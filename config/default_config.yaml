@@ -1,0 +1,45 @@
+# =============================================================================
+# Academic Research Suite — Default Configuration
+# -----------------------------------------------------------------------------
+# Copy this file to `secrets.yaml` to override with API keys and private
+# values. `secrets.yaml` is .gitignored and is loaded on top of these
+# defaults at runtime. Environment variables prefixed with `ARS_` (case
+# insensitive) take the highest precedence, e.g.:
+#
+#     ARS_AI_API_KEY=sk-...   ->  overrides ai_api_key
+#     ARS_WEB_SERVER_PORT=9000 -> overrides web_server_port
+#
+# All keys here MUST mirror the fields of `config.settings.Settings`.
+# =============================================================================
+
+# --- Application identity ----------------------------------------------------
+app_name: "Academic Research Suite"
+version: "1.0.0"
+
+# --- Filesystem layout (relative paths resolve under the app data dir) -------
+data_dir: "data"
+cache_dir: "data/cache"
+projects_dir: "data/projects"
+db_path: "data/ars.db"
+log_level: "INFO"
+
+# --- UI -----------------------------------------------------------------------
+theme_name: "modern_dark"
+
+# --- Proxy --------------------------------------------------------------------
+proxy_enabled: false
+
+# --- Web server (local optional mode) ----------------------------------------
+web_server_port: 8765
+
+# --- AI provider --------------------------------------------------------------
+# One of: ollama | openai | anthropic | none
+ai_provider: "none"
+ai_model: ""
+ai_api_key: ""
+ai_base_url: ""
+
+# --- Scraping policy ----------------------------------------------------------
+scraping_rate_limit_per_sec: 1.0
+scraping_max_concurrent: 4
+user_agent: "Mozilla/5.0 (compatible; AcademicResearchSuite/1.0; +https://github.com/academic-research-suite)"
