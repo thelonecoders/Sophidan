@@ -1,0 +1,989 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Academic Research Suite — API Reference</title>
+  <style>
+    :root {
+      --bg:        #1a1a2e;
+      --bg-2:      #16213e;
+      --surface:   #1f2647;
+      --border:    #2c3559;
+      --accent:    #3B82F6;
+      --accent-2:  #60a5fa;
+      --text:      #e5e7eb;
+      --text-dim:  #94a3b8;
+      --get:       #10b981;
+      --post:      #3B82F6;
+      --put:       #f59e0b;
+      --del:       #ef4444;
+      --ws:        #a855f7;
+      --mono:      'JetBrains Mono', 'Fira Code', ui-monospace, monospace;
+      --sans:      -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--sans);
+      font-size: 14px;
+      line-height: 1.5;
+    }
+    header {
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      padding: 1rem 2rem;
+      position: sticky; top: 0; z-index: 10;
+    }
+    header .row {
+      max-width: 1200px; margin: 0 auto;
+      display: flex; align-items: center; justify-content: space-between;
+    }
+    header h1 { font-size: 1.1rem; font-weight: 600; }
+    header a {
+      color: var(--accent);
+      text-decoration: none;
+      font-size: 0.85rem;
+    }
+    main { max-width: 1200px; margin: 0 auto; padding: 2rem; }
+    .intro { color: var(--text-dim); margin-bottom: 2rem; }
+    .intro p { margin-bottom: 0.5rem; }
+
+    .toc {
+      display: flex; flex-wrap: wrap; gap: 0.5rem;
+      margin-bottom: 2rem;
+    }
+    .toc a {
+      padding: 0.35rem 0.75rem;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      text-decoration: none;
+      color: var(--text-dim);
+      font-family: var(--mono);
+      font-size: 0.8rem;
+    }
+    .toc a:hover { color: var(--accent); border-color: var(--accent); }
+
+    .group {
+      margin-bottom: 2.5rem;
+    }
+    .group h2 {
+      font-size: 1.2rem;
+      margin-bottom: 0.5rem;
+      padding-bottom: 0.5rem;
+      border-bottom: 2px solid var(--accent);
+      display: inline-block;
+    }
+    .group .desc { color: var(--text-dim); margin-bottom: 1rem; }
+
+    .endpoint {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      margin-bottom: 0.75rem;
+      overflow: hidden;
+    }
+    .endpoint .head {
+      display: flex; align-items: center; gap: 0.75rem;
+      padding: 0.75rem 1rem;
+      border-bottom: 1px solid var(--border);
+    }
+    .method {
+      font-family: var(--mono);
+      font-size: 0.72rem;
+      font-weight: 700;
+      padding: 0.25rem 0.6rem;
+      border-radius: 4px;
+      min-width: 56px;
+      text-align: center;
+      letter-spacing: 0.04em;
+    }
+    .method.GET { background: rgba(16,185,129,0.15); color: var(--get); }
+    .method.POST { background: rgba(59,130,246,0.15); color: var(--post); }
+    .method.PUT { background: rgba(245,158,11,0.15); color: var(--put); }
+    .method.DELETE { background: rgba(239,68,68,0.15); color: var(--del); }
+    .method.WS { background: rgba(168,85,247,0.15); color: var(--ws); }
+    .path {
+      font-family: var(--mono);
+      font-size: 0.85rem;
+      color: var(--text);
+    }
+    .path .param { color: var(--accent-2); }
+    .summary {
+      margin-left: auto;
+      color: var(--text-dim);
+      font-size: 0.8rem;
+    }
+    .body {
+      padding: 1rem;
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 1rem;
+    }
+    .body .col h4 {
+      color: var(--text-dim);
+      font-size: 0.72rem;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      margin-bottom: 0.5rem;
+    }
+    pre {
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 0.75rem;
+      font-family: var(--mono);
+      font-size: 0.78rem;
+      overflow-x: auto;
+      color: var(--text);
+    }
+    pre .k { color: var(--accent-2); }
+    pre .s { color: #a3e635; }
+    pre .c { color: var(--text-dim); }
+
+    footer {
+      text-align: center;
+      padding: 1.5rem;
+      color: var(--text-dim);
+      font-size: 0.78rem;
+      border-top: 1px solid var(--border);
+    }
+    @media (max-width: 768px) {
+      .body { grid-template-columns: 1fr; }
+      .summary { display: none; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="row">
+      <h1>📚 Academic Research Suite — API Reference</h1>
+      <a href="/">← Back to dashboard</a>
+    </div>
+  </header>
+  <main>
+    <div class="intro">
+      <p>Every endpoint below is served from the local Flask + Socket.IO
+      server. The base URL is <code>http://127.0.0.1:8765</code> unless you
+      overrode the port with <code>--port</code>.</p>
+      <p>All responses are JSON. Endpoints that accept a body expect
+      <code>Content-Type: application/json</code>.</p>
+    </div>
+
+    <nav class="toc">
+      <a href="#health">Health</a>
+      <a href="#papers">Papers</a>
+      <a href="#projects">Projects</a>
+      <a href="#scraping">Scraping</a>
+      <a href="#analytics">Analytics</a>
+      <a href="#ai">AI</a>
+      <a href="#proxy">Proxy</a>
+      <a href="#export">Export</a>
+      <a href="#bibliometrics">Bibliometrics</a>
+      <a href="#network">Network</a>
+      <a href="#sr">Systematic Review</a>
+      <a href="#ma">Meta-Analysis</a>
+      <a href="#figures">Figures</a>
+      <a href="#innovation">Innovation</a>
+      <a href="#lifecycle">Lifecycle</a>
+      <a href="#ws">WebSocket</a>
+    </nav>
+
+    <!-- HEALTH -->
+    <section class="group" id="health">
+      <h2>Health</h2>
+      <p class="desc">Service liveness and module status.</p>
+
+      <div class="endpoint">
+        <div class="head">
+          <span class="method GET">GET</span>
+          <span class="path">/api/health</span>
+          <span class="summary">Version + active modules</span>
+        </div>
+        <div class="body">
+          <div class="col"><h4>Example response</h4>
+            <pre><span class="c"># 200 OK</span>
+{
+  <span class="k">"status"</span>: <span class="s">"ok"</span>,
+  <span class="k">"version"</span>: <span class="s">"0.1.0"</span>,
+  <span class="k">"python"</span>: <span class="s">"3.11.6"</span>,
+  <span class="k">"platform"</span>: <span class="s">"linux"</span>,
+  <span class="k">"timestamp"</span>: <span class="s">"2026-01-01T00:00:00Z"</span>,
+  <span class="k">"modules"</span>: {<span class="k">"database"</span>: true, <span class="k">"scraping_engine"</span>: false},
+  <span class="k">"tasks"</span>: 0
+}</pre>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- PAPERS -->
+    <section class="group" id="papers">
+      <h2>Papers</h2>
+      <p class="desc">CRUD + search over the local paper corpus.</p>
+
+      <div class="endpoint">
+        <div class="head">
+          <span class="method GET">GET</span>
+          <span class="path">/api/papers/</span>
+          <span class="summary">Paginated list, ?source=&year=&q=&project_id=&page=&per_page=</span>
+        </div>
+      </div>
+      <div class="endpoint">
+        <div class="head">
+          <span class="method GET">GET</span>
+          <span class="path">/api/papers/&lt;int:paper_id&gt;</span>
+          <span class="summary">Single paper detail</span>
+        </div>
+      </div>
+      <div class="endpoint">
+        <div class="head">
+          <span class="method POST">POST</span>
+          <span class="path">/api/papers/</span>
+          <span class="summary">Add a paper manually</span>
+        </div>
+        <div class="body">
+          <div class="col"><h4>Request body</h4>
+            <pre>{
+  <span class="k">"title"</span>: <span class="s">"Attention Is All You Need"</span>,
+  <span class="k">"authors"</span>: [<span class="s">"Vaswani"</span>, <span class="s">"Shazeer"</span>],
+  <span class="k">"year"</span>: 2017,
+  <span class="k">"doi"</span>: <span class="s">"10.5555/3295222.3295349"</span>,
+  <span class="k">"abstract"</span>: <span class="s">"…"</span>,
+  <span class="k">"source"</span>: <span class="s">"manual"</span>
+}</pre>
+          </div>
+          <div class="col"><h4>Example response</h4>
+            <pre><span class="c"># 201 Created</span>
+{<span class="k">"id"</span>: 42, <span class="k">"title"</span>: <span class="s">"…"</span>, <span class="k">"source"</span>: <span class="s">"manual"</span>}</pre>
+          </div>
+        </div>
+      </div>
+      <div class="endpoint">
+        <div class="head">
+          <span class="method DELETE">DELETE</span>
+          <span class="path">/api/papers/&lt;int:paper_id&gt;</span>
+          <span class="summary">Delete a paper</span>
+        </div>
+      </div>
+      <div class="endpoint">
+        <div class="head">
+          <span class="method GET">GET</span>
+          <span class="path">/api/papers/&lt;int:paper_id&gt;/similar</span>
+          <span class="summary">Find similar papers via embeddings (?limit=)</span>
+        </div>
+      </div>
+      <div class="endpoint">
+        <div class="head">
+          <span class="method GET">GET</span>
+          <span class="path">/api/papers/search</span>
+          <span class="summary">Full-text search (?q=&sources=&limit=)</span>
+        </div>
+      </div>
+    </section>
+
+    <!-- PROJECTS -->
+    <section class="group" id="projects">
+      <h2>Projects</h2>
+      <p class="desc">Project CRUD + paper association, snapshots, comparison.</p>
+
+      <div class="endpoint">
+        <div class="head"><span class="method GET">GET</span>
+          <span class="path">/api/projects/</span>
+          <span class="summary">List projects (?q=)</span></div>
+      </div>
+      <div class="endpoint">
+        <div class="head"><span class="method POST">POST</span>
+          <span class="path">/api/projects/</span>
+          <span class="summary">Create a project</span></div>
+        <div class="body"><div class="col"><h4>Request body</h4>
+          <pre>{<span class="k">"name"</span>: <span class="s">"LLM Survey"</span>, <span class="k">"description"</span>: <span class="s">"…"</span>}</pre></div></div>
+      </div>
+      <div class="endpoint">
+        <div class="head"><span class="method GET">GET</span>
+          <span class="path">/api/projects/&lt;int:id&gt;</span></div>
+      </div>
+      <div class="endpoint">
+        <div class="head"><span class="method PUT">PUT</span>
+          <span class="path">/api/projects/&lt;int:id&gt;</span></div>
+      </div>
+      <div class="endpoint">
+        <div class="head"><span class="method DELETE">DELETE</span>
+          <span class="path">/api/projects/&lt;int:id&gt;</span></div>
+      </div>
+      <div class="endpoint">
+        <div class="head"><span class="method POST">POST</span>
+          <span class="path">/api/projects/&lt;int:id&gt;/papers</span>
+          <span class="summary">Attach papers</span></div>
+        <div class="body"><div class="col"><h4>Request body</h4>
+          <pre>{<span class="k">"paper_ids"</span>: [1, 2, 3]}</pre></div></div>
+      </div>
+      <div class="endpoint">
+        <div class="head"><span class="method DELETE">DELETE</span>
+          <span class="path">/api/projects/&lt;int:id&gt;/papers/&lt;int:paper_id&gt;</span></div>
+      </div>
+      <div class="endpoint">
+        <div class="head"><span class="method GET">GET</span>
+          <span class="path">/api/projects/&lt;int:id&gt;/snapshots</span></div>
+      </div>
+      <div class="endpoint">
+        <div class="head"><span class="method POST">POST</span>
+          <span class="path">/api/projects/&lt;int:id&gt;/snapshots</span>
+          <span class="summary">Create snapshot</span></div>
+        <div class="body"><div class="col"><h4>Request body</h4>
+          <pre>{<span class="k">"label"</span>: <span class="s">"v1.0"</span>, <span class="k">"description"</span>: <span class="s">"baseline"</span>}</pre></div></div>
+      </div>
+      <div class="endpoint">
+        <div class="head"><span class="method POST">POST</span>
+          <span class="path">/api/projects/compare</span>
+          <span class="summary">Compare two projects</span></div>
+        <div class="body"><div class="col"><h4>Request body</h4>
+          <pre>{<span class="k">"a"</span>: 1, <span class="k">"b"</span>: 2}</pre></div></div>
+      </div>
+    </section>
+
+    <!-- SCRAPING -->
+    <section class="group" id="scraping">
+      <h2>Scraping</h2>
+      <p class="desc">Async scraping tasks with live WebSocket progress.</p>
+
+      <div class="endpoint">
+        <div class="head"><span class="method POST">POST</span>
+          <span class="path">/api/scraping/search</span>
+          <span class="summary">Submit a scrape task → returns task_id</span></div>
+        <div class="body">
+          <div class="col"><h4>Request body</h4>
+            <pre>{
+  <span class="k">"query"</span>: <span class="s">"transformer architecture"</span>,
+  <span class="k">"sources"</span>: [<span class="s">"arxiv"</span>, <span class="s">"semantic_scholar"</span>],
+  <span class="k">"max_results"</span>: 50,
+  <span class="k">"filters"</span>: {<span class="k">"year_min"</span>: 2017}
+}</pre></div>
+          <div class="col"><h4>Example response</h4>
+            <pre><span class="c"># 202 Accepted</span>
+{<span class="k">"task_id"</span>: <span class="s">"a1b2c3…"</span>, <span class="k">"status"</span>: <span class="s">"queued"</span>}</pre></div>
+        </div>
+      </div>
+      <div class="endpoint">
+        <div class="head"><span class="method GET">GET</span>
+          <span class="path">/api/scraping/tasks/&lt;task_id&gt;</span>
+          <span class="summary">Poll status</span></div>
+      </div>
+      <div class="endpoint">
+        <div class="head"><span class="method GET">GET</span>
+          <span class="path">/api/scraping/tasks</span>
+          <span class="summary">List all tasks</span></div>
+      </div>
+      <div class="endpoint">
+        <div class="head"><span class="method GET">GET</span>
+          <span class="path">/api/scraping/sources</span>
+          <span class="summary">List available scrapers with metadata</span></div>
+      </div>
+      <div class="endpoint">
+        <div class="head"><span class="method POST">POST</span>
+          <span class="path">/api/scraping/cancel/&lt;task_id&gt;</span></div>
+      </div>
+    </section>
+
+    <!-- ANALYTICS -->
+    <section class="group" id="analytics">
+      <h2>Analytics</h2>
+      <p class="desc">Topic modeling, clustering, temporal + network analysis.</p>
+
+      <div class="endpoint">
+        <div class="head"><span class="method POST">POST</span>
+          <span class="path">/api/analytics/topic-model</span></div>
+        <div class="body"><div class="col"><h4>Request body</h4>
+          <pre>{<span class="k">"project_id"</span>: 1, <span class="k">"num_topics"</span>: 8, <span class="k">"method"</span>: <span class="s">"bertopic"</span>}</pre></div></div>
+      </div>
+      <div class="endpoint">
+        <div class="head"><span class="method POST">POST</span>
+          <span class="path">/api/analytics/cluster</span></div>
+        <div class="body"><div class="col"><h4>Request body</h4>
+          <pre>{<span class="k">"project_id"</span>: 1, <span class="k">"method"</span>: <span class="s">"kmeans"</span>, <span class="k">"n_clusters"</span>: 5}</pre></div></div>
+      </div>
+      <div class="endpoint">
+        <div class="head"><span class="method POST">POST</span>
+          <span class="path">/api/analytics/temporal</span></div>
+        <div class="body"><div class="col"><h4>Request body</h4>
+          <pre>{<span class="k">"project_id"</span>: 1, <span class="k">"metric"</span>: <span class="s">"publications"</span>}</pre></div></div>
+      </div>
+      <div class="endpoint">
+        <div class="head"><span class="method GET">GET</span>
+          <span class="path">/api/analytics/network/&lt;int:project_id&gt;?type=citation|collaboration|temporal</span>
+          <span class="summary">Cytoscape-formatted graph</span></div>
+      </div>
+      <div class="endpoint">
+        <div class="head"><span class="method GET">GET</span>
+          <span class="path">/api/analytics/stats/&lt;int:project_id&gt;</span>
+          <span class="summary">Bibliometric summary</span></div>
+      </div>
+    </section>
+
+    <!-- AI -->
+    <section class="group" id="ai">
+      <h2>AI Assistant</h2>
+      <p class="desc">Streaming chat, summarization, model discovery, embeddings.</p>
+
+      <div class="endpoint">
+        <div class="head"><span class="method POST">POST</span>
+          <span class="path">/api/ai/chat</span>
+          <span class="summary">Returns text/event-stream (SSE)</span></div>
+        <div class="body">
+          <div class="col"><h4>Request body</h4>
+            <pre>{
+  <span class="k">"message"</span>: <span class="s">"Summarize recent LLM papers"</span>,
+  <span class="k">"history"</span>: [{<span class="k">"role"</span>: <span class="s">"user"</span>, <span class="k">"content"</span>: <span class="s">"…"</span>}],
+  <span class="k">"use_rag"</span>: true,
+  <span class="k">"project_id"</span>: 1
+}</pre></div>
+          <div class="col"><h4>SSE response</h4>
+            <pre>data: {<span class="k">"token"</span>: <span class="s">" The"</span>}
+data: {<span class="k">"token"</span>: <span class="s">" recent"</span>}
+data: {<span class="k">"token"</span>: <span class="s">" surge"</span>}
+data: {<span class="k">"done"</span>: true}</pre></div>
+        </div>
+      </div>
+      <div class="endpoint">
+        <div class="head"><span class="method POST">POST</span>
+          <span class="path">/api/ai/summarize</span></div>
+        <div class="body"><div class="col"><h4>Request body</h4>
+          <pre>{<span class="k">"paper_ids"</span>: [1, 2], <span class="k">"type"</span>: <span class="s">"abstract"</span>}</pre></div></div>
+      </div>
+      <div class="endpoint">
+        <div class="head"><span class="method GET">GET</span>
+          <span class="path">/api/ai/models?provider=openai|anthropic|ollama|all</span></div>
+      </div>
+      <div class="endpoint">
+        <div class="head"><span class="method POST">POST</span>
+          <span class="path">/api/ai/embeddings</span></div>
+        <div class="body"><div class="col"><h4>Request body</h4>
+          <pre>{<span class="k">"texts"</span>: [<span class="s">"hello"</span>, <span class="s">"world"</span>], <span class="k">"model"</span>: <span class="s">"default"</span>}</pre></div></div>
+      </div>
+    </section>
+
+    <!-- PROXY -->
+    <section class="group" id="proxy">
+      <h2>Proxy Pool</h2>
+      <p class="desc">Proxy discovery, testing, chaining, and stats.</p>
+
+      <div class="endpoint">
+        <div class="head"><span class="method GET">GET</span>
+          <span class="path">/api/proxy/</span>
+          <span class="summary">?country=&protocol=&healthy=&page=&per_page=</span></div>
+      </div>
+      <div class="endpoint">
+        <div class="head"><span class="method POST">POST</span>
+          <span class="path">/api/proxy/refresh</span>
+          <span class="summary">Scrape + health-check</span></div>
+        <div class="body"><div class="col"><h4>Request body (optional)</h4>
+          <pre>{<span class="k">"sources"</span>: [<span class="s">"free_proxy_list"</span>]}</pre></div></div>
+      </div>
+      <div class="endpoint">
+        <div class="head"><span class="method POST">POST</span>
+          <span class="path">/api/proxy/test</span>
+          <span class="summary">Test a single proxy</span></div>
+        <div class="body"><div class="col"><h4>Request body</h4>
+          <pre>{<span class="k">"host"</span>: <span class="s">"1.2.3.4"</span>, <span class="k">"port"</span>: 8080,
+ <span class="k">"protocol"</span>: <span class="s">"http"</span>}</pre></div></div>
+      </div>
+      <div class="endpoint">
+        <div class="head"><span class="method POST">POST</span>
+          <span class="path">/api/proxy/chain</span></div>
+        <div class="body"><div class="col"><h4>Request body</h4>
+          <pre>{<span class="k">"proxy_ids"</span>: [1, 2, 3]}</pre></div></div>
+      </div>
+      <div class="endpoint">
+        <div class="head"><span class="method GET">GET</span>
+          <span class="path">/api/proxy/stats</span></div>
+      </div>
+    </section>
+
+    <!-- EXPORT -->
+    <section class="group" id="export">
+      <h2>Export</h2>
+      <p class="desc">Generate downloadable files (CSV/JSON/TSV/XLSX, PDF/DOCX/PPTX, BibTeX).</p>
+
+      <div class="endpoint">
+        <div class="head"><span class="method POST">POST</span>
+          <span class="path">/api/export/papers</span>
+          <span class="summary">Tabular export → file download</span></div>
+        <div class="body"><div class="col"><h4>Request body</h4>
+          <pre>{<span class="k">"format"</span>: <span class="s">"csv"</span>, <span class="k">"paper_ids"</span>: [1,2],
+ <span class="k">"columns"</span>: [<span class="s">"title"</span>, <span class="s">"year"</span>]}</pre></div></div>
+      </div>
+      <div class="endpoint">
+        <div class="head"><span class="method POST">POST</span>
+          <span class="path">/api/export/report</span>
+          <span class="summary">PDF / DOCX / PPTX report</span></div>
+        <div class="body"><div class="col"><h4>Request body</h4>
+          <pre>{<span class="k">"type"</span>: <span class="s">"pdf"</span>, <span class="k">"project_id"</span>: 1,
+ <span class="k">"sections"</span>: [<span class="s">"summary"</span>, <span class="s">"analytics"</span>]}</pre></div></div>
+      </div>
+      <div class="endpoint">
+        <div class="head"><span class="method POST">POST</span>
+          <span class="path">/api/export/bibtex</span></div>
+        <div class="body"><div class="col"><h4>Request body</h4>
+          <pre>{<span class="k">"paper_ids"</span>: [1, 2, 3]}</pre></div></div>
+      </div>
+    </section>
+
+    <!-- BIBLIOMETRICS (v2.0.0) -->
+    <section class="group" id="bibliometrics">
+      <h2>Bibliometrics (v2.0.0)</h2>
+      <p class="desc">Publish-or-Perish indices, JCR journal metrics, VOSviewer networks, CiteSpace bursts.</p>
+
+      <div class="endpoint">
+        <div class="head"><span class="method POST">POST</span>
+          <span class="path">/api/bibliometrics/indices</span>
+          <span class="summary">All PoP author-level indices</span></div>
+        <div class="body"><div class="col"><h4>Request body</h4>
+          <pre>{<span class="k">"citations"</span>: [10, 5, 3, 1, 0, 0, 1, 2, 0, 4],
+ <span class="k">"years"</span>: [2018, 2019, 2020]}</pre></div></div>
+      </div>
+      <div class="endpoint">
+        <div class="head"><span class="method POST">POST</span>
+          <span class="path">/api/bibliometrics/journal-metrics</span>
+          <span class="summary">13 JCR-style metrics</span></div>
+        <div class="body"><div class="col"><h4>Request body</h4>
+          <pre>{<span class="k">"papers"</span>: [...], <span class="k">"journal"</span>: <span class="s">"Nature"</span>,
+ <span class="k">"year"</span>: 2024}</pre></div></div>
+      </div>
+      <div class="endpoint">
+        <div class="head"><span class="method POST">POST</span>
+          <span class="path">/api/bibliometrics/vos</span>
+          <span class="summary">VOSviewer-style network</span></div>
+        <div class="body"><div class="col"><h4>Request body</h4>
+          <pre>{<span class="k">"papers"</span>: [...],
+ <span class="k">"analysis_type"</span>: <span class="s">"bibliographic_coupling"</span>}</pre></div></div>
+      </div>
+      <div class="endpoint">
+        <div class="head"><span class="method POST">POST</span>
+          <span class="path">/api/bibliometrics/bursts</span>
+          <span class="summary">CiteSpace citation bursts</span></div>
+        <div class="body"><div class="col"><h4>Request body</h4>
+          <pre>{<span class="k">"papers"</span>: [...], <span class="k">"time_window"</span>: 1}</pre></div></div>
+      </div>
+      <div class="endpoint">
+        <div class="head"><span class="method GET">GET</span>
+          <span class="path">/api/bibliometrics/author-profile/&lt;author_id&gt;</span>
+          <span class="summary">Author bibliometric profile (POST papers in body)</span></div>
+      </div>
+      <div class="endpoint">
+        <div class="head"><span class="method GET">GET</span>
+          <span class="path">/api/bibliometrics/journal-profile/&lt;journal_name&gt;</span>
+          <span class="summary">Journal bibliometric profile</span></div>
+      </div>
+    </section>
+
+    <!-- NETWORK ANALYSIS (v2.0.0) -->
+    <section class="group" id="network">
+      <h2>Network Analysis (v2.0.0)</h2>
+      <p class="desc">NetworkX-pro algorithms + Gephi-style statistics, filters, layouts.</p>
+
+      <div class="endpoint">
+        <div class="head"><span class="method POST">POST</span>
+          <span class="path">/api/network/centrality</span></div>
+        <div class="body"><div class="col"><h4>Request body</h4>
+          <pre>{<span class="k">"graph"</span>: {<span class="k">"nodes"</span>: [...], <span class="k">"edges"</span>: [...]},
+ <span class="k">"method"</span>: <span class="s">"pagerank"</span>}</pre></div></div>
+      </div>
+      <div class="endpoint">
+        <div class="head"><span class="method POST">POST</span>
+          <span class="path">/api/network/community</span></div>
+        <div class="body"><div class="col"><h4>Request body</h4>
+          <pre>{<span class="k">"graph"</span>: {...}, <span class="k">"method"</span>: <span class="s">"louvain"</span>}</pre></div></div>
+      </div>
+      <div class="endpoint">
+        <div class="head"><span class="method POST">POST</span>
+          <span class="path">/api/network/components</span>
+          <span class="summary">Components, APs, bridges, cores, clustering</span></div>
+      </div>
+      <div class="endpoint">
+        <div class="head"><span class="method POST">POST</span>
+          <span class="path">/api/network/paths</span></div>
+        <div class="body"><div class="col"><h4>Request body</h4>
+          <pre>{<span class="k">"graph"</span>: {...},
+ <span class="k">"source"</span>: <span class="s">"nodeA"</span>, <span class="k">"target"</span>: <span class="s">"nodeB"</span>}</pre></div></div>
+      </div>
+      <div class="endpoint">
+        <div class="head"><span class="method POST">POST</span>
+          <span class="path">/api/network/link-prediction</span></div>
+        <div class="body"><div class="col"><h4>Request body</h4>
+          <pre>{<span class="k">"graph"</span>: {...}, <span class="k">"method"</span>: <span class="s">"jaccard"</span>,
+ <span class="k">"top_n"</span>: 10}</pre></div></div>
+      </div>
+      <div class="endpoint">
+        <div class="head"><span class="method POST">POST</span>
+          <span class="path">/api/network/layouts</span>
+          <span class="summary">spring|kamada|circular|force_atlas|stress</span></div>
+      </div>
+      <div class="endpoint">
+        <div class="head"><span class="method POST">POST</span>
+          <span class="path">/api/network/stats</span>
+          <span class="summary">Gephi-style full statistics report</span></div>
+      </div>
+      <div class="endpoint">
+        <div class="head"><span class="method POST">POST</span>
+          <span class="path">/api/network/filter</span></div>
+        <div class="body"><div class="col"><h4>Request body</h4>
+          <pre>{<span class="k">"graph"</span>: {...},
+ <span class="k">"filters"</span>: [{<span class="k">"kind"</span>: <span class="s">"GiantComponent"</span>}]}</pre></div></div>
+      </div>
+      <div class="endpoint">
+        <div class="head"><span class="method POST">POST</span>
+          <span class="path">/api/network/export</span>
+          <span class="summary">graphml|gexf|gml|pajek|edgelist|adjlist|json|cytoscape|d3</span></div>
+      </div>
+    </section>
+
+    <!-- SYSTEMATIC REVIEW (v2.0.0) -->
+    <section class="group" id="sr">
+      <h2>Systematic Review (v2.0.0)</h2>
+      <p class="desc">Protocol, screening, risk-of-bias, data extraction, synthesis, PRISMA.</p>
+
+      <div class="endpoint">
+        <div class="head"><span class="method POST">POST</span>
+          <span class="path">/api/sr/protocol</span></div>
+        <div class="body"><div class="col"><h4>Request body</h4>
+          <pre>{<span class="k">"template"</span>: <span class="s">"cochrane"</span>}</pre></div></div>
+      </div>
+      <div class="endpoint">
+        <div class="head"><span class="method GET">GET</span>
+          <span class="path">/api/sr/protocol/&lt;protocol_id&gt;</span></div>
+      </div>
+      <div class="endpoint">
+        <div class="head"><span class="method PUT">PUT</span>
+          <span class="path">/api/sr/protocol/&lt;protocol_id&gt;</span></div>
+      </div>
+      <div class="endpoint">
+        <div class="head"><span class="method POST">POST</span>
+          <span class="path">/api/sr/screening/import</span></div>
+        <div class="body"><div class="col"><h4>Request body</h4>
+          <pre>{<span class="k">"papers"</span>: [...]}</pre></div></div>
+      </div>
+      <div class="endpoint">
+        <div class="head"><span class="method POST">POST</span>
+          <span class="path">/api/sr/screening/&lt;record_id&gt;/decide</span></div>
+        <div class="body"><div class="col"><h4>Request body</h4>
+          <pre>{<span class="k">"decision"</span>: <span class="s">"include"</span>,
+ <span class="k">"reviewer"</span>: <span class="s">"alice"</span>, <span class="k">"reason"</span>: <span class="s">"..."</span>}</pre></div></div>
+      </div>
+      <div class="endpoint">
+        <div class="head"><span class="method GET">GET</span>
+          <span class="path">/api/sr/screening/progress</span></div>
+      </div>
+      <div class="endpoint">
+        <div class="head"><span class="method POST">POST</span>
+          <span class="path">/api/sr/rob/&lt;study_id&gt;</span></div>
+        <div class="body"><div class="col"><h4>Request body</h4>
+          <pre>{<span class="k">"tool"</span>: <span class="s">"rob2"</span>, <span class="k">"assessment"</span>: {...}}</pre></div></div>
+      </div>
+      <div class="endpoint">
+        <div class="head"><span class="method GET">GET</span>
+          <span class="path">/api/sr/rob/&lt;study_id&gt;</span></div>
+      </div>
+      <div class="endpoint">
+        <div class="head"><span class="method POST">POST</span>
+          <span class="path">/api/sr/extraction/&lt;study_id&gt;</span></div>
+      </div>
+      <div class="endpoint">
+        <div class="head"><span class="method POST">POST</span>
+          <span class="path">/api/sr/synthesis</span></div>
+        <div class="body"><div class="col"><h4>Request body</h4>
+          <pre>{<span class="k">"method"</span>: <span class="s">"narrative"</span>,
+ <span class="k">"extractions"</span>: [...]}</pre></div></div>
+      </div>
+      <div class="endpoint">
+        <div class="head"><span class="method POST">POST</span>
+          <span class="path">/api/sr/prisma-flow</span></div>
+        <div class="body"><div class="col"><h4>Request body</h4>
+          <pre>{<span class="k">"counts"</span>: {<span class="k">"n_records_databases"</span>: 1247, ...},
+ <span class="k">"format"</span>: <span class="s">"svg"</span>, <span class="k">"style"</span>: <span class="s">"bmj"</span>}</pre></div></div>
+      </div>
+      <div class="endpoint">
+        <div class="head"><span class="method GET">GET</span>
+          <span class="path">/api/sr/prisma-checklist</span>
+          <span class="summary">27-item PRISMA 2020 checklist</span></div>
+      </div>
+    </section>
+
+    <!-- META-ANALYSIS (v2.0.0) -->
+    <section class="group" id="ma">
+      <h2>Meta-Analysis (v2.0.0)</h2>
+      <p class="desc">Effect sizes, pooling, forest/funnel plots, subgroup, sensitivity, NMA, reports.</p>
+
+      <div class="endpoint">
+        <div class="head"><span class="method POST">POST</span>
+          <span class="path">/api/ma/effect-size</span></div>
+        <div class="body"><div class="col"><h4>Request body</h4>
+          <pre>{<span class="k">"type"</span>: <span class="s">"SMD"</span>,
+ <span class="k">"intervention"</span>: {<span class="k">"n"</span>: 30, <span class="k">"mean"</span>: 5.2, <span class="k">"sd"</span>: 1.4},
+ <span class="k">"control"</span>: {<span class="k">"n"</span>: 28, <span class="k">"mean"</span>: 3.8, <span class="k">"sd"</span>: 1.2}}</pre></div></div>
+      </div>
+      <div class="endpoint">
+        <div class="head"><span class="method POST">POST</span>
+          <span class="path">/api/ma/pool</span></div>
+        <div class="body"><div class="col"><h4>Request body</h4>
+          <pre>{<span class="k">"effect_sizes"</span>: [...], <span class="k">"method"</span>: <span class="s">"DL"</span>}</pre></div></div>
+      </div>
+      <div class="endpoint">
+        <div class="head"><span class="method POST">POST</span>
+          <span class="path">/api/ma/forest-plot</span>
+          <span class="summary">Returns base64-encoded PNG/SVG/PDF</span></div>
+      </div>
+      <div class="endpoint">
+        <div class="head"><span class="method POST">POST</span>
+          <span class="path">/api/ma/funnel-plot</span></div>
+      </div>
+      <div class="endpoint">
+        <div class="head"><span class="method POST">POST</span>
+          <span class="path">/api/ma/subgroup</span></div>
+        <div class="body"><div class="col"><h4>Request body</h4>
+          <pre>{<span class="k">"effect_sizes"</span>: [...], <span class="k">"subgroups"</span>: [<span class="s">"A"</span>, <span class="s">"B"</span>, ...]}</pre></div></div>
+      </div>
+      <div class="endpoint">
+        <div class="head"><span class="method POST">POST</span>
+          <span class="path">/api/ma/sensitivity</span></div>
+        <div class="body"><div class="col"><h4>Request body</h4>
+          <pre>{<span class="k">"effect_sizes"</span>: [...],
+ <span class="k">"type"</span>: <span class="s">"leave_one_out"</span>}</pre></div></div>
+      </div>
+      <div class="endpoint">
+        <div class="head"><span class="method POST">POST</span>
+          <span class="path">/api/ma/nma</span>
+          <span class="summary">Network meta-analysis (Bucher + SUCRA)</span></div>
+      </div>
+      <div class="endpoint">
+        <div class="head"><span class="method POST">POST</span>
+          <span class="path">/api/ma/report</span>
+          <span class="summary">PDF / DOCX report (base64)</span></div>
+      </div>
+    </section>
+
+    <!-- FIGURES (v2.0.0) -->
+    <section class="group" id="figures">
+      <h2>Q1 Figures (v2.0.0)</h2>
+      <p class="desc">Publication-grade figures: Nature/Science/Cell/NEJM/Lancet/JAMA palettes; PNG/SVG/PDF/TIFF.</p>
+
+      <div class="endpoint">
+        <div class="head"><span class="method POST">POST</span>
+          <span class="path">/api/figures/forest</span>
+          <span class="summary">Forest plot</span></div>
+      </div>
+      <div class="endpoint">
+        <div class="head"><span class="method POST">POST</span>
+          <span class="path">/api/figures/funnel</span></div>
+      </div>
+      <div class="endpoint">
+        <div class="head"><span class="method POST">POST</span>
+          <span class="path">/api/figures/volcano</span></div>
+      </div>
+      <div class="endpoint">
+        <div class="head"><span class="method POST">POST</span>
+          <span class="path">/api/figures/manhattan</span></div>
+      </div>
+      <div class="endpoint">
+        <div class="head"><span class="method POST">POST</span>
+          <span class="path">/api/figures/qq</span></div>
+      </div>
+      <div class="endpoint">
+        <div class="head"><span class="method POST">POST</span>
+          <span class="path">/api/figures/kaplan-meier</span></div>
+      </div>
+      <div class="endpoint">
+        <div class="head"><span class="method POST">POST</span>
+          <span class="path">/api/figures/roc</span></div>
+      </div>
+      <div class="endpoint">
+        <div class="head"><span class="method POST">POST</span>
+          <span class="path">/api/figures/pr-curve</span></div>
+      </div>
+      <div class="endpoint">
+        <div class="head"><span class="method POST">POST</span>
+          <span class="path">/api/figures/boxplot</span></div>
+      </div>
+      <div class="endpoint">
+        <div class="head"><span class="method POST">POST</span>
+          <span class="path">/api/figures/violin</span></div>
+      </div>
+      <div class="endpoint">
+        <div class="head"><span class="method POST">POST</span>
+          <span class="path">/api/figures/raincloud</span></div>
+      </div>
+      <div class="endpoint">
+        <div class="head"><span class="method POST">POST</span>
+          <span class="path">/api/figures/heatmap</span></div>
+      </div>
+      <div class="endpoint">
+        <div class="head"><span class="method POST">POST</span>
+          <span class="path">/api/figures/network</span></div>
+      </div>
+      <div class="endpoint">
+        <div class="head"><span class="method POST">POST</span>
+          <span class="path">/api/figures/sankey</span></div>
+      </div>
+      <div class="endpoint">
+        <div class="head"><span class="method POST">POST</span>
+          <span class="path">/api/figures/multi-panel</span></div>
+        <div class="body"><div class="col"><h4>Request body</h4>
+          <pre>{<span class="k">"rows"</span>: 2, <span class="k">"cols"</span>: 2,
+ <span class="k">"panels"</span>: [{<span class="k">"row"</span>: 0, <span class="k">"col"</span>: 0}, ...],
+ <span class="k">"journal"</span>: <span class="s">"Nature"</span>, <span class="k">"dpi"</span>: 300,
+ <span class="k">"format"</span>: <span class="s">"png"</span>}</pre></div></div>
+      </div>
+      <div class="endpoint">
+        <div class="head"><span class="method GET">GET</span>
+          <span class="path">/api/figures/palettes</span>
+          <span class="summary">List available journal palettes</span></div>
+      </div>
+    </section>
+
+    <!-- INNOVATION (v2.0.0) -->
+    <section class="group" id="innovation">
+      <h2>Innovation (v2.0.0)</h2>
+      <p class="desc">Citation bursts, knowledge frontiers, trend forecast, recommendation, novelty, directions.</p>
+
+      <div class="endpoint">
+        <div class="head"><span class="method POST">POST</span>
+          <span class="path">/api/innovation/bursts</span></div>
+        <div class="body"><div class="col"><h4>Request body</h4>
+          <pre>{<span class="k">"papers"</span>: [...], <span class="k">"time_window"</span>: 1}</pre></div></div>
+      </div>
+      <div class="endpoint">
+        <div class="head"><span class="method POST">POST</span>
+          <span class="path">/api/innovation/frontiers</span></div>
+        <div class="body"><div class="col"><h4>Request body</h4>
+          <pre>{<span class="k">"papers"</span>: [...],
+ <span class="k">"method"</span>: <span class="s">"embedding_density"</span>}</pre></div></div>
+      </div>
+      <div class="endpoint">
+        <div class="head"><span class="method POST">POST</span>
+          <span class="path">/api/innovation/forecast</span></div>
+        <div class="body"><div class="col"><h4>Request body</h4>
+          <pre>{<span class="k">"papers"</span>: [...], <span class="k">"topic"</span>: <span class="s">"LLM"</span>,
+ <span class="k">"years_ahead"</span>: 3}</pre></div></div>
+      </div>
+      <div class="endpoint">
+        <div class="head"><span class="method POST">POST</span>
+          <span class="path">/api/innovation/recommend-papers</span></div>
+        <div class="body"><div class="col"><h4>Request body</h4>
+          <pre>{<span class="k">"papers"</span>: [...], <span class="k">"query"</span>: <span class="s">"..."</span>,
+ <span class="k">"top_k"</span>: 10}</pre></div></div>
+      </div>
+      <div class="endpoint">
+        <div class="head"><span class="method POST">POST</span>
+          <span class="path">/api/innovation/recommend-collaborators</span></div>
+        <div class="body"><div class="col"><h4>Request body</h4>
+          <pre>{<span class="k">"papers"</span>: [...], <span class="k">"author"</span>: <span class="s">"Jane Doe"</span>}</pre></div></div>
+      </div>
+      <div class="endpoint">
+        <div class="head"><span class="method POST">POST</span>
+          <span class="path">/api/innovation/novelty</span></div>
+      </div>
+      <div class="endpoint">
+        <div class="head"><span class="method POST">POST</span>
+          <span class="path">/api/innovation/directions</span></div>
+        <div class="body"><div class="col"><h4>Request body</h4>
+          <pre>{<span class="k">"papers"</span>: [...], <span class="k">"topic"</span>: <span class="s">"LLM"</span>}</pre></div></div>
+      </div>
+    </section>
+
+    <!-- LIFECYCLE (v2.0.0) -->
+    <section class="group" id="lifecycle">
+      <h2>Research Lifecycle (v2.0.0)</h2>
+      <p class="desc">Gap detection, ideas, protocol templates, extraction, quality assessment, writing assistant.</p>
+
+      <div class="endpoint">
+        <div class="head"><span class="method POST">POST</span>
+          <span class="path">/api/lifecycle/gaps</span></div>
+        <div class="body"><div class="col"><h4>Request body</h4>
+          <pre>{<span class="k">"papers"</span>: [...], <span class="k">"topic"</span>: <span class="s">"..."</span>}</pre></div></div>
+      </div>
+      <div class="endpoint">
+        <div class="head"><span class="method POST">POST</span>
+          <span class="path">/api/lifecycle/ideas</span></div>
+        <div class="body"><div class="col"><h4>Request body</h4>
+          <pre>{<span class="k">"topic"</span>: <span class="s">"..."</span>, <span class="k">"papers"</span>: [...]}</pre></div></div>
+      </div>
+      <div class="endpoint">
+        <div class="head"><span class="method GET">GET</span>
+          <span class="path">/api/lifecycle/protocol-templates</span></div>
+      </div>
+      <div class="endpoint">
+        <div class="head"><span class="method POST">POST</span>
+          <span class="path">/api/lifecycle/protocol</span></div>
+        <div class="body"><div class="col"><h4>Request body</h4>
+          <pre>{<span class="k">"template"</span>: <span class="s">"systematic_review"</span>,
+ <span class="k">"project_id"</span>: <span class="s">"abc"</span>, <span class="k">"fields"</span>: {...}}</pre></div></div>
+      </div>
+      <div class="endpoint">
+        <div class="head"><span class="method GET">GET</span>
+          <span class="path">/api/lifecycle/extraction-templates</span></div>
+      </div>
+      <div class="endpoint">
+        <div class="head"><span class="method POST">POST</span>
+          <span class="path">/api/lifecycle/quality-assessment</span></div>
+        <div class="body"><div class="col"><h4>Request body</h4>
+          <pre>{<span class="k">"tool"</span>: <span class="s">"mmat"</span>, <span class="k">"study_data"</span>: {...}}</pre></div></div>
+      </div>
+      <div class="endpoint">
+        <div class="head"><span class="method GET">GET</span>
+          <span class="path">/api/lifecycle/reporting-checklists</span></div>
+      </div>
+      <div class="endpoint">
+        <div class="head"><span class="method POST">POST</span>
+          <span class="path">/api/lifecycle/write</span></div>
+        <div class="body"><div class="col"><h4>Request body</h4>
+          <pre>{<span class="k">"task"</span>: <span class="s">"outline"</span>, <span class="k">"content"</span>: <span class="s">"..."</span>,
+ <span class="k">"papers"</span>: [...]}</pre></div></div>
+      </div>
+    </section>
+
+    <!-- WEBSOCKET -->
+    <section class="group" id="ws">
+      <h2>WebSocket</h2>
+      <p class="desc">Real-time event streams via Socket.IO at the root namespace.</p>
+
+      <div class="endpoint">
+        <div class="head"><span class="method GET">GET</span>
+          <span class="path">/ws/status</span>
+          <span class="summary">Socket.IO subsystem status</span></div>
+      </div>
+      <div class="endpoint">
+        <div class="head"><span class="method WS">WS</span>
+          <span class="path">connect / disconnect</span></div>
+      </div>
+      <div class="endpoint">
+        <div class="head"><span class="method WS">WS</span>
+          <span class="path">subscribe</span></div>
+        <div class="body"><div class="col"><h4>Client → Server</h4>
+          <pre>{<span class="k">"task_id"</span>: <span class="s">"a1b2c3…"</span>}
+<span class="c"># or</span>
+{<span class="k">"channel"</span>: <span class="s">"logs"</span>}</pre></div></div>
+      </div>
+      <div class="endpoint">
+        <div class="head"><span class="method WS">WS</span>
+          <span class="path">unsubscribe</span></div>
+      </div>
+      <div class="endpoint">
+        <div class="head"><span class="method WS">WS</span>
+          <span class="path">scrape:progress / scrape:complete / scrape:error</span>
+          <span class="summary">Server → Client broadcasts</span></div>
+        <div class="body"><div class="col"><h4>Example event</h4>
+          <pre>{
+  <span class="k">"task_id"</span>: <span class="s">"a1b2c3…"</span>,
+  <span class="k">"progress"</span>: 0.45,
+  <span class="k">"message"</span>: <span class="s">"Fetched 22/50 results"</span>
+}</pre></div></div>
+      </div>
+    </section>
+  </main>
+  <footer>
+    Academic Research Suite · MIT License ·
+    Generated by <code>web/templates/api_docs.html</code>
+  </footer>
+</body>
+</html>

@@ -1,0 +1,290 @@
+# Academic Research Suite — Python dependencies
+# Each sub-agent appends its module-specific deps below its own header.
+# Duplicate lines (same package + version constraint) are removed by the
+# validation agent — the first occurrence wins. Section headers are kept.
+
+# === CORE / RUNTIME (shared) ===
+python>=3.10
+PyQt5>=5.15
+qtpy>=2.4
+PyYAML>=6.0
+python-dotenv>=1.0
+loguru>=0.7
+tqdm>=4.66
+dataclasses-json>=0.6
+pydantic>=2.5
+
+# === CORE (added by 1-core) ===
+# Notes:
+# - PyQt5 / qtpy are imported lazily via the qtpy shim so every module
+#   remains importable in headless environments.
+# - pydantic is OPTIONAL: config.settings falls back to a plain dataclass
+#   when pydantic is missing, but we declare it so the full Settings
+#   validation path is available in production installs.
+# - PyYAML is required by config.settings (default_config.yaml loader) and
+#   by utils.config_manager (secrets.yaml persistence).
+
+# === DATABASE ===
+SQLAlchemy>=2.0
+alembic>=1.13
+sqlite-utils>=3.36
+
+# === HTTP / SCRAPING ===
+requests>=2.31
+httpx>=0.27
+aiohttp>=3.9
+beautifulsoup4>=4.12
+lxml>=5.1
+selenium>=4.18
+fake-useragent>=1.5
+urllib3>=2.2
+charset-normalizer>=3.3
+
+# === DATA SCIENCE ===
+numpy>=1.26
+pandas>=2.2
+scipy>=1.12
+scikit-learn>=1.4
+networkx>=3.2
+statsmodels>=0.14
+matplotlib>=3.8
+seaborn>=0.13
+plotly>=5.19
+sentence-transformers>=2.5
+bertopic>=0.16
+gensim>=4.3
+nltk>=3.8
+spacy>=3.7
+textblob>=0.18
+
+# === DATA SCIENCE (added by 1-datasci) ===
+joblib>=1.3
+pyarrow>=15.0           # parquet engine for pandas
+wordcloud>=1.9          # word-cloud figures
+geopandas>=0.14         # geographic distribution
+hdbscan>=0.8.33         # density-based clustering (optional; lazy-imported)
+umap-learn>=0.5.5       # UMAP projection for clustering viz (optional; lazy-imported)
+pyLDAvis>=3.4           # interactive LDA visualization (optional; lazy-imported)
+fonttools>=4.50         # matplotlib font management
+noto-sans-sc>=1.0       # CJK font fallback (lazy; module tolerates absence)
+
+# === AI ASSISTANT ===
+openai>=1.12
+anthropic>=0.21
+ollama>=0.1.7
+langchain>=0.1
+langchain-community>=0.0.25
+chromadb>=0.4.24
+tiktoken>=0.6
+
+# === REPORTING / EXPORT ===
+reportlab>=4.0
+python-docx>=1.1
+python-pptx>=0.6.23
+fpdf2>=2.7
+bibtexparser>=1.4
+
+# === REPORTING (added by 1-reporting) ===
+# All deps required by the reporting/ sub-package were already listed above
+# (reportlab, python-docx, python-pptx, matplotlib) or under DATA SCIENCE
+# (pandas, numpy, networkx) or UTILITIES (Pillow). No new deps added.
+# The reporting modules also use Python stdlib: csv, io, os, re, tempfile,
+# xml (for TOC field XML in docx_report).
+
+# === WEB SERVER (added by 1-web) ===
+# Subsumes the earlier "WEB SERVER (optional local mode)" block — same deps,
+# plus the Socket.IO engine packages needed for /ws streaming.
+Flask>=3.0
+flask-cors>=4.0
+flask-socketio>=5.3
+Werkzeug>=3.0
+python-socketio>=5.10
+python-engineio>=4.8
+simple-websocket>=1.0
+# (Eventlet / gevent optional for production Socket.IO; threading mode used by default.)
+
+# === UTILITIES ===
+python-magic>=0.4
+Pillow>=10.2
+pytz>=2024.1
+dateparser>=1.2
+tenacity>=8.2
+python-dateutil>=2.8
+
+# === SCRAPER-B (added by 1-scraper-b) ===
+scholarly>=1.7
+openpyxl>=3.1
+habanero>=1.2.6
+
+# === DATABASE + PROJECT MGMT (added by 1-db) ===
+# SQLAlchemy, alembic, chromadb, numpy, pandas, matplotlib are already declared
+# above; we only add the optional Venn-diagram helper used by
+# project_management.comparison (graceful fallback to a bar chart if missing).
+matplotlib-venn>=0.11
+
+# === UI CORE (added by 1-ui-core) ===
+# Optional icon-font libraries. Used to populate ModernTheme.ICON_FONT when
+# available — the UI falls back to unicode/emoji glyphs otherwise.
+qt-material>=2.14
+qtawesome>=1.3
+
+# === SCRAPER-A (added by 1-scraper-a) ===
+# base_scraper.py + arxiv/pubmed/openalex/semantic_scholar scrapers reuse
+# existing deps only (requests, tenacity, lxml optional). No new packages
+# were introduced by this sub-agent.
+
+# === PROXY (added by 1-proxy) ===
+PySocks>=1.7.1
+
+# === KNOWLEDGE GRAPH (added by 1-graph) ===
+# Required:
+# networkx, pandas, matplotlib, plotly already declared above.
+# Optional (auto-fallback to networkx built-ins when absent):
+python-louvain>=0.16   # alternative louvain implementation (community package)
+leidenalg>=0.10        # Leiden community detection — requires python-igraph
+python-igraph>=0.11    # required by leidenalg
+imageio>=2.34          # for TemporalNetwork.visualize_evolution() GIF output
+
+# === v2.0.0 NETWORKX_PRO (added by v2-networkx-pro) ===
+# networkx (>=3.2), numpy, scipy, scikit-learn already declared above.
+# Optional — enables HTML-network visualisation via GraphIO.to_pyvis():
+pyvis>=0.3.2           # interactive HTML network visualisation (lazy-imported)
+
+# === v2.0.0 SYSTEMATIC_REVIEW (added by v2-sr) ===
+# Notes:
+# - pandas, numpy, scipy, matplotlib, openpyxl, reportlab, PyYAML are all
+#   already declared above and reused.
+# - The systematic_review package lazy-imports every heavy dependency
+#   inside the methods that need them, so `import systematic_review`
+#   succeeds even in a minimal Python environment.
+# - Meta-analysis / network-meta-analysis synthesis methods delegate to
+#   the sibling `meta_analysis/` package (added by v2-meta); if that
+#   package is not yet installed, the synthesizers raise a clear
+#   NotImplementedError prompting the caller to fall back to narrative.
+# - PRISMA flow-diagram generation delegates to the sibling
+#   `prisma.generator` module (added by v2-prisma); if not yet installed,
+#   PRISMAIntegration falls back to a built-in SVG + matplotlib renderer.
+# No new third-party packages are introduced by this sub-agent.
+
+# === TESTING ===
+pytest>=7.4
+
+# === v2.0.0 Q1_FIGURES (added by v2-q1) ===
+# All Q1-figure dependencies are already declared above (matplotlib,
+# numpy, scipy, scikit-learn, networkx, statsmodels).  No new packages
+# were introduced by this sub-agent.
+# Notes:
+# - matplotlib.sankey (used by BibliometricPlots.sankey_diagram /
+#   Q1NetworkPlots.sankey_diagram) ships with matplotlib itself.
+# - scipy.cluster.hierarchy + scipy.spatial.distance are used for
+#   dendrograms and hierarchical-clustering heatmaps.
+# - The optional `fa2` package (ForceAtlas2 layout) is NOT declared
+#   because it depends on `python-igraph` and is rarely available via
+#   pip cleanly; Q1NetworkPlots.network_figure gracefully falls back
+#   to networkx.spring_layout when fa2 is missing.
+# - matplotlib-venn is already declared above (used by v1.0.0
+#   project_management.comparison); not needed by q1_figures but kept
+#   for backwards compatibility.
+
+
+# === v2.0.0 EXTRA_SCRAPERS (added by v2-extras) ===
+# New scrapers added by sub-agent v2-extras:
+#   springer_scraper.py     — Springer Nature API (api_key)
+#   ieee_scraper.py         — IEEE Xplore Metadata API (api_key)
+#   acm_scraper.py           — ACM DL HTML scrape (bs4 + lxml)
+#   core_scraper.py         — CORE API v3 (api_key, Bearer auth)
+#   base_scraper_ext.py     — BASE Search API (optional api_key)
+#   unpaywall_scraper.py    — Unpaywall REST API (email only)
+#   opencitations_scraper.py — OpenCitations COCI (open data, no key)
+#   sciopen_scraper.py      — Sciopen OA aggregator (HTML scrape)
+#   wikipedia_scraper.py    — Wikipedia Action API (no key)
+# All new scrapers reuse existing dependencies (requests, beautifulsoup4,
+# lxml, tenacity) — no new packages are introduced by this sub-agent.
+# The integrations/ sub-package (citation_resolver, oa_finder,
+# metadata_enricher) also reuses existing deps only.
+
+# === v2.0.0 PRISMA (added by v2-prisma) ===
+# The prisma/ package reuses matplotlib (already declared above), reportlab
+# (already declared under REPORTING / EXPORT), python-docx (already declared
+# under REPORTING / EXPORT), and PyYAML (already declared under CORE).
+# All heavy deps are lazy-imported inside the methods that need them, so
+# `import prisma` succeeds even in a minimal Python environment.
+# No new third-party packages are introduced by this sub-agent.
+
+
+# === v2.0.0 GEPHI_VIZ (added by v2-gephi) ===
+# Notes:
+# - numpy, scipy, networkx, matplotlib, pandas, plotly, scikit-learn, qtpy,
+#   PyQt5 are already declared above; they are lazy-imported so every
+#   gephi_viz module imports cleanly in headless environments.
+# - pyvis (>=0.3.2) is also already declared under NETWORKX_PRO — reused here
+#   for the PreviewRenderer.render_pyvis() interactive HTML output.
+# No new third-party packages are introduced by this sub-agent.
+
+
+# === v2.0.0 RESEARCH_LIFECYCLE (added by v2-lifecycle) ===
+# Notes:
+# - pandas, numpy, networkx are already declared above (DATA SCIENCE section);
+#   lazy-imported inside the methods that need them so the package imports
+#   cleanly even in a minimal Python environment.
+# - reportlab, python-docx are already declared under REPORTING / EXPORT;
+#   lazy-imported by ProtocolBuilder.to_pdf / to_docx and
+#   ReportingChecklist.to_pdf.
+# - PyYAML is already declared under CORE; lazy-imported by
+#   ExtractionSession.to_yaml.
+# - The optional llm_client parameter accepts an
+#   ai_assistant.llm_client.LLMClient (already covered by the AI ASSISTANT
+#   block) — when None, every method falls back to deterministic templates.
+# No new third-party packages are introduced by this sub-agent.
+
+
+# === v2.0.0 META_ANALYSIS (added by v2-meta) ===
+# Notes:
+# - numpy, scipy, pandas, matplotlib, statsmodels are already declared above
+#   (DATA SCIENCE section); lazy-imported inside the meta_analysis methods
+#   that need them so `import meta_analysis` succeeds in a minimal env.
+# - networkx is already declared under DATA SCIENCE; lazy-imported by
+#   meta_analysis.network_meta (consistency model, node splitting, network
+#   plot) — falls back to a deterministic Bucher indirect comparison if
+#   networkx is absent.
+# - reportlab, python-docx are already declared under REPORTING / EXPORT;
+#   lazy-imported by meta_analysis.report.MetaAnalysisReport.generate().
+# - markdown is a NEW optional dep — lazy-imported by
+#   MetaAnalysisReport._to_html(); when missing, the HTML report falls
+#   back to a <pre>-wrapped plain-text render of the Markdown source.
+markdown>=3.5
+
+# === v2.0.0 INNOVATION (added by v2-innovation) ===
+# Notes:
+# - numpy, pandas, scipy, scikit-learn, networkx, statsmodels, matplotlib,
+#   sentence-transformers, bertopic, umap-learn, joblib are already declared
+#   above (DATA SCIENCE section). All heavy deps are lazy-imported inside the
+#   methods that need them so `import innovation.*` succeeds in a minimal env.
+# - Prophet is the only NEW required dep — lazy-imported by
+#   TrendForecaster._forecast_prophet(); when missing, the method falls back
+#   to ARIMA then to linear regression.
+# - FAISS is NEW and optional — lazy-imported by
+#   PaperRecommender.index_papers(); when missing, the recommender uses an
+#   in-memory numpy cosine-similarity index.
+# - The v1.0.0 ai_assistant.llm_client.LLMClient is reused for the LLM-backed
+#   narrative generation in research_directions.py — no new LLM dep added.
+prophet>=1.1.5            # trend forecasting (lazy-imported; falls back to ARIMA)
+faiss-cpu>=1.8.0          # fast paper-recommendation similarity index (optional)
+
+# === v2.0.0 BIBLIOMETRICS (added by v2-bibliometrics) ===
+# Notes:
+# - numpy, pandas, scipy, scikit-learn, networkx, matplotlib are already
+#   declared above (DATA SCIENCE section); imported eagerly inside the
+#   bibliometrics submodules that need them (every public method uses at
+#   least numpy, so the cost is minimal — but the package __init__ does
+#   NOT eagerly import submodules, so `import bibliometrics` is cheap).
+# - Louvain community detection uses networkx's built-in
+#   `nx.algorithms.community.louvain_communities` (available since nx 3.0);
+#   no python-louvain dependency required.
+# - The bibliometrics.scientogram, .vosviewer, and .citespace modules each
+#   lazily import scikit-learn (for spectral_clustering_view and
+#   spectral_embedding) and matplotlib (for *_view figures); the absence
+#   of either raises a clear ImportError only when the relevant method is
+#   called, so the modules remain importable in headless / unit-test
+#   environments.
+# No new third-party packages are introduced by this sub-agent.

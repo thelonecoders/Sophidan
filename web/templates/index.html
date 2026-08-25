@@ -1,0 +1,458 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Academic Research Suite — Dashboard</title>
+  <style>
+    /* === Modern dark theme matching the desktop app's palette === */
+    :root {
+      --bg:        #1a1a2e;
+      --bg-2:      #16213e;
+      --surface:   #1f2647;
+      --surface-2: #232b52;
+      --border:    #2c3559;
+      --accent:    #3B82F6;
+      --accent-2:  #60a5fa;
+      --text:      #e5e7eb;
+      --text-dim:  #94a3b8;
+      --success:   #10b981;
+      --warning:   #f59e0b;
+      --error:     #ef4444;
+      --mono:      'JetBrains Mono', 'Fira Code', ui-monospace, monospace;
+      --sans:      -apple-system, BlinkMacSystemFont, 'Segoe UI',
+                   Roboto, Helvetica, Arial, sans-serif;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body { height: 100%; }
+    body {
+      background: linear-gradient(135deg, var(--bg) 0%, var(--bg-2) 100%);
+      color: var(--text);
+      font-family: var(--sans);
+      font-size: 14px;
+      line-height: 1.5;
+      min-height: 100vh;
+    }
+
+    header.app-header {
+      background: rgba(31, 38, 71, 0.6);
+      backdrop-filter: blur(12px);
+      border-bottom: 1px solid var(--border);
+      padding: 1.25rem 2rem;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      position: sticky;
+      top: 0;
+      z-index: 10;
+    }
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+    }
+    .brand .logo {
+      width: 36px; height: 36px;
+      border-radius: 8px;
+      background: linear-gradient(135deg, var(--accent), var(--accent-2));
+      display: flex; align-items: center; justify-content: center;
+      font-weight: 800; color: white; font-size: 18px;
+      box-shadow: 0 4px 12px rgba(59, 130, 246, 0.4);
+    }
+    .brand h1 {
+      font-size: 1.15rem;
+      font-weight: 600;
+      letter-spacing: -0.01em;
+    }
+    .brand .version {
+      color: var(--text-dim);
+      font-size: 0.8rem;
+      font-family: var(--mono);
+    }
+
+    .status-indicator {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      padding: 0.4rem 0.85rem;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      font-size: 0.82rem;
+      font-family: var(--mono);
+    }
+    .status-dot {
+      width: 8px; height: 8px;
+      border-radius: 50%;
+      background: var(--text-dim);
+      transition: background 0.3s;
+    }
+    .status-dot.ok    { background: var(--success); box-shadow: 0 0 8px var(--success); }
+    .status-dot.warn  { background: var(--warning); }
+    .status-dot.error { background: var(--error);   }
+
+    main {
+      max-width: 1200px;
+      margin: 0 auto;
+      padding: 2rem;
+    }
+
+    .hero {
+      text-align: center;
+      padding: 2.5rem 1rem 1.5rem;
+    }
+    .hero h2 {
+      font-size: 2rem;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+      margin-bottom: 0.5rem;
+    }
+    .hero p {
+      color: var(--text-dim);
+      max-width: 640px;
+      margin: 0 auto;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      gap: 1.25rem;
+      margin: 2rem 0;
+    }
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 1.5rem;
+      text-decoration: none;
+      color: inherit;
+      transition: transform 0.15s, border-color 0.15s, box-shadow 0.15s;
+    }
+    .card:hover {
+      transform: translateY(-2px);
+      border-color: var(--accent);
+      box-shadow: 0 8px 24px rgba(59, 130, 246, 0.18);
+    }
+    .card .icon {
+      width: 40px; height: 40px;
+      border-radius: 8px;
+      background: rgba(59, 130, 246, 0.15);
+      color: var(--accent);
+      display: flex; align-items: center; justify-content: center;
+      font-size: 20px;
+      margin-bottom: 0.85rem;
+    }
+    .card h3 {
+      font-size: 1rem;
+      margin-bottom: 0.35rem;
+    }
+    .card p {
+      color: var(--text-dim);
+      font-size: 0.85rem;
+    }
+    .card .arrow {
+      margin-top: 0.85rem;
+      color: var(--accent);
+      font-size: 0.85rem;
+      font-weight: 500;
+    }
+
+    .panel {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 1.5rem;
+      margin-top: 1.5rem;
+    }
+    .panel-header {
+      display: flex; align-items: center; justify-content: space-between;
+      margin-bottom: 1rem;
+    }
+    .panel-header h3 { font-size: 1rem; font-weight: 600; }
+    .panel-header .badge {
+      font-family: var(--mono);
+      font-size: 0.72rem;
+      color: var(--text-dim);
+      background: var(--bg);
+      padding: 0.25rem 0.5rem;
+      border-radius: 4px;
+      border: 1px solid var(--border);
+    }
+
+    .stats-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+      gap: 1rem;
+    }
+    .stat {
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 1rem;
+    }
+    .stat .label {
+      color: var(--text-dim);
+      font-size: 0.72rem;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      margin-bottom: 0.35rem;
+    }
+    .stat .value {
+      font-family: var(--mono);
+      font-size: 1.25rem;
+      font-weight: 600;
+    }
+    .stat .value.true  { color: var(--success); }
+    .stat .value.false { color: var(--error);   }
+
+    .activity-list {
+      list-style: none;
+      font-family: var(--mono);
+      font-size: 0.8rem;
+    }
+    .activity-list li {
+      padding: 0.5rem 0;
+      border-bottom: 1px solid var(--border);
+      color: var(--text-dim);
+    }
+    .activity-list li:last-child { border-bottom: none; }
+    .activity-list .ts {
+      color: var(--accent);
+      margin-right: 0.5rem;
+    }
+
+    .open-desktop {
+      display: inline-block;
+      margin-top: 1rem;
+      padding: 0.6rem 1.2rem;
+      background: var(--accent);
+      color: white;
+      text-decoration: none;
+      border-radius: 6px;
+      font-weight: 500;
+      font-size: 0.9rem;
+      transition: background 0.15s;
+    }
+    .open-desktop:hover { background: var(--accent-2); }
+    .open-desktop.disabled {
+      background: var(--surface-2);
+      color: var(--text-dim);
+      cursor: not-allowed;
+      pointer-events: none;
+    }
+
+    footer {
+      text-align: center;
+      padding: 2rem;
+      color: var(--text-dim);
+      font-size: 0.78rem;
+      border-top: 1px solid var(--border);
+      margin-top: 2rem;
+    }
+
+    .skeleton {
+      display: inline-block;
+      width: 60px; height: 1em;
+      background: var(--border);
+      border-radius: 4px;
+      animation: pulse 1.2s ease-in-out infinite;
+    }
+    @keyframes pulse {
+      0%, 100% { opacity: 0.4; }
+      50%      { opacity: 0.8; }
+    }
+  </style>
+</head>
+<body>
+  <header class="app-header">
+    <div class="brand">
+      <div class="logo">AR</div>
+      <div>
+        <h1>Academic Research Suite</h1>
+        <div class="version">v<span id="version">—</span></div>
+      </div>
+    </div>
+    <div class="status-indicator">
+      <span class="status-dot" id="status-dot"></span>
+      <span id="status-text">checking…</span>
+    </div>
+  </header>
+
+  <main>
+    <section class="hero">
+      <h2>Local Research Workspace</h2>
+      <p>
+        Optional local web server exposing the Academic Research Suite's
+        scraping, analytics, AI, and reporting capabilities over HTTP and
+        WebSocket. Mirror of the desktop UI — same engine, different shell.
+      </p>
+      <a href="#" id="open-desktop" class="open-desktop disabled"
+         title="Launch the desktop app">
+        Open Desktop App
+      </a>
+    </section>
+
+    <section class="grid">
+      <a class="card" href="/api/docs">
+        <div class="icon">📚</div>
+        <h3>API Reference</h3>
+        <p>Swagger-style list of every endpoint, method, param, and example payload.</p>
+        <div class="arrow">View docs →</div>
+      </a>
+      <a class="card" href="/api/health">
+        <div class="icon">💚</div>
+        <h3>Health Check</h3>
+        <p>Live JSON status: version, modules, tracked tasks, platform.</p>
+        <div class="arrow">GET /api/health →</div>
+      </a>
+      <a class="card" href="/api/scraping/sources">
+        <div class="icon">🔍</div>
+        <h3>Scrapers</h3>
+        <p>Discover available data sources (arXiv, PubMed, OpenAlex, …).</p>
+        <div class="arrow">GET /api/scraping/sources →</div>
+      </a>
+      <a class="card" href="/api/ai/models">
+        <div class="icon">🤖</div>
+        <h3>AI Models</h3>
+        <p>Available LLMs by provider (OpenAI, Anthropic, Ollama).</p>
+        <div class="arrow">GET /api/ai/models →</div>
+      </a>
+    </section>
+
+    <section class="panel">
+      <div class="panel-header">
+        <h3>Live System Stats</h3>
+        <span class="badge">polls every 3s</span>
+      </div>
+      <div class="stats-grid" id="stats-grid">
+        <div class="stat"><div class="label">Version</div>
+          <div class="value"><span class="skeleton"></span></div></div>
+        <div class="stat"><div class="label">Python</div>
+          <div class="value"><span class="skeleton"></span></div></div>
+        <div class="stat"><div class="label">Platform</div>
+          <div class="value"><span class="skeleton"></span></div></div>
+        <div class="stat"><div class="label">Tasks Tracked</div>
+          <div class="value"><span class="skeleton"></span></div></div>
+        <div class="stat"><div class="label">Database</div>
+          <div class="value"><span class="skeleton"></span></div></div>
+        <div class="stat"><div class="label">Scraping Engine</div>
+          <div class="value"><span class="skeleton"></span></div></div>
+        <div class="stat"><div class="label">AI Chat Engine</div>
+          <div class="value"><span class="skeleton"></span></div></div>
+        <div class="stat"><div class="label">Event Bus</div>
+          <div class="value"><span class="skeleton"></span></div></div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-header">
+        <h3>Recent Activity</h3>
+        <span class="badge">/api/scraping/tasks</span>
+      </div>
+      <ul class="activity-list" id="activity-list">
+        <li><span class="ts">—</span> Waiting for activity…</li>
+      </ul>
+    </section>
+  </main>
+
+  <footer>
+    Academic Research Suite · MIT License ·
+    <a href="/api/docs" style="color: var(--accent); text-decoration: none;">
+      API Docs
+    </a>
+  </footer>
+
+  <script>
+    // === Pure-vanilla JS client polling /api/health every 3 seconds ===
+    (function () {
+      var VERSION = null;
+      var statusDot = document.getElementById('status-dot');
+      var statusText = document.getElementById('status-text');
+      var versionEl = document.getElementById('version');
+      var statsGrid = document.getElementById('stats-grid');
+      var activityEl = document.getElementById('activity-list');
+      var desktopLink = document.getElementById('open-desktop');
+
+      function setStatus(state, label) {
+        statusDot.className = 'status-dot ' + state;
+        statusText.textContent = label;
+      }
+
+      function fmtValue(v) {
+        if (v === true)  return '<span class="value true">yes</span>';
+        if (v === false) return '<span class="value false">no</span>';
+        if (v === null || v === undefined) return '<span class="value">—</span>';
+        return '<span class="value">' + String(v) + '</span>';
+      }
+
+      function renderHealth(data) {
+        VERSION = data.version || VERSION;
+        versionEl.textContent = VERSION || '0.0.0';
+        var m = data.modules || {};
+        statsGrid.innerHTML =
+          statCard('Version', VERSION || '—') +
+          statCard('Python', data.python || '—') +
+          statCard('Platform', data.platform || '—') +
+          statCard('Tasks Tracked', data.tasks !== undefined ? data.tasks : '—') +
+          statCard('Database', m.database) +
+          statCard('Scraping Engine', m.scraping_engine) +
+          statCard('AI Chat Engine', m.chat_engine) +
+          statCard('Event Bus', m.event_bus);
+
+        var ok = (data.active_modules || []).length;
+        if (ok === 0) {
+          setStatus('warn', 'degraded — ' + (Object.keys(m).length - ok) + ' modules missing');
+        } else if (ok < Object.keys(m).length) {
+          setStatus('warn', 'partial — ' + ok + '/' + Object.keys(m).length + ' modules live');
+        } else {
+          setStatus('ok', 'all systems operational');
+        }
+
+        // Enable desktop-app link only when running locally (loopback).
+        if (location.hostname === '127.0.0.1' || location.hostname === 'localhost') {
+          desktopLink.classList.remove('disabled');
+          desktopLink.href = 'ars://open';
+        }
+      }
+
+      function statCard(label, v) {
+        return '<div class="stat"><div class="label">' + label + '</div>' +
+               fmtValue(v) + '</div>';
+      }
+
+      function renderTasks(data) {
+        var tasks = data.tasks || [];
+        if (!tasks.length) {
+          activityEl.innerHTML = '<li><span class="ts">—</span> No tasks yet. Submit one via POST /api/scraping/search</li>';
+          return;
+        }
+        var rows = tasks.slice(0, 10).map(function (t) {
+          var age = ((Date.now() / 1000) - (t.created_at || 0)).toFixed(0);
+          return '<li><span class="ts">[' + t.status + ']</span> ' +
+                 (t.query || '(empty)') + ' — ' +
+                 (t.results_count || 0) + ' results — ' + age + 's ago</li>';
+        });
+        activityEl.innerHTML = rows.join('');
+      }
+
+      function poll() {
+        fetch('/api/health')
+          .then(function (r) { return r.json(); })
+          .then(renderHealth)
+          .catch(function () { setStatus('error', 'unreachable'); });
+
+        fetch('/api/scraping/tasks')
+          .then(function (r) { return r.json(); })
+          .then(renderTasks)
+          .catch(function () {
+            activityEl.innerHTML = '<li><span class="ts">—</span> tasks endpoint unavailable</li>';
+          });
+      }
+
+      poll();
+      setInterval(poll, 3000);
+    })();
+  </script>
+</body>
+</html>
