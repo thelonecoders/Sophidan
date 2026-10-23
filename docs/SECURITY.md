@@ -175,7 +175,7 @@ alongside that release.
 
 ## Contact
 
-- **Security email:** <security@academic-research-suite.org>
+- **Security email:** <academicresearchsuite@proton.me>
 - **PGP key:** available at <https://keys.openpgp.org> (search for
   the security email).
 - **General issues:** <https://github.com/thelonecoders/Sophidan/issues>
