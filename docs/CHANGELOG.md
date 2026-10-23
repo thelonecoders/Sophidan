@@ -6,6 +6,123 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [Unreleased]
+
+### Fixed (patch round 2026-10-07)
+- `web/server.py` / `main.py`: removed hard-coded `__version__ = "0.1.0"`;
+  the version is now sourced from the layered configuration, so
+  `/api/health`, `--version` and the Help ▸ About dialog report 2.0.0.
+- `web/routes/scraping.py`: `GET /api/scraping/sources` probed a
+  non-existent `engine.list_sources` method and therefore always served
+  the static 8-source fallback, hiding the 5 keyless v2 scrapers (ACM,
+  OpenCitations, Unpaywall, SciOpen, Wikipedia). The route now queries
+  `engine.available_scrapers()`, covers the full 17-scraper catalog and
+  reports `active_count` (13 active without API keys).
+- `proxy/proxy_manager.py`: fixed import of the non-existent
+  `database.connection.get_connection` symbol; the proxy cache now uses
+  the real `DatabaseConnection` singleton via `engine.raw_connection()`
+  instead of silently falling back to a separate local database file.
+- `requirements.txt`: removed `noto-sans-sc>=1.0`, which does not exist
+  on PyPI and broke `pip install -r requirements.txt` for every fresh
+  install. CJK font fallback relies on fonttools + system Noto fonts.
+- `ui/dialogs/help_dialog.py`: About tab showed hard-coded
+  "Version 0.1.0"; now reads the configured version.
+- README: test badge and Testing section corrected to the real 303-case
+  suite (117 v1 + 92 v2 + 72 functional + 20 patch-regression +
+  2 README-example tests); the project-structure tree now lists
+  `tests/test_patch_regressions.py` (and no longer references a
+  non-existent `tests/test_reports_view.py`).
+- `.gitignore`: now excludes `data/*.db`, `*.db-wal`, `*.db-shm` and
+  `data/exports/` so local databases and SQLite sidecar files can no
+  longer be committed accidentally (keeps the shipped empty schema).
+
+### Added (patch round 2026-10-07)
+- `.github/workflows/ci.yml`: GitHub Actions CI — compile sweep +
+  full pytest suite + smoke runner on Python 3.10/3.11/3.12 (headless).
+- `Dockerfile` + `.dockerignore`: reproducible web-server container
+  with health check for `--web` deployments.
+- `tests/test_patch_regressions.py`: regression tests locking the
+  version sourcing, the sources-endpoint fix, and the proxy-DB fix
+  (expanded to 20 tests by the packaging round below).
+- `docs/screenshots/README.md`: placeholder so README image links
+  resolve to a real directory.
+
+### Fixed
+- `requirements.txt`: removed invalid `python>=3.10` line (Python version is declared via `requires-python`).
+- Version metadata aligned to 2.0.0 (`pyproject.toml`, `config/settings.py`, `config/default_config.yaml`, README).
+- README examples corrected to match the code: h=5, g=10, e=13.78, pooled effect 1.82 (95% CI 1.15 to 2.50).
+- README and docs counts reconciled with the code: 17 scrapers (13 default, 4 key-gated), 10 layouts + LayoutPipeline, 16 filters, 13 statistical plots, 12 data plots, 9 quality tools.
+- Repository, clone, issue and User-Agent URLs now point to https://github.com/thelonecoders/Sophidan.
+- README no longer claims dependencies are pinned.
+
+### Security
+- Web server: no hard-coded default `SECRET_KEY`; CORS and Socket.IO origins default to local origins and honour `CORS_ORIGINS` / `ARS_CORS_ORIGINS`.
+
+### Added
+- `tests/test_readme_examples.py` locks the documented numeric examples.
+- `docs/COMPLIANCE_AND_LICENSING.md`; `.gitignore`.
+- Current Anthropic model ids in the model selectors (older ids retained).
+
+### Fixed (packaging & docs round 2026-10-08)
+- `pyproject.toml`: packaging repaired — the 9 v2 packages are now
+  included in `packages.find` (the previous `data*` exclude glob also
+  swallowed `data_acquisition` and `database`, so `pip install .`
+  shipped only 13 of 22 packages and `pip install -e .` was required),
+  `py-modules = ["main"]` backs the `ars = main:main` console script,
+  `web/templates/*.html` ship as package data, and local
+  `config/secrets.yaml` / `*.db` files are excluded from wheels.
+- `requirements.txt`: `pytest>=7.4` floor aligned with the
+  `minversion = "8.0"` already declared in `pyproject.toml`.
+- `main.spec`: collects `ui` / `web` submodules (dynamically imported
+  via importlib) and bundles `web/templates/`; the contradictory
+  collect-then-exclude torch/transformers block was resolved (the DL
+  stack stays excluded — every consumer degrades gracefully).
+- `Dockerfile`: runs as a non-root `appuser`; the server now binds to
+  `127.0.0.1` by default (matching the comment) with an `ARS_HOST`
+  override for `docker run -e ARS_HOST=0.0.0.0 -p …` publishing;
+  `.dockerignore` excludes `data/ars.db*`, runtime report/log dirs and
+  the stray root `__init__.py`.
+- `installer/ars.nsi`: all source paths are repo-root relative (matches
+  the documented `makensis installer\ars.nsi` invocation); user-data
+  deletion is gated behind an explicit uninstaller checkbox.
+- `tests/test_functional_v2.py`: the enshrined
+  `test_citation_bursts_on_ramp` (which legitimised the fabricated
+  linear-citation ramp) was rewritten as
+  `test_citation_bursts_require_real_yearly_histories` — real
+  per-year histories must produce bursts, cumulative-only papers must
+  produce none, and the legacy ramp survives only behind the explicit
+  `allow_synthetic_ramp=True` opt-in.
+- `tests/test_v2.py`: repaired vacuous assertions in
+  `test_bibliometrics_compute_all` (dead `for`/`pass` loop → real key +
+  value checks) and `test_sr_rob_tools_instantiate` (trivial
+  `hasattr(__class__)` → real domain/tool checks).
+- `tests/test_patch_regressions.py`: +16 contract-lock regression
+  tests (MH RBG variance closed form, REML τ² plausibility, SUCRA
+  ordering, heatmap without vmin/vmax, log-rank same-groups p > 0.05,
+  `_connected_view` directed diameter, GraphIO GraphML/GEXF round-trip
+  with None/list attrs, katz link-prediction route shape, DB paper
+  CRUD round-trip, EventBus string/Event interop, Worker signal wiring
+  offscreen, CSV formula-injection guard, RIS exporter round-trip,
+  ProxyPool facade + rotator ban sync, `Paper.to_dict`, BASE/CORE
+  query builders). Suite is fully green: **303 passed, 0 failed**.
+- Docs regenerated against the live API: README (all five broken v2
+  examples, PDFReport builder chain, `GraphIO.to_cytoscape`, 17
+  centralities, 108 endpoints, test badge/tree), api_reference.md
+  (15 blueprints / 108 endpoints / health 2.0.0 / auth roadmap),
+  development.md (real `main.spec` recipe, 2.0.0 versions),
+  SECURITY.md (v2.0.x supported-version table), INSTALL.md (real env
+  var names + BASE-not-via-OpenAlex + real pyvis entry point + v2.1
+  roadmap refs), FAQ.md (Jinja2 → v2.2.0), INNOVATION.md /
+  user_guide.md (GraphIO.to_cytoscape), BUILD_WINDOWS_EXE.md
+  (phantom workflow section + leaked sandbox path removed),
+  CHANGELOG (counts + planned-version alignment).
+- `.github/`: CI gains ruff (non-blocking), pytest-qt install +
+  `QT_QPA_PLATFORM=offscreen`, `timeout-minutes` and a concurrency
+  group; minimal bug/feature issue templates + PR template added;
+  SECURITY.md / CODE_OF_CONDUCT.md mirrored under `.github/`.
+- `tests/conftest.py` added (offscreen Qt + Agg env defaults), making
+  CONTRIBUTING.md's "tests inherit these via `conftest.py`" true.
+
 ## [v2.0.0] — 2026-08-25 — Research-lifecycle OS release
 
 The v2.0.0 release turns Academic Research Suite from a literature-
@@ -34,7 +151,7 @@ remain 100% backwards-compatible.
   intellectual turning points, research fronts); and the
   `ScientogramBuilder` for Sci2 / Leydesdorff-style scientograms.
 - `networkx_pro/` — full NetworkX algorithm library exposed behind
-  ten stateless classes: `Centralities` (20 measures),
+  ten stateless classes: `Centralities` (17 measures),
   `CommunityDetection`, `ComponentAnalysis`, `PathsAndFlows`,
   `LinkPrediction`, `Isomorphism`, `BipartiteAnalysis`,
   `GraphGenerators`, `GraphIO`, `MultiGraphAnalysis` — together
@@ -595,27 +712,26 @@ optional local Flask web server.
 
 ## Planned Versions
 
-### [v1.1.0] — planned (Q4 2026)
+### [v2.1.0] — planned (Q4 2026)
 
+- Multi-user server mode with PostgreSQL + Redis.
 - Pluggable authentication for the web server (API tokens +
   optional OIDC).
-- Postgres-backed deployment guide with Docker Compose.
 - Real-time collaborative editing of project notes.
 - Bulk PDF full-text ingestion with Tesseract OCR.
 - Snapshots diff view in the UI.
-- PyInstaller `main.spec` for one-click desktop binary builds.
+- PRISMA flow builder: drag-and-drop stage editor.
 
-### [v1.2.0] — planned (Q1 2027)
+### [v2.2.0] — planned (Q1 2027)
 
 - Bidirectional Zotero / Mendeley / EndNote sync.
 - Custom report templates with Jinja2.
 - Plugin system: drop-in scrapers and analyses via entry-points.
 - Bilingual UI (English / 简体中文).
-- Public plugin registry at <https://plugins.academic-research-suite.org>.
+- Network meta-analysis with multi-arm studies (Gemtc-style).
 
-### [v2.0.0] — planned (Q2 2027)
+### [v2.3.0] — planned (Q2 2027, unscheduled)
 
-- Multi-user server mode with PostgreSQL + Redis.
 - PySide6 / Qt 6 migration behind the qtpy shim.
 - Cloud LLM routing layer (multi-provider, automatic fail-over,
   cost tracking, budget alerts).
@@ -625,6 +741,6 @@ optional local Flask web server.
 
 ---
 
-*[Unreleased]:* v1.0.0 is shipped as a GitHub source release.
-PyPI publication is deferred to v1.1.0.
+*[Unreleased]:* v2.0.0 is shipped as a GitHub source release.
+PyPI publication is deferred to the first stable minor (v2.1.0).
 

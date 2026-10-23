@@ -33,8 +33,8 @@ and AI providers.
 
 ```bash
 # 1. Clone
-git clone https://github.com/academic-research-suite/academic_research_suite.git
-cd academic_research_suite
+git clone https://github.com/thelonecoders/Sophidan.git
+cd Sophidan
 
 # 2. Create venv (Python 3.10+)
 python -m venv venv
@@ -191,7 +191,7 @@ academic_research_suite/
 ├── config/                       Settings + YAML loader
 ├── core/                         Orchestrator · TaskQueue · EventBus
 ├── utils/                        logger · cache · workers · config_manager
-├── data_acquisition/             9 scrapers + ScrapingEngine
+├── data_acquisition/             17 scrapers + ScrapingEngine
 ├── proxy/                        6-module proxy suite
 ├── data_science/                 7 modules: topics, clustering, ...
 ├── knowledge_graph/              5 modules: citation, collaboration, ...
@@ -618,39 +618,35 @@ via `testpaths = ["tests"]` in `pyproject.toml`.
 
 ## Building the Desktop Binary
 
-ARS can be packaged as a single-file executable with PyInstaller.
-A canonical `main.spec` file is on the v1.1.0 roadmap; until then,
-use the following recipe:
+ARS can be packaged as a distributable folder executable with
+PyInstaller. A canonical, maintained `main.spec` ships at the repo
+root — use it:
 
 ```bash
-pip install pyinstaller
+pip install "pyinstaller>=6.0"
+pyinstaller main.spec --clean --noconfirm
 
-pyinstaller \
-  --name "academic-research-suite" \
-  --windowed \
-  --onedir \
-  --add-data "config/default_config.yaml:config" \
-  --add-data "ui:ui" \
-  --add-data "web/templates:web/templates" \
-  --hidden-import qtpy \
-  --hidden-import PyQt5 \
-  main.py
-
-# The bundled app lands in dist/academic-research-suite/
+# Linux:  dist/AcademicResearchSuite/AcademicResearchSuite  (ELF binary)
+# Windows (on a Windows host): dist/AcademicResearchSuite/AcademicResearchSuite.exe
 ```
+
+The spec already declares the lazy-imported hidden imports (v1/v2
+scrapers, all v2 packages, the dynamically loaded `ui.widgets.*` and
+`web.routes.*` submodules, the Qt backends) and bundles the data files
+(`config/default_config.yaml`, `web/templates/`, `LICENSE`). See the
+spec header and [docs/BUILD_WINDOWS_EXE.md](BUILD_WINDOWS_EXE.md) for
+end-user instructions.
 
 **Notes:**
 
-- `--onedir` is preferred over `--onefile` for a project this
-  size; startup time is much better and debugging is easier.
-- Use `--add-data` for every non-Python file (YAML, QSS, HTML
-  templates). The syntax is `source:dest` (Linux/macOS) or
-  `source;dest` (Windows).
-- Hidden imports are needed for any package that's loaded lazily
-  via `importlib.import_module` — PyInstaller's static analyzer
-  won't see them.
-- A formal `main.spec` will be added in v1.1.0; tracked under
-  [Roadmap in README](../README.md#roadmap).
+- `--onedir`-style COLLECT output is preferred over `--onefile` for a
+  project this size; startup time is much better and debugging is
+  easier.
+- The deep-learning stack (torch / transformers /
+  sentence_transformers) is deliberately excluded from the bundle;
+  every feature that would use it degrades gracefully.
+- PyInstaller cannot cross-compile: a real `.exe` must be built on a
+  Windows host.
 
 ---
 
@@ -662,17 +658,17 @@ The release process is automated but human-gated.
 
 ARS follows [Semantic Versioning](https://semver.org/):
 
-- **Patch** (`v1.0.1`): bug fixes only, no API changes.
-- **Minor** (`v1.1.0`): backwards-compatible features.
-- **Major** (`v2.0.0`): breaking changes.
+- **Patch** (`v2.0.1`): bug fixes only, no API changes.
+- **Minor** (`v2.1.0`): backwards-compatible features.
+- **Major** (`v3.0.0`): breaking changes.
 
 The version is recorded in three places:
 
-1. `pyproject.toml` → `version = "1.0.0"`.
-2. `config/default_config.yaml` → `version: "1.0.0"`.
+1. `pyproject.toml` → `version = "2.0.0"`.
+2. `config/default_config.yaml` → `version: "2.0.0"`.
 3. `docs/CHANGELOG.md` → new entry on release day.
 
-The `main.py` module declares `__version__ = "0.1.0"` for the
+The `main.py` module declares `__version__ = "2.0.0"` for the
 desktop banner — keep this in sync on release.
 
 ### Release checklist
@@ -689,7 +685,7 @@ desktop banner — keep this in sync on release.
    python -m build
    twine upload dist/*
    ```
-   PyPI publication is **TBD** — v1.0.0 is shipped as a GitHub
+   PyPI publication is **TBD** — v2.0.0 is shipped as a GitHub
    source release only.
 
 ### Branching
@@ -776,8 +772,8 @@ We follow the standard fork → branch → PR workflow.
 ### 1. Fork & branch
 
 ```bash
-gh repo fork academic-research-suite/academic_research_suite --clone
-cd academic_research_suite
+gh repo fork thelonecoders/Sophidan --clone
+cd Sophidan
 git checkout -b feat/my-feature develop
 ```
 

@@ -251,7 +251,7 @@ To verify in a fresh clone:
 
 ```bash
 git clone <repo> academic_research_suite
-cd academic_research_suite
+cd Sophidan
 git rev-parse HEAD          # should print the SHA above
 git describe --tags         # should print v2.0.0
 git tag -l -n5              # should list v0.1.0, v0.2.0, v1.0.0, v2.0.0

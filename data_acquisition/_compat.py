@@ -167,6 +167,39 @@ def get_logger(name: str) -> logging.Logger:
         return logger
 
 
+# ---------------------------------------------------------------------------
+# Polite-pool contact email (audit 4-b #27)
+# ---------------------------------------------------------------------------
+
+#: Project-wide fallback contact address.  Used by scrapers whose APIs
+#: require (or strongly recommend) an identifying e-mail — Unpaywall's
+#: ToS, NCBI E-utilities and OpenAlex's polite pool.  ``example.com``
+#: placeholders are NOT acceptable: Unpaywall and NCBI block/penalise
+#: requests that carry them.
+DEFAULT_CONTACT_EMAIL = "ars@example.org"
+
+
+def contact_email() -> str:
+    """Return the configured contact e-mail for polite API pools.
+
+    Resolution order:
+      1. ``config.settings.unpaywall_email`` (added in v2.0.1; also
+         fed by the ``UNPAYWALL_EMAIL`` environment variable).
+      2. :data:`DEFAULT_CONTACT_EMAIL` (``ars@example.org``).
+
+    Never raises — a missing config module degrades to the constant.
+    """
+    try:  # pragma: no cover - depends on config module availability
+        from config.settings import get_settings  # type: ignore
+
+        email = getattr(get_settings(), "unpaywall_email", None)
+        if email and "@" in str(email):
+            return str(email)
+    except Exception:  # noqa: BLE001
+        pass
+    return DEFAULT_CONTACT_EMAIL
+
+
 __all__ = [
     "BaseScraper",
     "Paper",
@@ -289,4 +322,6 @@ __all__ += [
     "OpenAccessLocation",
     "Citation",
     "WikipediaArticle",
+    "DEFAULT_CONTACT_EMAIL",
+    "contact_email",
 ]

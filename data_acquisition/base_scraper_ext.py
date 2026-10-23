@@ -3,7 +3,7 @@ base_scraper_ext.py
 ===================
 
 Scraper for the **Bielefeld Academic Search Engine (BASE)** API
-(``https://api.base-search.net/``).
+(``https://api.base-search.net/cgi-bin/BaseHttpSearchInterface.fcgi``).
 
 BASE is one of the world's largest aggregators of open-access
 documents (journals, repositories, datasets).  A free academic API
@@ -66,11 +66,22 @@ def _load_settings() -> Any:
 class BASEScraper(BaseScraper):
     """Scraper for the BASE (Bielefeld Academic Search Engine) API."""
 
-    BASE_URL = "https://api.base-search.net/"
+    # Full search-interface endpoint (audit 4-b #1: the bare host
+    # ``https://api.base-search.net/`` returned 404 for every request —
+    # the search servlet lives under /cgi-bin/BaseHttpSearchInterface.fcgi).
+    BASE_URL = (
+        "https://api.base-search.net/cgi-bin/BaseHttpSearchInterface.fcgi"
+    )
     SOURCE_NAME = "base"
 
-    # Recognised document-type filter values exposed by BASE.
+    # Recognised document-type filter values exposed by BASE (mapped to
+    # the ``dcdocumenttype`` Lucene facet used by the search interface).
     _VALID_TYPES = {"publication", "dataset", "software"}
+    _TYPE_FACET = {
+        "publication": "publication",
+        "dataset": "dataset",
+        "software": "software",
+    }
 
     def __init__(
         self,
@@ -123,13 +134,18 @@ class BASEScraper(BaseScraper):
             query: Free-text search string (uses BASE's ``query``
                 parameter, which supports Lucene syntax).
             max_results: Maximum number of records to return.
-            year: 4-digit publication-year filter.
+            year: 4-digit publication-year filter (folded into the
+                Lucene query as ``dcyear:<year>`` — BASE's HTTP
+                interface has no dedicated ``year`` parameter).
             type: Document-type filter — one of ``"publication"``,
-                ``"dataset"``, ``"software"``.
+                ``"dataset"``, ``"software"`` (folded into the Lucene
+                query as ``dcdocumenttype:<type>``).
             language: ISO-639-1 / ISO-639-2 language code (e.g.
-                ``"eng"``, ``"ger"``, ``"fra"``).
+                ``"eng"``, ``"ger"``, ``"fra"``; folded into the
+                Lucene query as ``dclanguage:<code>``).
             country: ISO-3166-1 alpha-2 country code of the
-                repository's host country.
+                repository's host country (folded into the Lucene
+                query as ``country:<code>``).
             **kwargs: Reserved for future use.
 
         Returns:
@@ -139,32 +155,41 @@ class BASEScraper(BaseScraper):
         result = ScraperResult(source=self.name, query=query)
         errors: List[str] = []
 
-        # BASE accepts query parameters via the ``?func=perform&query=...``
-        # REST endpoint.  Anonymous clients skip the API key entirely.
-        params: Dict[str, Any] = {
-            "func": "perform",
-            "query": query,
-            "format": "json",
-            "hits": min(max_results, 100),
-            "offset": 0,
-        }
-        if self.api_key:
-            params["apikey"] = self.api_key
+        # BASE's HTTP interface accepts *only* the Lucene ``query``
+        # parameter — year/type/language/country are NOT API parameters
+        # (audit 4-b #1).  They are folded into the Lucene query string
+        # with AND semantics.
+        lucene_parts: List[str] = []
+        if query and query.strip():
+            lucene_parts.append(query.strip())
         if year:
-            params["year"] = int(year)
+            lucene_parts.append(f"dcyear:{int(year)}")
         if type:
-            t = (type or "").strip().lower()
+            t = str(type).strip().lower()
             if t in self._VALID_TYPES:
-                params["type"] = t
+                lucene_parts.append(f"dcdocumenttype:{self._TYPE_FACET[t]}")
             else:
                 self.logger.warning(
                     "Unknown BASE type=%r; expected one of %s",
                     type, sorted(self._VALID_TYPES),
                 )
         if language:
-            params["lang"] = language
+            lucene_parts.append(f"dclanguage:{str(language).strip().lower()}")
         if country:
-            params["country"] = country
+            lucene_parts.append(f"country:{str(country).strip().lower()}")
+        lucene_query = " AND ".join(lucene_parts) if lucene_parts else "*"
+
+        # BASE accepts query parameters via the ``?func=perform&query=...``
+        # REST endpoint.  Anonymous clients skip the API key entirely.
+        params: Dict[str, Any] = {
+            "func": "perform",
+            "query": lucene_query,
+            "format": "json",
+            "hits": min(max_results, 100),
+            "offset": 0,
+        }
+        if self.api_key:
+            params["apikey"] = self.api_key
 
         raw_response: Dict[str, Any] = {}
         try:

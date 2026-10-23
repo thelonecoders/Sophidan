@@ -150,11 +150,18 @@ class COREScraper(BaseScraper):
         # CORE v3 expects a JSON POST body.
         q_parts: List[str] = []
         if query and query.strip():
-            # CORE uses Lucene-like syntax; quoted strings preserve multi-word phrases.
-            if " " in query.strip() and not query.strip().startswith('"'):
-                q_parts.append(f'title:(""{query.strip()}") OR abstract:(""{query.strip()}") OR fullText:(""{query.strip()}")')
+            # CORE uses Lucene-like syntax; quoted strings preserve multi-word
+            # phrases.  A phrase needs SINGLE double-quotes around the whole
+            # term — the previous f-string doubled them (`title:(""x"")`),
+            # producing an invalid Lucene phrase that 400'd every multi-word
+            # CORE search (audit 4-b #2).
+            q = query.strip()
+            if " " in q and not q.startswith('"'):
+                q_parts.append(
+                    f'title:("{q}") OR abstract:("{q}") OR fullText:("{q}")'
+                )
             else:
-                q_parts.append(query.strip())
+                q_parts.append(q)
         else:
             q_parts.append("*")
 

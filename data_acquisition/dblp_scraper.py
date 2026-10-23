@@ -119,7 +119,13 @@ class DBLPScraper(BaseScraper):
             xml_text = self._get_text(
                 self.BASE_URL,
                 params=params,
-                cache_key=self._cache_key("dblp_search", query),
+                # The cache key MUST include the page size ``h`` — the
+                # old key omitted it, so a second search of the same
+                # query with a larger max_results returned the
+                # truncated cached page (audit 4-b #17).
+                cache_key=self._cache_key(
+                    "dblp_search", query, params["h"], params["f"]
+                ),
             )
         except Exception as exc:
             self.logger.error("DBLP search failed: %s", exc, exc_info=True)
@@ -384,15 +390,16 @@ class DBLPScraper(BaseScraper):
             except ValueError:
                 year_int = None
 
-            ee = fields.get("ee") or fields.get("doi")
+            ee = fields.get("ee") or None
+            doi, url = self._split_ee_and_doi(fields.get("doi"), ee)
             papers.append(
                 Paper(
                     title=fields.get("title", "").rstrip("."),
                     authors=authors,
                     year=year_int,
                     abstract="",
-                    doi=ee,
-                    url=ee,
+                    doi=doi,
+                    url=url,
                     source=self.name,
                     citations_count=None,
                     references=[],
@@ -430,13 +437,14 @@ class DBLPScraper(BaseScraper):
             el = root.find(f".//{tag}")
             if el is not None:
                 fields: Dict[str, Any] = {child.tag: (child.text or "") for child in el}
+                doi, url = self._split_ee_and_doi(fields.get("doi"), fields.get("ee"))
                 return {
                     "title": fields.get("title", "").rstrip("."),
                     "authors": [a.text for a in el.findall("author") if a.text],
                     "year": fields.get("year"),
                     "venue": fields.get("journal") or fields.get("booktitle"),
-                    "doi": fields.get("ee") or fields.get("doi"),
-                    "url": fields.get("ee"),
+                    "doi": doi,
+                    "url": url,
                     "type": el.tag,
                     "key": el.get("key"),
                 }
@@ -457,6 +465,30 @@ class DBLPScraper(BaseScraper):
                 d[tag] = self._info_to_dict(child)
         return d
 
+    @staticmethod
+    def _split_ee_and_doi(
+        doi_text: Optional[str], ee_text: Optional[str]
+    ) -> tuple[Optional[str], Optional[str]]:
+        """Separate the DOI and the landing-page URL from DBLP fields.
+
+        DBLP records carry the DOI in a dedicated ``<doi>`` element and
+        the electronic-edition URL in ``<ee>``.  When only ``<ee>`` is
+        present and it happens to point at doi.org, the DOI is extracted
+        from the URL; every other ``<ee>`` value (dl.acm.org, link.
+        springer.com, ...) is treated purely as the URL.
+
+        Returns:
+            ``(doi, url)`` — either may be ``None``.
+        """
+        doi = (doi_text or "").strip() or None
+        ee = (ee_text or "").strip() or None
+        if not doi and ee:
+            for prefix in ("https://doi.org/", "http://doi.org/", "doi.org/", "doi:"):
+                if ee.lower().startswith(prefix):
+                    doi = ee[len(prefix):].strip() or None
+                    break
+        return doi, ee
+
     def _hit_to_paper(self, hit: Dict[str, Any]) -> Paper:
         """Convert a DBLP hit dict to a :class:`Paper`."""
         authors = hit.get("authors") or []
@@ -469,15 +501,19 @@ class DBLPScraper(BaseScraper):
         except (TypeError, ValueError):
             year_int = None
 
-        ee = hit.get("doi") or hit.get("ee") or hit.get("url")
+        # audit 4-b #13: Paper.doi used to be populated from the <ee>
+        # element (a https://doi.org/... or dl.acm.org/... URL), which
+        # broke cross-source DOI dedupe/merging.  The DOI comes from the
+        # dedicated <doi> element; <ee> is the landing-page URL.
+        doi, url = self._split_ee_and_doi(hit.get("doi"), hit.get("ee") or hit.get("url"))
 
         return Paper(
             title=(hit.get("title") or "").rstrip("."),
             authors=list(authors),
             year=year_int,
             abstract="",
-            doi=ee,
-            url=ee,
+            doi=doi,
+            url=url,
             source=self.name,
             citations_count=None,
             references=[],

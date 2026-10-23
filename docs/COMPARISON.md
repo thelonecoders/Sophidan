@@ -300,7 +300,7 @@ discovery via the "two-papers" or "multi-papers" method.
 | CitationResolver (cross-API DOI / OpenAlex / Crossref / OpenCitations) | ✓ | ✓ (uses OpenAlex) |
 | Co-citation + bibliographic coupling analysis | ✓ | partial |
 | Bibliometrics (PoP indices + journal metrics) | ✓ | ✗ |
-| Network visualization (11 layouts) | ✓ | ✗ (uses its own) |
+| Network visualization (10 layouts) | ✓ | ✗ (uses its own) |
 | Systematic-review lifecycle | ✓ | ✗ |
 | Meta-analysis | ✓ | ✗ |
 | PRISMA 2020 flow generator | ✓ | ✗ |
@@ -365,7 +365,7 @@ subscription model.
 | PRISMA 2020 flow generator + 6 extensions | ✓ | partial (basic flow) |
 | Forest / funnel plots | ✓ | ✓ (basic) |
 | Bibliometrics | ✓ | ✗ |
-| Network visualization (11 layouts + 60+ algorithms) | ✓ | ✗ |
+| Network visualization (10 layouts + 60+ algorithms) | ✓ | ✗ |
 | Q1-journal figure factory | ✓ | ✗ |
 | Innovation analytics | ✓ | ✗ |
 | Local-LLM RAG assistant | ✓ | ✗ |
@@ -402,7 +402,7 @@ risk-of-bias tables, and GRADE summaries.
 | Sensitivity analysis (leave-one-out, cumulative, influence) | ✓ | partial |
 | 4 RoB tools (RoB 2, ROBINS-I, QUADAS-2, NOS) | ✓ | partial (RoB 2 + ROBINS-I) |
 | Bibliometrics (PoP + VOS + CiteSpace) | ✓ | ✗ |
-| Network visualization (11 layouts) | ✓ | ✗ |
+| Network visualization (10 layouts) | ✓ | ✗ |
 | Q1-journal figure factory (10 palettes) | ✓ | ✗ |
 | Innovation analytics | ✓ | ✗ |
 | Local-LLM RAG assistant | ✓ | ✗ |
@@ -441,7 +441,7 @@ meta-analysis toolkit by a wide margin.
 | Systematic-review screening + kappa | ✓ | ✗ |
 | PRISMA 2020 flow generator | ✓ | ✗ |
 | Bibliometrics (PoP + VOS + CiteSpace) | ✓ | ✗ |
-| Network visualization (11 layouts) | ✓ | ✗ |
+| Network visualization (10 layouts) | ✓ | ✗ |
 | Q1-journal figure factory (10 journal palettes) | ✓ | ✗ |
 | Innovation analytics | ✓ | ✗ |
 | Local-LLM RAG assistant | ✓ | ✗ |
@@ -548,4 +548,4 @@ For everything else, ARS v2.0.0 is the broadest single-tool option.
 *Comparisons reflect feature sets as of v2.0.0 (August 2026). For
 tool-version-by-version detail see each project's documentation; if
 you spot a discrepancy please open an issue at
-<https://github.com/academic-research-suite/academic_research_suite/issues>.*
+<https://github.com/thelonecoders/Sophidan/issues>.*

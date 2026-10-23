@@ -34,12 +34,31 @@ import re
 import time
 from typing import Any, Dict, List, Optional
 
-from ._compat import BaseScraper, Paper, ScraperResult, get_logger
+from ._compat import BaseScraper, Paper, ScraperResult, contact_email, get_logger
 
 CROSSREF_BASE_URL = "https://api.crossref.org/works"
 
-# Sort names accepted by Crossref's `sort` parameter.
-_VALID_SORTS = {"relevance", "published", "cited", "submitted", "updated", "score"}
+# Sort names accepted by Crossref's `sort` parameter (audit 4-b #4:
+# "cited" and "submitted" are NOT valid — they caused HTTP 400 on every
+# request that used them).  Crossref has no "cited" sort; citation
+# ordering is "is-referenced-by-count".
+_VALID_SORTS = {
+    "is-referenced-by-count",
+    "score",
+    "published",
+    "issued",
+    "deposited",
+    "references-count",
+    "updated",
+}
+
+# Friendly aliases accepted by callers -> real Crossref sort values.
+_SORT_ALIASES = {
+    "relevance": "score",
+    "cited": "is-referenced-by-count",
+    "citations": "is-referenced-by-count",
+    "date": "published",
+}
 
 
 class CrossrefScraper(BaseScraper):
@@ -79,10 +98,12 @@ class CrossrefScraper(BaseScraper):
             timeout=timeout,
             max_retries=max_retries,
             cache=cache,
-            user_agent=self._user_agent(polite_email),
+            user_agent=self._user_agent(polite_email or contact_email()),
         )
         self.logger: logging.Logger = get_logger(__name__)
-        self._polite_email = polite_email
+        # Crossref's polite pool needs an identifying email; fall back to
+        # the project contact constant (audit 4-b #27 pattern).
+        self._polite_email = polite_email or contact_email()
 
     # ------------------------------------------------------------------
     # BaseScraper interface
@@ -106,8 +127,13 @@ class CrossrefScraper(BaseScraper):
                 ``type``, ``container_title``, ``author``,
                 ``has_full_text``, ``has_license``. Unknown keys are
                 passed through unchanged.
-            sort: Sort order — one of ``"relevance"``,
-                ``"published"``, ``"cited"``.
+            sort: Sort order — one of ``"score"`` (relevance),
+                ``"is-referenced-by-count"`` (citations),
+                ``"published"``, ``"issued"``, ``"deposited"`` or
+                ``"references-count"``.  The legacy aliases
+                ``"relevance"`` / ``"cited"`` are mapped to their
+                valid Crossref equivalents; unknown values fall back
+                to ``"score"``.
             **kwargs: Reserved for future use.
 
         Returns:
@@ -115,7 +141,15 @@ class CrossrefScraper(BaseScraper):
         """
         start_ms = self._now_ms()
         result = ScraperResult(source=self.name, query=query)
-        sort = sort if sort in _VALID_SORTS else "relevance"
+        # Map legacy aliases ("relevance"/"cited") and drop anything
+        # Crossref would reject with HTTP 400 (audit 4-b #4).
+        sort = _SORT_ALIASES.get(sort, sort)
+        if sort not in _VALID_SORTS:
+            self.logger.warning(
+                "Unsupported Crossref sort %r; falling back to 'score'.",
+                sort,
+            )
+            sort = "score"
 
         params: Dict[str, Any] = {
             "query.bibliographic": query,
@@ -252,51 +286,77 @@ class CrossrefScraper(BaseScraper):
     def fetch_citations(self, doi: str, max_results: int = 100) -> List[Paper]:
         """Fetch works citing the given DOI.
 
-        Crossref exposes this through ``filter=reference:DOI``.
+        Crossref's REST API has NO forward-citation filter — the
+        ``filter=reference:DOI`` query this method used to build is not
+        a documented Crossref filter and always answered HTTP 400, so
+        the method silently returned ``[]`` forever (audit 4-b #3).
+
+        Inbound citations are instead resolved through the **OpenCitations
+        COCI** index (``/citations/{doi}``), which is derived from
+        Crossref's own citation links, then each citing DOI is expanded
+        into a full record via :meth:`fetch_by_doi`.  When OpenCitations
+        yields nothing, the Semantic Scholar ``/paper/DOI:.../citations``
+        endpoint is used as a second source.
 
         Args:
             doi: The DOI whose citations should be retrieved.
             max_results: Maximum number of citing works to return.
 
         Returns:
-            A list of citing :class:`Paper` objects.
+            A list of citing :class:`Paper` objects (may be empty when
+            no open citation index knows the DOI).
         """
         cleaned = self._clean_doi(doi)
         if not cleaned:
             return []
-        params: Dict[str, Any] = {
-            "filter": f"reference:{cleaned}",
-            "rows": min(max_results, 100),
-            "sort": "published",
-        }
-        if self._polite_email:
-            params["mailto"] = self._polite_email
 
-        cursor = "*"
-        out: List[Paper] = []
-        while len(out) < max_results:
-            params["cursor"] = cursor
+        # --- Source 1: OpenCitations COCI (open, Crossref-derived) -----
+        citing_dois: List[str] = []
+        try:
+            from .opencitations_scraper import OpenCitationsScraper
+
+            oc = OpenCitationsScraper(rate_limit=3.0)
+            citing_dois = [
+                c.citing_doi
+                for c in oc.fetch_citations(cleaned)
+                if c.citing_doi
+            ]
+        except Exception as exc:  # noqa: BLE001 - optional source
+            self.logger.debug(
+                "fetch_citations(%s): OpenCitations unavailable: %s",
+                cleaned, exc,
+            )
+
+        # --- Source 2: Semantic Scholar citations (fallback) ------------
+        if not citing_dois:
             try:
-                resp = self._make_request("GET", self.BASE_URL, params=params)
-                data = self._handle_response(resp)
-            except Exception as exc:
-                self.logger.error("Crossref fetch_citations(%s): %s", doi, exc)
-                break
-            message = data.get("message", {})
-            items = message.get("items", []) or []
-            if not items:
-                break
-            for item in items:
-                if len(out) >= max_results:
-                    break
-                try:
-                    out.append(self._parse_work(item))
-                except Exception as exc:  # pragma: no cover
-                    self.logger.warning("Skipping citation: %s", exc)
-            cursor = message.get("next-cursor")
-            if not cursor:
-                break
-        return out
+                from .semantic_scholar_scraper import SemanticScholarScraper
+
+                s2 = SemanticScholarScraper(rate_limit=0.33)
+                papers = s2.fetch_citations(f"DOI:{cleaned}", limit=max_results)
+                return papers[:max_results]
+            except Exception as exc:  # noqa: BLE001 - optional source
+                self.logger.debug(
+                    "fetch_citations(%s): Semantic Scholar unavailable: %s",
+                    cleaned, exc,
+                )
+                return []
+
+        # --- Expand citing DOIs into full Crossref records ---------------
+        out: List[Paper] = []
+        for citing in citing_dois[:max_results]:
+            try:
+                paper = self.fetch_by_doi(citing)
+                if paper is not None:
+                    out.append(paper)
+                    continue
+            except Exception as exc:  # noqa: BLE001 - per-item resilience
+                self.logger.debug(
+                    "fetch_citations: failed to expand %s: %s", citing, exc
+                )
+            # Keep the citing DOI even when Crossref has no record.
+            out.append(Paper(doi=citing, title=f"DOI:{citing}", source=self.name))
+        return out[:max_results]
 
     # ------------------------------------------------------------------
     # Internal helpers

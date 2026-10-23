@@ -159,6 +159,23 @@ def _coerce_list(value: Any) -> list:
         return [value]
 
 
+def _scalar_isna(value: Any) -> bool:
+    """Return ``True`` for missing *scalar* values (never raises).
+
+    ``pd.isna`` raises ``ValueError`` ("truth value of an array is
+    ambiguous") when handed a list/array cell (e.g. ``keywords`` stored
+    as a list). Non-scalar containers are therefore never treated as
+    missing.
+    """
+    if isinstance(value, (list, tuple, set, dict, np.ndarray, pd.Series, pd.Index)):
+        return False
+    try:
+        result = pd.isna(value)
+    except (TypeError, ValueError):
+        return False
+    return bool(result) if isinstance(result, (bool, np.bool_)) else False
+
+
 class AnalysisEngine:
     """Central data-analysis orchestrator.
 
@@ -217,13 +234,15 @@ class AnalysisEngine:
             for col in _PAPER_FIELDS:
                 if col in df.columns:
                     val = row[col]
-                    rec[col] = None if pd.isna(val) else val
+                    # Scalar-only NaN check: pd.isna on list/array cells
+                    # raises "truth value of an array is ambiguous".
+                    rec[col] = None if _scalar_isna(val) else val
                 else:
                     rec[col] = None
             for opt in _OPTIONAL_FIELDS:
                 if opt in df.columns:
                     val = row[opt]
-                    rec[opt] = None if pd.isna(val) else val
+                    rec[opt] = None if _scalar_isna(val) else val
             records.append(rec)
         self._papers = records
         self.logger.info("Loaded %d papers from DataFrame", len(self._papers))

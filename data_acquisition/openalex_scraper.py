@@ -33,7 +33,7 @@ from typing import Any, Dict, Iterator, List, Mapping, Optional
 
 import requests
 
-from .base_scraper import BaseScraper, Paper, ScraperResult
+from ._compat import BaseScraper, Paper, ScraperResult, contact_email
 
 logger = logging.getLogger(__name__)
 
@@ -52,7 +52,7 @@ class OpenAlexScraper(BaseScraper):
         timeout: float = 30.0,
         max_retries: int = 3,
         user_agent: Optional[str] = None,
-        mailto: str = "ars_user@example.com",
+        mailto: Optional[str] = None,
     ) -> None:
         """Initialize an :class:`OpenAlexScraper`.
 
@@ -65,7 +65,11 @@ class OpenAlexScraper(BaseScraper):
             max_retries: Maximum retry attempts.
             user_agent: Optional User-Agent override.
             mailto: ``mailto`` query parameter; moves the client into
-                the polite pool (higher rate limit).
+                the polite pool (higher rate limit).  Defaults to
+                ``config.settings.unpaywall_email`` or the project
+                contact constant — OpenAlex asks polite-pool clients
+                for a real address, not ``example.com`` placeholders
+                (audit 4-b #27).
         """
         super().__init__(
             proxy_manager=proxy_manager,
@@ -75,7 +79,7 @@ class OpenAlexScraper(BaseScraper):
             max_retries=max_retries,
             user_agent=user_agent,
         )
-        self.mailto = mailto
+        self.mailto = mailto or contact_email()
 
     # -- public API ------------------------------------------------------
 
@@ -129,8 +133,10 @@ class OpenAlexScraper(BaseScraper):
                     "abstract_inverted_index",
                     "referenced_works",
                     "primary_location",
+                    "best_oa_location",
                     "type",
                     "language",
+                    "topics",
                     "concepts",
                     "keywords",
                     "biblio",
@@ -241,16 +247,23 @@ class OpenAlexScraper(BaseScraper):
         return self._search_entity("institutions", name)
 
     def fetch_venues(self, name: str) -> List[Dict[str, Any]]:
-        """Search the ``/venues`` endpoint by name."""
-        return self._search_entity("venues", name)
+        """Search for journal/venue records by name.
+
+        OpenAlex renamed the deprecated ``/venues`` endpoint to
+        ``/sources`` in 2024 (audit 4-b #23); the current endpoint is
+        used and venue-style records are returned.
+        """
+        return self._search_entity("sources", name)
 
     def fetch_concepts(self, name: str) -> List[Dict[str, Any]]:
-        """Search the ``/concepts`` endpoint by name.
+        """Search topic records by name.
 
-        Note: the ``/concepts`` endpoint is deprecated by OpenAlex but
-        remains available; we keep this for legacy callers.
+        The deprecated ``/concepts`` endpoint has been replaced by
+        ``/topics`` in the current OpenAlex API (audit 4-b #23); the
+        current endpoint is used.  Concept-style call sites keep
+        working — topics expose ``display_name`` like concepts did.
         """
-        return self._search_entity("concepts", name)
+        return self._search_entity("topics", name)
 
     # -- helpers ---------------------------------------------------------
 
@@ -328,14 +341,14 @@ class OpenAlexScraper(BaseScraper):
         primary_location = item.get("primary_location") or {}
         source_obj = primary_location.get("source") or {}
         pdf_url = None
-        best_oa = primary_location.get("best_oa_location") or {}
+        # ``best_oa_location`` is a TOP-LEVEL work field — the old code
+        # looked for it under primary_location (always None) and left a
+        # dead ``for...pass`` loop behind (audit 4-b #23).
+        best_oa = item.get("best_oa_location") or {}
         if isinstance(best_oa, Mapping):
-            pdf_url = best_oa.get("pdf_url")
-        if not pdf_url:
-            for loc_field in ("locations", "locations_count"):
-                # OpenAlex doesn't expose a "best_oa_location" under
-                # primary_location reliably; also check open_access.
-                pass
+            pdf_url = best_oa.get("pdf_url") or best_oa.get("landing_page_url")
+        if not pdf_url and isinstance(primary_location, Mapping):
+            pdf_url = primary_location.get("pdf_url")
         open_access = item.get("open_access") or {}
         if not pdf_url and isinstance(open_access, Mapping):
             oa_url = open_access.get("oa_url")
@@ -364,6 +377,12 @@ class OpenAlexScraper(BaseScraper):
             name = kw.get("keyword") or kw.get("display_name") or ""
             if name:
                 keywords.append(name)
+        # Prefer the current /topics vocabulary; fall back to the
+        # deprecated concepts list (still returned when requested).
+        for topic in item.get("topics", []) or []:
+            display = topic.get("display_name") or ""
+            if display:
+                keywords.append(display)
         for concept in item.get("concepts", []) or []:
             display = concept.get("display_name") or ""
             if display:
@@ -379,11 +398,21 @@ class OpenAlexScraper(BaseScraper):
             work_id = work_id[len("https://openalex.org/") :]
 
         fields_of_study: List[str] = []
+        for topic in item.get("topics", []) or []:
+            # Topics nest their discipline under field/subfield/domain.
+            field_obj = topic.get("field") or {}
+            display = (
+                field_obj.get("display_name")
+                if isinstance(field_obj, Mapping)
+                else None
+            ) or topic.get("display_name") or ""
+            if display and display not in fields_of_study:
+                fields_of_study.append(display)
         for concept in item.get("concepts", []) or []:
             level = concept.get("level")
             if level == 0:  # top-level concepts only
                 display = concept.get("display_name") or ""
-                if display:
+                if display and display not in fields_of_study:
                     fields_of_study.append(display)
 
         return Paper(

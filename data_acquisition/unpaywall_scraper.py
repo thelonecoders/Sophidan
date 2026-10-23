@@ -38,7 +38,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Mapping, Optional
 
-from ._compat import BaseScraper, Paper, ScraperResult, get_logger
+from ._compat import BaseScraper, Paper, ScraperResult, contact_email, get_logger
 
 logger = logging.getLogger(__name__)
 
@@ -240,7 +240,12 @@ class UnpaywallScraper(BaseScraper):
             )
             # Don't hard-fail; Unpaywall may still return a result.
         url = f"{self.BASE_URL}/{cleaned}"
-        params: Dict[str, Any] = {"email": self.email or "anonymous@example.com"}
+        # Unpaywall's ToS requires a real contact address — the old
+        # "anonymous@example.com" placeholder is rejected/penalised
+        # (audit 4-b #27).  self.email already resolves from
+        # settings.unpaywall_email / UNPAYWALL_EMAIL; the constant is
+        # the last-resort project contact.
+        params: Dict[str, Any] = {"email": self.email or contact_email()}
         try:
             cache_key = self._cache_key("unpaywall", "doi", cleaned)
             resp = self._make_request(
@@ -369,18 +374,22 @@ class UnpaywallScraper(BaseScraper):
     # -- internal helpers ------------------------------------------------
 
     def _resolve_email(self) -> Optional[str]:
-        """Resolve the contact email from env var or settings."""
+        """Resolve the contact email from env var or settings.
+
+        Falls back to the project contact constant (``ars@example.org``)
+        instead of an ``example.com`` placeholder (audit 4-b #27).
+        """
         env = os.environ.get("UNPAYWALL_EMAIL")
         if env:
             return env
         settings = _load_settings()
         if settings is None:
-            return None
+            return contact_email()
         for attr in ("unpaywall_email", "contact_email", "polite_email"):
             value = getattr(settings, attr, None)
             if value:
                 return value
-        return None
+        return contact_email()
 
     @staticmethod
     def _clean_doi(doi: str) -> str:

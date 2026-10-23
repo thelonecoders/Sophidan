@@ -52,7 +52,7 @@ from bibliometrics import JournalMetrics, VOSAnalyzer, CiteSpaceAnalyzer, Scient
 stats = quick_stats([120, 45, 30, 12, 8, 5, 3, 1, 0, 0])
 print(stats["h_index"], stats["e_index"])
 
-profile = AuthorProfile.from_papers(papers, author_id="A1")
+profile = AuthorProfile.from_papers(papers, name="A1")
 print(profile.to_dict())
 
 jm = JournalMetrics()
@@ -162,7 +162,7 @@ print(MultiGraphAnalysis.parallel_edge_count(MG, 1, 2))   # 2
 
 ## gephi_viz
 
-Eleven layout algorithms, fifteen filters, Gephi-grade statistics,
+Ten layout algorithms (plus LayoutPipeline), sixteen filters, Gephi-grade statistics,
 partition coloring, ranking-based sizing, multi-backend renderer,
 Qt-embedded interactive canvas.
 
@@ -411,14 +411,17 @@ from prisma.checklist import PRISMAChecklist, PRISMAExtensionsChecklist
 from prisma.extensions import PRISMAExtension, PRISMAExtensionGenerator
 
 counts = PRISMAStageCounts(
-    records_identified_via_databases=1248,
-    records_after_deduplication=1107,
-    records_screened=1107,
-    records_excluded_title_abstract=923,
-    full_text_articles_assessed_for_eligibility=184,
-    full_text_articles_excluded=67,
-    studies_included_in_qualitative_synthesis=117,
-    studies_included_in_quantitative_synthesis=84,
+    n_records_databases=1248,
+    n_records_registers=37,
+    n_records_after_duplicates=1107,
+    n_records_screened=1107,
+    n_records_excluded_title_abstract=923,
+    n_records_sought_full_text=184,
+    n_records_not_retrieved=8,
+    n_full_text_assessed=176,
+    n_full_text_excluded=67,
+    n_studies_included_qualitative=117,
+    n_studies_included_quantitative=84,
 )
 gen = PRISMAFlowGenerator(counts, title="Remdesivir review")
 gen.render_svg("prisma.svg"); gen.render_pdf("prisma.pdf")
@@ -447,10 +450,10 @@ PRISMAExtensionGenerator.nma_flow(counts, title="NMA flow")
 | `Q1FigureFactory` | `q1_figures.figure_factory` | Single-call builder: `set_journal`, `set_size(columns, aspect)`, `set_dpi`, `new_figure`, `new_axes`, `new_figure_and_axes`, `style_axes`, `set_axis_labels`, `set_title`, `set_tick_labels_fontsize`, `add_legend`, `add_significance_bar`, `add_significance_line`, `add_error_bars`, `add_colorbar`, `annotate_panel`, `save`, `finalize`. |
 | `GridLayout` | `q1_figures.multi_panel` | Grid layout helper. |
 | `MultiPanelFigure` | `q1_figures.multi_panel` | Multi-panel composition with panel labels, shared axes, per-panel colorbars; `add_panel`, `add_panel_at`, `share_x`, `share_y`, `set_panel_label`, `set_panel_title`, `add_colorbar_to`, `adjust_spacing`, `finalize`, `save`. |
-| `StatisticalPlots` | `q1_figures.statistical_plots` | 14 plots: `boxplot`, `violinplot`, `raincloud_plot`, `beeswarm`, `paired_plot`, `volcano_plot`, `manhattan_plot`, `qq_plot`, `kaplan_meier`, `roc_curve`, `pr_curve`, `calibration_plot`, `bland_altman`. |
+| `StatisticalPlots` | `q1_figures.statistical_plots` | 13 plots: `boxplot`, `violinplot`, `raincloud_plot`, `beeswarm`, `paired_plot`, `volcano_plot`, `manhattan_plot`, `qq_plot`, `kaplan_meier`, `roc_curve`, `pr_curve`, `calibration_plot`, `bland_altman`. |
 | `Q1NetworkPlots` | `q1_figures.network_plots` | 8 plots: `network_figure`, `bipartite_figure`, `circular_network`, `arc_diagram`, `heatmap_graph`, `sankey_diagram`, `chord_diagram`, `hive_plot`. |
 | `BibliometricPlots` | `q1_figures.bibliometric_plots` | 12 plots: `lotka_curve`, `bradford_curve`, `zipf_law_plot`, `growth_curve`, `citation_distribution`, `h_index_curve`, `impact_factor_distribution`, `author_collaboration_heatmap`, `citation_network_graph`, `topic_evolution_streamgraph`, `overlay_visualization`, `co_word_map`. |
-| `Q1DataPlots` | `q1_figures.data_plots` | 11 plots: `scatter`, `line_plot`, `bar_plot`, `stacked_bar`, `grouped_bar`, `heatmap`, `clustered_heatmap`, `density_plot`, `contour_plot`, `ridgeline_plot`, `parallel_coordinates`, `polar_plot`. |
+| `Q1DataPlots` | `q1_figures.data_plots` | 12 plots: `scatter`, `line_plot`, `bar_plot`, `stacked_bar`, `grouped_bar`, `heatmap`, `clustered_heatmap`, `density_plot`, `contour_plot`, `ridgeline_plot`, `parallel_coordinates`, `polar_plot`. |
 
 ```python
 from q1_figures.figure_factory import Q1FigureFactory
@@ -590,7 +593,7 @@ print(ReportingChecklist.to_markdown(items))
 # Writing
 writer = WritingAssistant(llm_client=llm)
 outline = writer.outline(topic="...", papers=papers[:30])
-abstract = writer.generate_abstract(topic="...", papers=papers[:20])
+abstract = writer.generate_abstract(papers[0], max_words=250)
 ```
 
 ---
@@ -625,14 +628,16 @@ from innovation.research_directions import ResearchDirectionRecommender
 # Bursts
 det = CitationBurstDetector(s=2.0, gamma=1.0)
 bursts = det.detect_papers(papers)
-det.visualize(bursts, path="bursts.png")
+fig = det.visualize(bursts, figsize=(12, 8))
+fig.savefig("bursts.png", dpi=150)
 
 # Frontiers
-kf = KnowledgeFrontier(papers, approach="embedding_density")
-frontiers = kf.compute_frontier(top_k=10)
-kf.visualize(frontiers, path="frontiers.png")
-tracker = FrontierTracker(papers)
-print(tracker.emerging_topics(threshold=0.5))
+kf = KnowledgeFrontier(papers)
+frontiers = kf.compute_frontier(method="embedding_density", top_n=10)
+fig = kf.visualize(method="tsne", figsize=(12, 10), regions=frontiers)
+fig.savefig("frontiers.png", dpi=150)
+tracker = FrontierTracker({2020: papers_2020, 2021: papers_2021})
+print(tracker.emerging_topics(year=2021, lookback=2))
 
 # Trend forecasting
 forecaster = TrendForecaster(papers)

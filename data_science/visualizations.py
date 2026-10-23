@@ -115,13 +115,32 @@ class Visualizer:
             ax.text(0.5, 0.5, "No citation data", ha="center", va="center",
                     transform=ax.transAxes)
             return fig
-        # Use log10(citations + 1)
-        log_vals = np.log1p(vals.clip(lower=0))
-        ax.hist(log_vals, bins=30, color="#e07a5f", edgecolor="white")
+        # Histogram the RAW counts on a log x-axis (the old code
+        # histogrammed log1p(values) and then set_xscale("log") — a
+        # double transform with mismatched tick labels that also dropped
+        # the 0-citation bin).
+        vals = vals.clip(lower=0)
+        n_zero = int((vals == 0).sum())
+        plot_vals = vals[vals > 0]
+        if plot_vals.empty:
+            ax.hist(np.zeros(max(n_zero, 1)), bins=[0.5, 1.5],
+                    color="#e07a5f", edgecolor="white")
+            ax.set_xlabel("Citations (all zero)")
+            ax.set_ylabel("Frequency")
+            ax.set_title("Citation Distribution")
+            return fig
+        lo = max(float(plot_vals.min()), 0.5)
+        hi = float(plot_vals.max()) + 1.0
+        bins = np.logspace(np.log10(lo), np.log10(hi), 30)
+        ax.hist(plot_vals, bins=bins, color="#e07a5f", edgecolor="white")
         ax.set_xscale("log")
         ax.set_xlabel("Citations (log scale)")
         ax.set_ylabel("Frequency")
         ax.set_title("Citation Distribution")
+        if n_zero:
+            ax.text(0.98, 0.95, f"{n_zero} paper(s) with 0 citations",
+                    transform=ax.transAxes, ha="right", va="top",
+                    fontsize=7, color="#666666")
         return fig
 
     # ------------------------------------------------------------------
@@ -334,7 +353,12 @@ class Visualizer:
                 ``country`` / ``affiliation_country`` attribute.
 
         Returns:
-            A :class:`matplotlib.figure.Figure`.
+            A :class:`matplotlib.figure.Figure`. If no world geometry is
+            obtainable (``geopandas >= 1.0`` ships none and
+            ``geodatasets`` may not be installed, and the environment
+            may be offline), a horizontal bar chart of the per-country
+            counts is rendered instead — the method never crashes on a
+            missing basemap.
         """
         import matplotlib.pyplot as plt
         try:
@@ -360,33 +384,56 @@ class Visualizer:
             ax.text(0.5, 0.5, "No country data", ha="center", va="center",
                     transform=ax.transAxes)
             return fig
-        try:
-            # Use Natural Earth low-res dataset bundled with geopandas
-            world = gpd.read_file(gpd.datasets.get_path("naturalearth_lowres")) \
-                if hasattr(gpd.datasets, "get_path") else gpd.datasets.get_path("naturalearth_lowres")
-            if isinstance(world, str):
-                world = gpd.read_file(world)
-        except Exception:
-            try:
-                world = gpd.read_file("naturalearth_lowres")
-            except Exception as exc:
-                self.logger.warning("geopandas world dataset unavailable: %s", exc)
-                ax.text(0.5, 0.5, "World geometry unavailable",
-                        ha="center", va="center", transform=ax.transAxes)
-                return fig
+        world = self._load_world_geometry(gpd)
+        if world is None or world.empty:
+            # Graceful degradation: per-country counts as bars (no basemap
+            # available offline). Still a usable figure — never a crash.
+            self.logger.warning(
+                "World geometry unavailable (geopandas >= 1.0 removed the "
+                "bundled naturalearth datasets and no geodatasets/online "
+                "fallback worked) — falling back to a country bar chart."
+            )
+            top = counter.most_common(25)
+            names = [c for c, _ in top][::-1]
+            counts = [v for _, v in top][::-1]
+            ax.barh(names, counts, color="#e07a5f")
+            ax.set_xlabel("Publications")
+            ax.set_title(
+                "Publications by Country "
+                "(world geometry unavailable — bar fallback)"
+            )
+            return fig
         # Map counts onto the world
-        name_col = "name" if "name" in world.columns else (
-            "NAME" if "NAME" in world.columns else None
+        name_col = next(
+            (c for c in ("name", "NAME", "ADMIN", "admin", "name_en",
+                         "NAME_EN") if c in world.columns),
+            None,
         )
-        iso_col = "iso_a3" if "iso_a3" in world.columns else None
+        iso_col = next(
+            (c for c in ("iso_a3", "ISO_A3", "iso_a3_eh", "ISO_A3_EH")
+             if c in world.columns),
+            None,
+        )
+        if name_col is None and iso_col is None:
+            # Geometry without any country identifier → cannot choropleth.
+            self.logger.warning(
+                "World geometry has no country-name/ISO column — using bar fallback."
+            )
+            top = counter.most_common(25)
+            names = [c for c, _ in top][::-1]
+            counts = [v for _, v in top][::-1]
+            ax.barh(names, counts, color="#e07a5f")
+            ax.set_xlabel("Publications")
+            ax.set_title("Publications by Country (no mappable geometry)")
+            return fig
         world["count"] = 0
         for country, c in counter.items():
             mask = (
                 (world[name_col].astype(str).str.lower() == country.lower())
-                if name_col else pd.Series([False] * len(world))
+                if name_col else pd.Series([False] * len(world), index=world.index)
             ) | (
                 (world[iso_col].astype(str).str.upper() == country.upper())
-                if iso_col else pd.Series([False] * len(world))
+                if iso_col else pd.Series([False] * len(world), index=world.index)
             )
             world.loc[mask, "count"] = c
         world.plot(
@@ -396,6 +443,82 @@ class Visualizer:
         ax.set_title("Geographic Distribution of Publications")
         ax.set_axis_off()
         return fig
+
+    @staticmethod
+    def _load_world_geometry(gpd: Any) -> Any:
+        """Best-effort loader for world country polygons.
+
+        Tries, in order:
+        1. ``geodatasets`` (the geopandas-recommended source since 1.0),
+        2. the legacy bundled ``gpd.datasets`` (geopandas <= 0.14),
+        3. a local ``data/geo/*.geojson`` / ``*.shp`` shipped with the
+           repo, if present,
+        4. a short-timeout download of Natural Earth 110m admin-0
+           countries (works only when online).
+
+        Returns a GeoDataFrame whose attributes include a country name
+        and/or ISO-A3 column, or ``None`` when nothing usable is
+        available.
+        """
+        label_cols = ("name", "NAME", "ADMIN", "admin", "name_en",
+                      "NAME_EN")
+        iso_cols = ("iso_a3", "ISO_A3", "iso_a3_eh", "ISO_A3_EH")
+
+        def _usable(gdf: Any) -> bool:
+            return (
+                gdf is not None and len(gdf) > 0
+                and any(c in gdf.columns for c in label_cols + iso_cols)
+            )
+
+        # 1) geodatasets package
+        try:
+            from geodatasets import get_path as _gd_path
+            for name in ("naturalearth.land", "naturalearth land"):
+                try:
+                    gdf = gpd.read_file(_gd_path(name))
+                    if _usable(gdf):
+                        return gdf
+                except Exception:  # noqa: BLE001 - try next source
+                    continue
+        except Exception:  # noqa: BLE001
+            pass
+        # 2) legacy bundled dataset (geopandas <= 0.14)
+        try:
+            if hasattr(gpd, "datasets") and hasattr(gpd.datasets, "get_path"):
+                gdf = gpd.read_file(gpd.datasets.get_path("naturalearth_lowres"))
+                if _usable(gdf):
+                    return gdf
+        except Exception:  # noqa: BLE001
+            pass
+        # 3) repo-bundled geometry (data/geo/...)
+        try:
+            from pathlib import Path
+            geo_dir = Path(__file__).resolve().parents[1] / "data" / "geo"
+            if geo_dir.is_dir():
+                for pattern in ("*.geojson", "*.json", "*.shp"):
+                    for cand in sorted(geo_dir.glob(pattern)):
+                        try:
+                            gdf = gpd.read_file(cand)
+                            if _usable(gdf):
+                                return gdf
+                        except Exception:  # noqa: BLE001
+                            continue
+        except Exception:  # noqa: BLE001
+            pass
+        # 4) online Natural Earth (short timeout so offline runs fail fast)
+        try:
+            import io
+            import requests
+            url = ("https://naciscdn.org/naturalearth/110m/cultural/"
+                   "ne_110m_admin_0_countries.zip")
+            resp = requests.get(url, timeout=5)
+            resp.raise_for_status()
+            gdf = gpd.read_file(io.BytesIO(resp.content))
+            if _usable(gdf):
+                return gdf
+        except Exception:  # noqa: BLE001 - offline / blocked
+            pass
+        return None
 
     # ------------------------------------------------------------------
     # Helpers

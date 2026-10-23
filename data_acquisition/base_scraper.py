@@ -55,9 +55,8 @@ import requests
 try:  # pragma: no cover - tenacity is a declared dep but import is defensive
     from tenacity import (
         Retrying,
-        retry_if_exception_type,
+        retry_if_exception,
         stop_after_attempt,
-        wait_exponential,
     )
     _TENACITY_AVAILABLE = True
 except ImportError:  # pragma: no cover
@@ -265,10 +264,15 @@ class _TokenBucket:
 
         Returns:
             ``True`` if the tokens were acquired, ``False`` on timeout.
+
+        Note:
+            The lock is released while sleeping so concurrent request
+            threads are never serialised behind a rate-limit wait
+            (audit 4-i: token-bucket sleep must not hold the lock).
         """
         deadline = time.monotonic() + timeout
-        with self._lock:
-            while True:
+        while True:
+            with self._lock:
                 now = time.monotonic()
                 delta = now - self._last
                 self._tokens = min(self.capacity, self._tokens + delta * self.rate)
@@ -278,17 +282,81 @@ class _TokenBucket:
                     return True
                 needed = tokens - self._tokens
                 wait = needed / self.rate
-                if time.monotonic() + wait > deadline:
-                    return False
-                # Release lock while sleeping; loop will re-check.
-                # Use a condvar-like pattern with small sleeps to keep
-                # things simple and dependency-free.
-                time.sleep(min(wait, 0.25))
+            # Sleep OUTSIDE the lock; loop re-checks after waking.
+            if time.monotonic() + wait > deadline:
+                return False
+            time.sleep(min(wait, 0.25))
 
 
 # ---------------------------------------------------------------------------
 # BaseScraper
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Retry policy (audit 4-i): ONLY transient failures are retried —
+# connection errors, timeouts, HTTP 429 and 5xx.  Every other 4xx fails
+# immediately (no retry storm against a deterministic client error), and
+# a server-supplied ``Retry-After`` on 429/503 is honoured verbatim.
+# ---------------------------------------------------------------------------
+
+class _RetryableHTTPError(requests.HTTPError):
+    """HTTP failure that MAY be retried (429 / 5xx responses only)."""
+
+
+def _is_retryable(exc: BaseException) -> bool:
+    """Return ``True`` for connection errors, timeouts and 429/5xx HTTP."""
+    if isinstance(exc, _RetryableHTTPError):
+        return True
+    if isinstance(exc, (requests.ConnectionError, requests.Timeout)):
+        return True
+    if isinstance(exc, requests.HTTPError):
+        resp = getattr(exc, "response", None)
+        status = getattr(resp, "status_code", None)
+        return status == 429 or (status is not None and status >= 500)
+    return False
+
+
+def _retry_wait_seconds(retry_state: Any) -> float:
+    """Tenacity wait callable: honour ``Retry-After`` then back off."""
+    exc = None
+    try:
+        outcome = getattr(retry_state, "outcome", None)
+        exc = outcome.exception() if outcome is not None else None
+    except Exception:  # noqa: BLE001
+        exc = None
+    if exc is not None:
+        resp = getattr(exc, "response", None)
+        retry_after = None
+        if resp is not None:
+            headers = getattr(resp, "headers", None)
+            if headers is not None:
+                try:
+                    retry_after = headers.get("Retry-After")
+                except Exception:  # noqa: BLE001
+                    retry_after = None
+        if retry_after:
+            try:
+                return min(max(float(retry_after), 0.0), 60.0)
+            except (TypeError, ValueError):
+                pass  # HTTP-date form — fall back to exponential back-off
+    return min(2.0 ** (getattr(retry_state, "attempt_number", 1) - 1), 30.0)
+
+
+def _manual_retry_wait(exc: BaseException, attempt: int) -> float:
+    """Sleep time for the tenacity-less fallback loop (Retry-After aware)."""
+    resp = getattr(exc, "response", None)
+    headers = getattr(resp, "headers", None)
+    if headers is not None:
+        try:
+            retry_after = headers.get("Retry-After")
+            if retry_after:
+                return min(max(float(retry_after), 0.0), 60.0)
+        except (TypeError, ValueError):  # noqa: BLE001
+            pass
+        except Exception:  # noqa: BLE001 - defensive header access
+            pass
+    return min(2.0 ** attempt, 30.0)
+
 
 class BaseScraper(ABC):
     """Abstract base class for every data source scraper.
@@ -321,7 +389,7 @@ class BaseScraper(ABC):
     #: Default User-Agent string; overridden per-subclass if desired.
     DEFAULT_USER_AGENT = (
         "AcademicResearchSuite/0.1 "
-        "(+https://github.com/academic-research-suite)"
+        "(+https://github.com/thelonecoders/Sophidan)"
     )
 
     #: Subclasses should override with the source's short name.
@@ -398,7 +466,16 @@ class BaseScraper(ABC):
             )
 
     def _proxies(self) -> Optional[Dict[str, str]]:
-        """Return a ``proxies`` dict for ``requests`` if a proxy is set."""
+        """Return a ``proxies`` dict for ``requests`` if a proxy is set.
+
+        The injected manager may hand out either a plain URL string or a
+        :class:`proxy.proxy_manager.Proxy` object (both ``ProxyManager``
+        and ``ProxyPool`` return ``Proxy`` instances — audit 4-i: calling
+        ``.startswith`` on them used to raise ``AttributeError`` and kill
+        proxied scraping).  Proxy objects are converted via the manager's
+        ``to_request_dict()`` when available, falling back to a duck-typed
+        attribute build.
+        """
         if self.proxy_manager is None:
             return None
         try:
@@ -407,6 +484,36 @@ class BaseScraper(ABC):
             return None
         if not addr:
             return None
+
+        # --- Proxy object path -------------------------------------------
+        if not isinstance(addr, str):
+            to_request_dict = getattr(self.proxy_manager, "to_request_dict", None)
+            if callable(to_request_dict):
+                try:
+                    d = to_request_dict(addr)
+                    if isinstance(d, dict) and (d.get("http") or d.get("https")):
+                        http_url = str(d.get("http") or d.get("https"))
+                        https_url = str(d.get("https") or d.get("http"))
+                        return {"http": http_url, "https": https_url}
+                except Exception:  # noqa: BLE001 - fall through to duck-typing
+                    pass
+            # Duck-typed Proxy dataclass (host/port/protocol[/username]).
+            host = getattr(addr, "host", None)
+            port = getattr(addr, "port", None)
+            if host and port:
+                protocol = getattr(addr, "protocol", "http") or "http"
+                auth = ""
+                username = getattr(addr, "username", None)
+                if username:
+                    auth = f"{username}:{getattr(addr, 'password', None) or ''}@"
+                url = f"{protocol}://{auth}{host}:{port}"
+                return {"http": url, "https": url}
+            # Last resort: stringify (e.g. an object with a useful __str__).
+            addr = str(addr)
+            if not addr:
+                return None
+
+        # --- Plain string path --------------------------------------------
         if addr.startswith(("http://", "https://", "socks5://", "socks4://")):
             url = addr
         else:
@@ -499,21 +606,21 @@ class BaseScraper(ABC):
                 proxies=proxies,
                 **kwargs,
             )
-            # Treat 429 and 5xx as retryable.
-            if resp.status_code in (429, 500, 502, 503, 504):
-                raise requests.HTTPError(
+            # Retryable server-side failures: 429 (rate limit) + 5xx.
+            if resp.status_code == 429 or resp.status_code >= 500:
+                raise _RetryableHTTPError(
                     f"HTTP {resp.status_code} from {url}", response=resp
                 )
+            # Any other non-2xx (401/403/404/410/422 ...) is a deterministic
+            # client error: fail fast, do NOT retry.
             resp.raise_for_status()
             return resp
 
         if _TENACITY_AVAILABLE:
             retryer = Retrying(
                 stop=stop_after_attempt(self.max_retries),
-                wait=wait_exponential(multiplier=1, min=1, max=30),
-                retry=retry_if_exception_type(
-                    (requests.ConnectionError, requests.Timeout, requests.HTTPError)
-                ),
+                wait=_retry_wait_seconds,  # honours Retry-After on 429
+                retry=retry_if_exception(_is_retryable),
                 reraise=True,
             )
             response = retryer(_do_request)
@@ -524,9 +631,11 @@ class BaseScraper(ABC):
                 try:
                     response = _do_request()
                     break
-                except (requests.ConnectionError, requests.Timeout, requests.HTTPError) as exc:
+                except Exception as exc:  # noqa: BLE001 - filtered below
+                    if not _is_retryable(exc):
+                        raise
                     last_err = exc
-                    sleep_for = min(2 ** attempt, 30)
+                    sleep_for = _manual_retry_wait(exc, attempt)
                     self.logger.warning(
                         "Request to %s failed (attempt %d/%d): %s; sleeping %.1fs",
                         url, attempt + 1, self.max_retries, exc, sleep_for,

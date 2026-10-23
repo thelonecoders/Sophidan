@@ -157,6 +157,11 @@ class OpenCitationsScraper(BaseScraper):
             result.elapsed_ms = self._now_ms() - start_ms
             return result
         citations = self.fetch_citations(cleaned)
+        # Inbound citing DOIs belong in the raw ``cited_by`` slot, NOT in
+        # ``Paper.references`` (which carries *outbound* reference
+        # semantics — mixing them polluted citation graphs built from
+        # Paper.references, audit 4-b #21).
+        cited_by = [c.citing_doi for c in citations if c.citing_doi]
         paper = Paper(
             title=meta.get("title") or "",
             authors=[],
@@ -165,8 +170,8 @@ class OpenCitationsScraper(BaseScraper):
             doi=cleaned,
             url=f"https://opencitations.net/index/coci?id={cleaned}",
             source=self.name,
-            citations_count=len(citations),
-            references=[c.citing_doi for c in citations if c.citing_doi],
+            citations_count=self.fetch_citation_count(cleaned) or len(citations),
+            references=[],
             keywords=[],
             pdf_url=None,
             issn=None,
@@ -182,6 +187,7 @@ class OpenCitationsScraper(BaseScraper):
             raw={
                 "opencitations": meta,
                 "citations": [c.to_dict() for c in citations],
+                "cited_by": cited_by,
             },
         )
         result.papers.append(paper)
@@ -265,6 +271,12 @@ class OpenCitationsScraper(BaseScraper):
     def fetch_citation_count(self, doi: str) -> int:
         """Return the total number of citations recorded for ``doi``.
 
+        Uses COCI's dedicated ``/citation-count/{doi}`` endpoint — the
+        old implementation fetched the FULL citing list just to take its
+        length, transferring potentially megabytes for heavily cited
+        works (audit 4-b #21).  Falls back to the list length when the
+        count endpoint is unavailable.
+
         Args:
             doi: The DOI to look up.
 
@@ -272,8 +284,32 @@ class OpenCitationsScraper(BaseScraper):
             Integer count.  ``0`` when the DOI is unknown to COCI or
             an error occurred.
         """
-        citations = self.fetch_citations(doi)
-        return len(citations)
+        cleaned = self._clean_doi(doi)
+        if not cleaned:
+            return 0
+        url = f"{self.BASE_URL}/citation-count/{cleaned}"
+        try:
+            cache_key = self._cache_key("opencitations", "citation_count", cleaned)
+            resp = self._make_request(
+                "GET", url, cache_key=cache_key,
+                headers={"Accept": "application/json"},
+            )
+            data = resp.json()
+            items = data if isinstance(data, list) else [data]
+            for item in items:
+                if not isinstance(item, Mapping):
+                    continue
+                for key in ("count", "citation_count", "citation-count", "cited"):
+                    if key in item:
+                        value = _safe_int(item.get(key))
+                        if value is not None:
+                            return value
+        except Exception as exc:  # noqa: BLE001
+            self.logger.debug(
+                "OpenCitations citation-count(%s) failed (%s); "
+                "falling back to the citing list.", doi, exc,
+            )
+        return len(self.fetch_citations(doi))
 
     def fetch_metadata(self, doi: str) -> Dict[str, Any]:
         """Fetch raw COCI metadata for a DOI.
@@ -313,11 +349,13 @@ class OpenCitationsScraper(BaseScraper):
         Mutates ``paper`` in place:
 
           * ``paper.citations_count`` is set if it was previously
-            ``None`` or zero.
-          * ``paper.references`` is populated with citing DOIs (so
-            it reflects the inbound citation network — this is
-            deliberately distinct from Crossref's ``references``
-            which are outbound).
+            ``None`` or zero (via the ``/citation-count`` endpoint).
+          * the inbound citing DOIs are stored under
+            ``paper.raw['cited_by']`` — NOT in ``paper.references``,
+            which carries outbound reference semantics.  The previous
+            behavior wrote citing DOIs into ``references`` and
+            ``CitationResolver`` then unioned them into the reference
+            graph, polluting it (audit 4-b #21).
           * ``paper.raw['opencitations']`` contains the raw COCI
             metadata dict.
 
@@ -334,11 +372,10 @@ class OpenCitationsScraper(BaseScraper):
         raw = paper.raw if isinstance(paper.raw, dict) else {}
         raw["opencitations"] = meta
         raw["citations"] = [c.to_dict() for c in citations]
+        raw["cited_by"] = [c.citing_doi for c in citations if c.citing_doi]
         paper.raw = raw
         if not paper.citations_count or paper.citations_count == 0:
-            paper.citations_count = len(citations)
-        if not paper.references:
-            paper.references = [c.citing_doi for c in citations if c.citing_doi]
+            paper.citations_count = self.fetch_citation_count(paper.doi) or len(citations)
         return paper
 
     # -- internal helpers ------------------------------------------------

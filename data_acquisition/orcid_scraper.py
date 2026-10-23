@@ -233,6 +233,12 @@ class ORCIDScraper(BaseScraper):
     def search_by_name(self, name: str, max_results: int = 50) -> List[Dict[str, Any]]:
         """Search the ORCID registry by name.
 
+        Uses the ``/expanded-search/`` endpoint, which returns the
+        given/family names (and affiliations) directly in the response.
+        The old code hit plain ``/search/``, whose results only carry
+        ``orcid-identifier.path`` — every match came back with empty
+        names (audit 4-b #14).
+
         Args:
             name: Author name. If a multi-token string is supplied,
                 the first token is treated as the given name and the
@@ -245,26 +251,45 @@ class ORCIDScraper(BaseScraper):
         """
         tokens = name.strip().split()
         if len(tokens) >= 2:
-            q = f"given-names:{tokens[0]}+AND+family-name:{tokens[-1]}"
+            # Real spaces around AND — the old literal "+AND+" was
+            # %-encoded by requests into %2BAND%2B and ORCID's Solr
+            # layer received literal plus signs instead of the boolean
+            # operator (audit 4-b #15).  requests percent-encodes the
+            # value correctly when it is part of the params dict.
+            q = f"given-names:{tokens[0]} AND family-name:{tokens[-1]}"
         else:
             q = f"given-and-family-names:{name.strip()}"
-        params = {"q": q}
+        params: Dict[str, Any] = {"q": q, "rows": max(1, min(max_results, 1000))}
         try:
-            data = self._request_json(f"{self.BASE_URL}/search/", params=params)
+            data = self._request_json(
+                f"{self.BASE_URL}/expanded-search/", params=params
+            )
         except Exception as exc:
             self.logger.error("ORCID search_by_name(%s): %s", name, exc)
             return []
-        results = data.get("result", []) or []
+        # /expanded-search/ returns {"num-found": N, "expanded-result": [...]}.
+        results = data.get("expanded-result", []) or []
         expanded: List[Dict[str, Any]] = []
         for item in results[:max_results]:
-            orcid_id = item.get("orcid-identifier", {}).get("path")
-            given = item.get("orcid-identifier", {}).get("given-names", "")
-            family = item.get("orcid-identifier", {}).get("family-name", "")
+            if not isinstance(item, dict):
+                continue
+            orcid_id = (
+                item.get("orcid-id")
+                or item.get("orcid_identifier")
+                or (item.get("orcid-identifier", {}) or {}).get("path")
+            )
+            given = item.get("given-names") or ""
+            family = item.get("family-names") or ""
+            credit = item.get("credit-name") or ""
+            display = credit or " ".join(
+                part for part in (given, family) if part
+            ).strip()
             summary = {
                 "orcid_id": orcid_id,
                 "given_names": given,
                 "family_names": family,
-                "name": (given + " " + family).strip() if (given or family) else "",
+                "name": display,
+                "institution_name": list(item.get("institution-name") or []),
             }
             expanded.append(summary)
         return expanded

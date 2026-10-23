@@ -47,7 +47,7 @@ You also need:
 Optional but recommended:
 
 - **Tesseract OCR** — for OCR on scanned PDFs in the planned
-  bulk-PDF ingestion feature (v1.1.0).
+  bulk-PDF ingestion feature (v2.1.0).
 - **Ollama** — for the local-LLM RAG assistant.
 - **Google Chrome / Chromium** — required by the Google Scholar
   Selenium scraper.
@@ -76,8 +76,8 @@ wget -q https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.de
 sudo apt install -y ./google-chrome-stable_current_amd64.deb
 
 # 2. Clone & venv
-git clone https://github.com/academic-research-suite/academic_research_suite.git
-cd academic_research_suite
+git clone https://github.com/thelonecoders/Sophidan.git
+cd Sophidan
 python3 -m venv venv
 source venv/bin/activate
 
@@ -105,8 +105,8 @@ sudo dnf install -y tesseract google-noto-sans-cjk-fonts
 # Chrome: install via dnf from Google's repo (see above) or use chromium
 sudo dnf install -y chromium
 
-git clone https://github.com/academic-research-suite/academic_research_suite.git
-cd academic_research_suite
+git clone https://github.com/thelonecoders/Sophidan.git
+cd Sophidan
 python3 -m venv venv
 source venv/bin/activate
 pip install --upgrade pip wheel
@@ -125,8 +125,8 @@ sudo pacman -S --needed python python-pip python-virtualenv \
 # Optional
 sudo pacman -S --needed tesseract chromium
 
-git clone https://github.com/academic-research-suite/academic_research_suite.git
-cd academic_research_suite
+git clone https://github.com/thelonecoders/Sophidan.git
+cd Sophidan
 python -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
@@ -149,8 +149,8 @@ brew install python@3.12 git openssl@3 libffi libxml2 libxslt \
 brew install tesseract font-noto-sans-cjk-sc google-chrome
 
 # 3. Clone & venv
-git clone https://github.com/academic-research-suite/academic_research_suite.git
-cd academic_research_suite
+git clone https://github.com/thelonecoders/Sophidan.git
+cd Sophidan
 python3 -m venv venv
 source venv/bin/activate
 
@@ -196,8 +196,8 @@ WSL2.
    <https://www.google.com/chrome/>.
 
 ```powershell
-git clone https://github.com/academic-research-suite/academic_research_suite.git
-cd academic_research_suite
+git clone https://github.com/thelonecoders/Sophidan.git
+cd Sophidan
 python -m venv venv
 venv\Scripts\activate
 pip install --upgrade pip wheel
@@ -239,7 +239,7 @@ ARS ships with lazy imports — every optional dependency is loaded
 inside the function that needs it, so `python -c "import <pkg>"`
 never raises. Install the ones you actually use.
 
-### Tesseract OCR (planned v1.1.0 bulk PDF ingestion)
+### Tesseract OCR (planned v2.1.0 bulk PDF ingestion)
 
 | OS | Install |
 |---|---|
@@ -270,15 +270,23 @@ ollama pull phi3           # 3.8B params, ~2GB (smaller / faster)
 ollama pull qwen2.5        # Alibaba's Qwen2.5
 ```
 
-Configure ARS in `config/secrets.yaml`:
+Configure ARS via one of the supported settings sources —
+`config/secrets.yaml` (optional, .gitignored, merged over
+`config/default_config.yaml` by `config/settings.py`) or the
+environment:
 
 ```yaml
+# config/secrets.yaml
 ai_provider: "ollama"
 ai_model: "llama3"
 ai_base_url: "http://localhost:11434"
 ```
 
-### PostgreSQL (multi-user, planned v1.1.0)
+Unknown keys in `secrets.yaml` are ignored with a logged warning —
+only the fields declared in `config/settings.py::Settings` take
+effect.
+
+### PostgreSQL (multi-user, planned v2.1.0)
 
 For a single user the default SQLite is plenty (handles up to ~10⁶
 papers comfortably). For a small research group sharing a server:
@@ -417,7 +425,7 @@ If all seven steps pass, your install is healthy.
 To upgrade to a new version:
 
 ```bash
-cd academic_research_suite
+cd Sophidan
 git pull origin main
 
 # Reactivate venv
@@ -467,7 +475,7 @@ To uninstall:
 # 1. Quit ARS if running
 # 2. Remove the project directory
 cd ..
-rm -rf academic_research_suite
+rm -rf Sophidan
 
 # 3. (Optional) remove the venv you created elsewhere
 rm -rf ~/venvs/ars    # if you put the venv outside the project
@@ -488,7 +496,7 @@ pip uninstall academic-research-suite
 
 *If the install doesn't go smoothly, see [FAQ.md](FAQ.md) or open
 an issue at
-<https://github.com/academic-research-suite/academic_research_suite/issues>.*
+<https://github.com/thelonecoders/Sophidan/issues>.*
 
 ---
 
@@ -530,9 +538,9 @@ Verify: `python -c "import faiss; print(faiss.IndexFlatL2)"`.
 
 ### `pyvis` — for interactive HTML network visualisations
 
-Used by `gephi_viz.preview.InteractivePreview` (lazy import inside the
-function). Without `pyvis`, the interactive HTML preview is replaced by
-a static SVG export.
+Used by `PreviewRenderer.render_pyvis()` in `gephi_viz/preview.py`
+(lazy import inside the function). Without `pyvis`, the interactive
+HTML preview is replaced by a static matplotlib SVG export.
 
 ```bash
 pip install pyvis          # ~5 MB; depends on networkx + jinja2
@@ -566,21 +574,26 @@ Verify: `python -c "import networkx as nx; print(nx.__version__); print(nx.commu
 
 ### API keys for new v2.0.0 scrapers
 
-ARS v2.0.0 adds four new scrapers under `data_acquisition/`. Each has
-its own key requirements (set in `config/secrets.yaml` or via the
-`ARS_*` env vars):
+ARS v2.0.0 adds scrapers under `data_acquisition/`. Keys are read
+from the `Settings` fields (`springer_api_key`, `ieee_api_key`,
+`core_api_key`, `base_api_key`, `s2_api_key`, `unpaywall_email`) —
+set them in `config/secrets.yaml` or via the environment. Both the
+bare env names and their `ARS_`-prefixed equivalents are honoured
+(e.g. `SPRINGER_API_KEY` or `ARS_SPRINGER_API_KEY`):
 
-| Scraper | Module | API key | How to obtain |
-|---|---|---|---|
-| **Springer** | `data_acquisition/springer_scraper.py` | `ARS_SPRINGER_API_KEY` | <https://dev.springernature.com/> — free, instant signup |
-| **IEEE Xplore** | `data_acquisition/ieee_scraper.py` | `ARS_IEEE_API_KEY` | <https://developer.ieee.org/> — free, requires institutional email |
-| **CORE** | `data_acquisition/core_scraper.py` | `ARS_CORE_API_KEY` | <https://core.ac.uk/api-keys/register> — free, instant signup |
-| **BASE** | `data_acquisition/base_scraper_ext.py` | none required | BASE is accessed via the OpenAlex aggregator (no separate key) |
+| Scraper | Module | Env var | Settings field | How to obtain |
+|---|---|---|---|---|
+| **Springer** | `data_acquisition/springer_scraper.py` | `SPRINGER_API_KEY` | `springer_api_key` | <https://dev.springernature.com/> — free, instant signup |
+| **IEEE Xplore** | `data_acquisition/ieee_scraper.py` | `IEEE_API_KEY` | `ieee_api_key` | <https://developer.ieee.org/> — free, requires institutional email |
+| **CORE** | `data_acquisition/core_scraper.py` | `CORE_API_KEY` | `core_api_key` | <https://core.ac.uk/api-keys/register> — free, instant signup |
+| **Semantic Scholar** | `data_acquisition/semantic_scholar_scraper.py` | `S2_API_KEY` (or `SEMANTIC_SCHOLAR_API_KEY`) | `s2_api_key` | <https://www.semanticscholar.org/product/api> — optional, raises rate limits |
+| **BASE** | `data_acquisition/base_scraper_ext.py` | none required | — | BASE's anonymous HTTP interface needs no key (searched directly at api.base-search.net, **not** via OpenAlex); an optional key (`BASE_API_KEY`) raises rate limits |
+| **PubMed** | `data_acquisition/pubmed_scraper.py` | `NCBI_API_KEY` | — (env only) | <https://ncbiinsights.ncbi.nlm.nih.gov/2017/11/02/new-api-keys-for-the-e-utilities/> — optional, 10 req/s instead of 3 |
 
 **Unpaywall** requires only an email address (used as the API "key" —
-set `ARS_UNPAYWALL_EMAIL`):
+set `UNPAYWALL_EMAIL` or `ARS_UNPAYWALL_EMAIL`):
 ```bash
-export ARS_UNPAYWALL_EMAIL="your-email@your-institution.edu"
+export UNPAYWALL_EMAIL="your-email@your-institution.edu"
 ```
 
 **OpenCitations** requires no key at all — it is fully open.
@@ -590,6 +603,8 @@ Configure keys in `config/secrets.yaml`:
 springer_api_key: "abc123..."
 ieee_api_key:     "def456..."
 core_api_key:     "ghi789..."
+base_api_key:     "jkl012..."
+s2_api_key:       "mno345..."
 unpaywall_email:  "your-email@your-institution.edu"
 ```
 

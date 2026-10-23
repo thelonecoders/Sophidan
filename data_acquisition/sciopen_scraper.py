@@ -69,7 +69,7 @@ class SciOpenScraper(BaseScraper):
 
     DEFAULT_USER_AGENT = (
         "AcademicResearchSuite/2.0 "
-        "(Sciopen OA scraper; +https://github.com/academic-research-suite; "
+        "(Sciopen OA scraper; +https://github.com/thelonecoders/Sophidan; "
         "academic research, OA only)"
     )
 

@@ -23,7 +23,10 @@ when redirected from ``https://doi.org/{doi}``.
 Batch resolution
 ----------------
 :meth:`DOILookup.batch_resolve` resolves a list of DOIs in parallel
-using a :class:`concurrent.futures.ThreadPoolExecutor`.
+using a :class:`concurrent.futures.ThreadPoolExecutor` capped at two
+workers with a shared politeness interval — Crossref's REST API is a
+shared community resource and the previous 10-thread unthrottled fan-out
+was antisocial and invited 429s (audit 4-b #19).
 """
 from __future__ import annotations
 #
@@ -34,6 +37,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional
@@ -58,6 +62,10 @@ _MIME_CSL = "application/vnd.citationstyles.csl+json"
 class DOILookup:
     """Resolve DOIs / titles / URLs into :class:`Paper` records."""
 
+    #: Minimum seconds between consecutive Crossref HTTP requests issued
+    #: by this instance (throttle shared by batch and format converters).
+    MIN_REQUEST_INTERVAL: float = 0.25
+
     def __init__(
         self,
         polite_email: Optional[str] = None,
@@ -77,6 +85,18 @@ class DOILookup:
         self._timeout = timeout
         self._max_retries = max_retries
         self._session = requests.Session()
+        # Shared request throttle (audit 4-b #19).
+        self._throttle_lock = threading.Lock()
+        self._last_request_ts: float = 0.0
+
+    def _throttle(self) -> None:
+        """Enforce :attr:`MIN_REQUEST_INTERVAL` between HTTP requests."""
+        with self._throttle_lock:
+            elapsed = time.monotonic() - self._last_request_ts
+            wait = self.MIN_REQUEST_INTERVAL - elapsed
+            if wait > 0:
+                time.sleep(wait)
+            self._last_request_ts = time.monotonic()
 
     # ------------------------------------------------------------------
     # Resolution methods
@@ -207,13 +227,17 @@ class DOILookup:
     def batch_resolve(
         self,
         dois: List[str],
-        max_workers: int = 10,
+        max_workers: int = 2,
     ) -> List[Paper]:
         """Resolve a list of DOIs in parallel.
 
+        The worker pool is capped at **2** threads (the old default of
+        10 ran unthrottled against Crossref — audit 4-b #19) and every
+        request passes through the shared :meth:`_throttle` interval.
+
         Args:
             dois: List of DOI strings (with or without URL prefix).
-            max_workers: Thread pool size.
+            max_workers: Thread pool size (effectively clamped to 2).
 
         Returns:
             A list of resolved :class:`Paper` objects. DOIs that
@@ -223,7 +247,9 @@ class DOILookup:
         results: List[Paper] = []
         if not dois:
             return results
-        max_workers = max(1, min(max_workers, 32))
+        # Crossref is a shared community resource: cap the fan-out at
+        # 2 workers (mandate: ThreadPoolExecutor max 2 + throttling).
+        max_workers = max(1, min(max_workers, 2))
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {executor.submit(self.from_doi, doi): doi for doi in dois}
             for future in as_completed(futures):
@@ -291,6 +317,7 @@ class DOILookup:
         headers = {"User-Agent": self._user_agent(), "Accept": "application/json"}
         last_exc: Optional[Exception] = None
         for attempt in range(self._max_retries):
+            self._throttle()
             try:
                 resp = self._session.get(
                     url, params=params, headers=headers, timeout=self._timeout
@@ -302,9 +329,16 @@ class DOILookup:
                     )
                     time.sleep(delay)
                     continue
-                resp.raise_for_status()
+                # Deterministic 4xx failures (404 unknown DOI, 400 bad
+                # query, ...) must NOT be retried — the old loop treated
+                # every exception as transient and slept 3 times per
+                # missing page (audit 4-b #19).
+                if resp.status_code >= 400:
+                    raise requests.HTTPError(
+                        f"HTTP {resp.status_code} for {url}", response=resp
+                    )
                 return resp.json()
-            except Exception as exc:
+            except (requests.ConnectionError, requests.Timeout) as exc:
                 last_exc = exc
                 self.logger.debug(
                     "Crossref request attempt %d failed: %s", attempt + 1, exc
@@ -322,7 +356,9 @@ class DOILookup:
             "User-Agent": self._user_agent(),
             "Accept": mime_type,
         }
+        last_exc: Optional[Exception] = None
         for attempt in range(self._max_retries):
+            self._throttle()
             try:
                 resp = self._session.get(
                     url, headers=headers, timeout=self._timeout, allow_redirects=True
@@ -330,14 +366,22 @@ class DOILookup:
                 if resp.status_code in (429, 503):
                     time.sleep(2 ** attempt)
                     continue
-                resp.raise_for_status()
+                # A missing DOI (404) or other deterministic 4xx is not
+                # retryable (audit 4-b #19).
+                if resp.status_code >= 400:
+                    raise requests.HTTPError(
+                        f"HTTP {resp.status_code} for {url}", response=resp
+                    )
                 return resp.text
-            except Exception as exc:
+            except (requests.ConnectionError, requests.Timeout) as exc:
+                last_exc = exc
                 self.logger.debug(
                     "Content negotiation attempt %d failed (%s): %s",
                     attempt + 1, mime_type, exc,
                 )
                 time.sleep(2 ** attempt)
+        if last_exc:
+            raise last_exc
         raise RuntimeError(
             f"Content negotiation for DOI {cleaned} ({mime_type}) failed."
         )

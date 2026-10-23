@@ -15,9 +15,9 @@ from __future__ import annotations
 
 import logging
 import re
-from collections import defaultdict
+from collections import Counter, defaultdict
 from itertools import combinations
-from typing import Any, Iterable, List, Sequence
+from typing import Any, Iterable, List, Optional, Sequence
 
 import numpy as np
 import pandas as pd
@@ -84,7 +84,16 @@ class Bibliometrics:
     collaboration index, and co-citation / co-authorship matrices.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, papers: Optional[List[Any]] = None) -> None:
+        """Initialize the calculator.
+
+        Args:
+            papers: Optional corpus to attach to the instance. When
+                provided, :meth:`summary` (PATCH CONTRACT #7) can be
+                called without arguments. Per-method ``papers``
+                arguments still take precedence.
+        """
+        self.papers: List[Any] = list(papers) if papers is not None else []
         self.logger = logger
 
     # ------------------------------------------------------------------
@@ -292,7 +301,9 @@ class Bibliometrics:
         ys = [int(y) for y in years if y]
         if len(ys) < 2:
             return 0.0
-        max_year = ys[-1]
+        # Use the true latest year — ``ys[-1]`` follows the caller's
+        # input order and yields negative half-lives on shuffled input.
+        max_year = max(ys)
         weighted_ages: List[int] = []
         for c, y in zip(cites, years):
             if y:
@@ -398,3 +409,66 @@ class Bibliometrics:
             mat.loc[a, b] = c
             mat.loc[b, a] = c
         return mat
+
+    # ------------------------------------------------------------------
+    # Corpus-level facade (PATCH CONTRACT #7 — web layer entry point)
+    # ------------------------------------------------------------------
+    def summary(self, papers: Optional[List[Any]] = None) -> dict:
+        """Return a JSON-friendly corpus summary.
+
+        Contract #7 entry point for the web layer:
+        ``Bibliometrics(papers).summary()``.
+
+        Args:
+            papers: Optional corpus override; defaults to the papers
+                attached at construction.
+
+        Returns:
+            Dict with keys ``total_papers``, ``authors``
+            (``{name: {papers, h_index, i10_index, g_index,
+            total_citations}}``), ``journals`` (``{name: count}``),
+            ``years`` (``{year: count}``), ``h_index`` (corpus-level h
+            over all papers), ``i10_index``, ``g_index``,
+            ``total_citations``, ``year_range``, and
+            ``collaboration_index``. All values are plain Python types.
+        """
+        corpus = list(papers) if papers is not None else list(self.papers)
+        total_papers = len(corpus)
+        cites: List[int] = []
+        journal_counts: Counter = Counter()
+        year_counts: Counter = Counter()
+        for paper in corpus:
+            d = _paper_to_dict(paper)
+            try:
+                cites.append(int(d.get("citations_count") or 0))
+            except (TypeError, ValueError):
+                cites.append(0)
+            journal = (
+                d.get("journal") or d.get("source")
+                or d.get("venue") or d.get("publisher")
+            )
+            if journal:
+                journal_counts[str(journal).strip()] += 1
+            y = d.get("year")
+            try:
+                year_counts[int(y)] += 1
+            except (TypeError, ValueError):
+                pass
+        author_metrics = self.author_metrics(corpus) if corpus else {}
+        sorted_years = sorted(year_counts)
+        return {
+            "total_papers": total_papers,
+            "authors": author_metrics,
+            "n_authors": len(author_metrics),
+            "journals": dict(sorted(journal_counts.items(),
+                                    key=lambda kv: -kv[1])),
+            "years": {str(y): int(year_counts[y]) for y in sorted_years},
+            "year_range": (
+                [sorted_years[0], sorted_years[-1]] if sorted_years else None
+            ),
+            "h_index": self.h_index(cites),
+            "i10_index": self.i10_index(cites),
+            "g_index": self.g_index(cites),
+            "total_citations": int(sum(cites)),
+            "collaboration_index": self.collaboration_index(corpus),
+        }

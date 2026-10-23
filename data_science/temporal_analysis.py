@@ -84,7 +84,13 @@ class TemporalAnalyzer:
 
     @property
     def df(self) -> pd.DataFrame:
-        """Lazily build a tidy DataFrame of papers."""
+        """Lazily build a tidy DataFrame of papers.
+
+        The DataFrame is built with an explicit column list so an *empty*
+        corpus still yields a (empty) frame with the expected columns —
+        ``dropna(subset=[...])`` and the per-column accessors downstream
+        never raise ``KeyError``.
+        """
         if self._df is None:
             records = []
             for p in self.papers:
@@ -100,10 +106,20 @@ class TemporalAnalyzer:
                     "doi": p.get("doi"),
                 }
                 records.append(rec)
-            df = pd.DataFrame(records)
+            columns = [
+                "year", "citations_count", "authors",
+                "title", "abstract", "keywords", "doi",
+            ]
+            df = pd.DataFrame(records, columns=columns)
             df = df.dropna(subset=["year"]).copy()
-            df["year"] = df["year"].astype(int)
-            df["citations_count"] = df["citations_count"].fillna(0).astype(int)
+            if not df.empty:
+                df["year"] = df["year"].astype(int)
+                df["citations_count"] = (
+                    df["citations_count"].fillna(0).astype(int)
+                )
+            else:
+                df["year"] = df["year"].astype(object)
+                df["citations_count"] = df["citations_count"].astype(int)
             self._df = df
         return self._df
 
@@ -158,16 +174,38 @@ class TemporalAnalyzer:
         # Lazy import to avoid circular dependency
         from .topic_modeler import TopicModeler, _paper_to_text  # type: ignore
 
+        # Fit on the text-bearing subset only (papers with title /
+        # abstract / keywords). Fitting on the whole frame silently
+        # degrades to an empty model when *any* row lacks text because
+        # the topic modeler filters empty texts internally.
+        text_mask = (
+            df["title"].fillna("").str.strip().ne("")
+            | df["abstract"].fillna("").str.strip().ne("")
+            | df["keywords"].map(len).gt(0)
+        )
+        sub = df.loc[text_mask]
+        if sub.empty:
+            return {"bin_edges": [], "topics": [], "matrix": np.zeros((0, 0))}
         modeler = TopicModeler(method="nmf", n_top_words=10)
-        topic_model = modeler.fit(list(df.itertuples(index=False, name="Paper")),
-                                  num_topics=num_topics)
+        topic_model = modeler.fit(
+            list(sub.itertuples(index=False, name="Paper")),
+            num_topics=num_topics,
+        )
         dtm = topic_model.doc_topic_matrix
-        if dtm is None or dtm.shape[0] != len(df):
+        if dtm is None or dtm.ndim != 2:
+            return {"bin_edges": [], "topics": [], "matrix": np.zeros((0, 0))}
+        # Align the year vector with the rows the model actually kept
+        # (TopicModel.kept_indices maps matrix rows back into ``sub``).
+        years = sub["year"].to_numpy()
+        kept = getattr(topic_model, "kept_indices", None)
+        if kept is not None and len(kept) == dtm.shape[0]:
+            years = years[list(kept)]
+        elif dtm.shape[0] != len(years):
+            # Cannot align safely — refuse to fabricate a mapping.
             return {"bin_edges": [], "topics": [], "matrix": np.zeros((0, 0))}
 
-        years = df["year"].to_numpy()
-        y_min = int(years.min())
-        y_max = int(years.max())
+        y_min = int(pd.Series(years).min())
+        y_max = int(pd.Series(years).max())
         edges = list(range(y_min, y_max + 2, max(1, year_bins)))
         if len(edges) < 2:
             edges = [y_min, y_max + 1]
@@ -175,7 +213,7 @@ class TemporalAnalyzer:
         n_topics = dtm.shape[1]
         matrix = np.zeros((n_bins, n_topics), dtype=np.float32)
         counts = np.zeros(n_bins, dtype=np.int64)
-        for i in range(len(df)):
+        for i in range(dtm.shape[0]):
             y = int(years[i])
             b = min(n_bins - 1, max(0, (y - y_min) // max(1, year_bins)))
             matrix[b] += dtm[i]
@@ -213,14 +251,28 @@ class TemporalAnalyzer:
             return []
         from .topic_modeler import TopicModeler  # type: ignore
 
-        modeler = TopicModeler(method="nmf", n_top_words=10)
-        topic_model = modeler.fit(list(df.itertuples(index=False, name="Paper")),
-                                  num_topics=10)
-        dtm = topic_model.doc_topic_matrix
-        if dtm is None or dtm.shape[0] != len(df):
+        text_mask = (
+            df["title"].fillna("").str.strip().ne("")
+            | df["abstract"].fillna("").str.strip().ne("")
+            | df["keywords"].map(len).gt(0)
+        )
+        sub = df.loc[text_mask]
+        if sub.empty:
             return []
-        years = df["year"].to_numpy()
-        y_max = int(years.max())
+        modeler = TopicModeler(method="nmf", n_top_words=10)
+        topic_model = modeler.fit(
+            list(sub.itertuples(index=False, name="Paper")), num_topics=10
+        )
+        dtm = topic_model.doc_topic_matrix
+        if dtm is None or dtm.ndim != 2:
+            return []
+        years = sub["year"].to_numpy()
+        kept = getattr(topic_model, "kept_indices", None)
+        if kept is not None and len(kept) == dtm.shape[0]:
+            years = years[list(kept)]
+        elif dtm.shape[0] != len(years):
+            return []
+        y_max = int(pd.Series(years).max())
         recent_start = y_max - window + 1
         prior_start = recent_start - window
         recent_mask = years >= recent_start
@@ -356,6 +408,82 @@ class TemporalAnalyzer:
             a, b = 0.0, float(y.mean()) if len(y) else 0.0
         future_x = np.arange(len(s), len(s) + years_ahead, dtype=float)
         return a * future_x + b
+
+    # ------------------------------------------------------------------
+    # High-level facade (PATCH CONTRACT #7 — web layer entry point)
+    # ------------------------------------------------------------------
+    def analyze(self, **kw: Any) -> dict:
+        """Return a JSON-friendly bundle of the core temporal series.
+
+        Contract #7 entry point for the web layer:
+        ``TemporalAnalyzer(papers).analyze()``.
+
+        Args:
+            **kw: Forwarded to the individual series methods. Recognised
+                keys: ``num_topics``, ``year_bins`` (topic_evolution);
+                ``window`` (trending_topics); ``years_ahead``
+                (forecast); ``year_threshold`` (emerging_authors).
+
+        Returns:
+            Dict with keys:
+            ``publications_per_year`` (``{year: count}``),
+            ``citations_per_year`` (``{year: sum}``),
+            ``total_papers``, ``total_citations``, ``year_range``,
+            ``topic_evolution`` (``{bin_edges, topics, matrix}``),
+            ``trending_topics``, ``emerging_authors``, and
+            ``forecast`` (``{year: value}``, observed + horizon).
+        """
+        pubs = self.publications_per_year()
+        cites = self.citations_per_year()
+        out: dict = {
+            "publications_per_year": {
+                str(int(y)): int(v) for y, v in pubs.items()
+            },
+            "citations_per_year": {
+                str(int(y)): int(v) for y, v in cites.items()
+            },
+            "total_papers": int(pubs.sum()) if not pubs.empty else 0,
+            "total_citations": int(cites.sum()) if not cites.empty else 0,
+            "year_range": (
+                [int(pubs.index.min()), int(pubs.index.max())]
+                if not pubs.empty else None
+            ),
+        }
+        try:
+            out["topic_evolution"] = self.topic_evolution(
+                num_topics=int(kw.get("num_topics", 10)),
+                year_bins=int(kw.get("year_bins", 5)),
+            )
+            # Ensure the matrix is JSON-safe.
+            m = out["topic_evolution"].get("matrix")
+            if m is not None:
+                out["topic_evolution"]["matrix"] = np.asarray(m).tolist()
+        except Exception as exc:  # pragma: no cover - defensive
+            self.logger.warning("topic_evolution failed: %s", exc)
+            out["topic_evolution"] = {
+                "bin_edges": [], "topics": [], "matrix": [],
+            }
+        try:
+            out["trending_topics"] = self.trending_topics(
+                window=int(kw.get("window", 3))
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            self.logger.warning("trending_topics failed: %s", exc)
+            out["trending_topics"] = []
+        try:
+            out["emerging_authors"] = self.emerging_authors(
+                year_threshold=int(kw.get("year_threshold", 2020))
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            self.logger.warning("emerging_authors failed: %s", exc)
+            out["emerging_authors"] = []
+        try:
+            fc = self.forecast(years_ahead=int(kw.get("years_ahead", 3)))
+            out["forecast"] = {str(int(y)): float(v) for y, v in fc.items()}
+        except Exception as exc:  # pragma: no cover - defensive
+            self.logger.warning("forecast failed: %s", exc)
+            out["forecast"] = {}
+        return out
 
     # ------------------------------------------------------------------
     # Visualization

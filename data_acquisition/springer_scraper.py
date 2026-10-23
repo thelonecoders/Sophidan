@@ -76,8 +76,14 @@ class SpringerScraper(BaseScraper):
     BASE_URL = "https://api.springernature.com/meta/v2/json"
     SOURCE_NAME = "springer"
 
-    # Recognised ``type`` filter values exposed by the API.
-    _VALID_TYPES = {"Journal", "Paper", "Chapter", "Book", "Proceeding", "Protocol"}
+    # Recognised ``type`` filter values exposed by the API.  Springer's
+    # facet vocabulary is Journal/Book/Chapter/Article/Proceeding/Protocol
+    # — "Paper" is NOT a valid facet (audit 4-b #25) and mapped to
+    # "Article" for backwards compatibility.
+    _VALID_TYPES = {"Journal", "Article", "Chapter", "Book", "Proceeding", "Protocol"}
+
+    #: Legacy caller vocabulary -> real Springer facet value.
+    _TYPE_ALIASES = {"paper": "Article"}
 
     def __init__(
         self,
@@ -140,8 +146,9 @@ class SpringerScraper(BaseScraper):
             year_to: Inclusive publication-year upper bound.
             journal: Journal name (Springer's ``journal:`` filter).
             type: Content type filter — one of ``"Journal"``,
-                ``"Paper"``, ``"Chapter"``, ``"Book"``,
-                ``"Proceeding"``, ``"Protocol"``.
+                ``"Article"``, ``"Chapter"``, ``"Book"``,
+                ``"Proceeding"``, ``"Protocol"``.  The legacy value
+                ``"Paper"`` is accepted and mapped to ``"Article"``.
             openaccess: If ``True`` restricts to open-access content;
                 ``False`` to closed-access; ``None`` for no filter.
             **kwargs: Reserved for future use.
@@ -174,8 +181,19 @@ class SpringerScraper(BaseScraper):
             q_parts.append(f"date:{lo}-{hi}")
         if journal:
             q_parts.append(f'journal:"{journal.strip()}"')
-        if type and type in self._VALID_TYPES:
-            q_parts.append(f"type:{type}")
+        if type:
+            t = str(type).strip().lower()
+            t = self._TYPE_ALIASES.get(t, t)
+            facet = next(
+                (v for v in self._VALID_TYPES if v.lower() == t), None
+            )
+            if facet:
+                q_parts.append(f"type:{facet}")
+            else:
+                self.logger.warning(
+                    "Unknown Springer type=%r; expected one of %s",
+                    type, sorted(self._VALID_TYPES),
+                )
         if openaccess is not None:
             q_parts.append("openaccess:true" if openaccess else "openaccess:false")
         composite_q = " AND ".join(q_parts) if q_parts else "*"

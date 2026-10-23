@@ -4,9 +4,11 @@ Academic Research Suite ships as Python source. To produce a standalone
 Windows `.exe`, use **PyInstaller** with the included `main.spec`.
 
 > PyInstaller cannot cross-compile — you cannot produce a Windows `.exe`
-> from Linux. You must either (a) build on a Windows host, or (b) push a
-> tag to GitHub and let the included workflow build it on a Windows runner
-> for you (see "Alternative: GitHub Actions Auto-Build" below).
+> from Linux. You must build on a Windows host (see the steps below).
+> There is currently **no** GitHub Actions auto-build workflow in this
+> repository; any third-party CI recipe must run the same
+> `pyinstaller main.spec --clean --noconfirm` command on a
+> `windows-latest` runner.
 
 ## Prerequisites
 
@@ -75,26 +77,6 @@ needed on the target.
   reliable than `--onefile` for an app this size; onefile would have to
   extract ~250 MB to a temp dir on every launch).
 
-## Alternative: GitHub Actions Auto-Build
-
-The workflow at `.github/workflows/build-windows-exe.yml` runs on every
-`v*.*.*` tag push (and on manual dispatch). It will:
-
-1. Spin up a `windows-latest` GitHub-hosted runner.
-2. Install Python 3.11 + all dependencies from `requirements.txt`.
-3. Run `pyinstaller main.spec --clean --noconfirm`.
-4. Zip the `dist/AcademicResearchSuite/` folder.
-5. Attach `AcademicResearchSuite_windows_x64.zip` to the GitHub Release.
-
-This takes ~10 minutes after the tag push — no local Windows machine required.
-
-```bash
-# From your local clone:
-git tag v2.0.0
-git push origin v2.0.0
-# Wait ~10 min, then check https://github.com/<you>/academic-research-suite/releases
-```
-
 ## Bundle Size Reference
 
 | Artifact | Approx. size | Notes |
@@ -104,10 +86,11 @@ git push origin v2.0.0
 | PyInstaller folder on Windows | ~200-250 MB | `.exe` + `_internal/` (smaller than Linux venv here because the build host had extra packages) |
 | Inno Setup installer (`.exe`) | ~80-100 MB | LZMA2-compressed single-file installer |
 
-The Linux proof-of-concept binary at
-`/home/z/my-project/download/AcademicResearchSuite_linux_x64/AcademicResearchSuite`
-is provided to verify the spec is correct — it is an ELF binary, NOT a Windows
-`.exe`. The same spec on Windows produces a real `.exe`.
+A Linux proof-of-concept build (`pyinstaller main.spec --clean
+--noconfirm` run on Linux) produces an ELF binary at
+`dist/AcademicResearchSuite/AcademicResearchSuite`. It exists to verify
+the spec is correct — it is an ELF binary, NOT a Windows `.exe`. The
+same spec on Windows produces a real `.exe`.
 
 ## Troubleshooting
 

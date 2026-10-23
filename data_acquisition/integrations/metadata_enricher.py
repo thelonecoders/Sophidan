@@ -274,7 +274,25 @@ class MetadataEnricher:
             # Crossref / OpenAlex / Semantic Scholar: fetch by DOI.
             if not paper.doi:
                 return None
-            return scraper.fetch_by_doi(paper.doi)
+            if hasattr(scraper, "fetch_by_doi"):
+                # Crossref (and IEEE-style scrapers) expose a direct
+                # DOI lookup.
+                return scraper.fetch_by_doi(paper.doi)
+            # OpenAlex and Semantic Scholar only implement
+            # fetch_by_id — the old code called the nonexistent
+            # fetch_by_doi and both sources were silently skipped in
+            # every enrichment run (audit 4-b #6).  Their fetch_by_id
+            # accepts DOI-prefixed identifiers:
+            #   * OpenAlex: /works/doi:10.xxxx/...   ->  "doi:" prefix
+            #   * Semantic Scholar: /paper/DOI:10.xxxx/... -> "DOI:" prefix
+            cleaned = str(paper.doi).strip()
+            for prefix in ("https://doi.org/", "http://doi.org/", "doi.org/", "doi:"):
+                if cleaned.lower().startswith(prefix):
+                    cleaned = cleaned[len(prefix):]
+                    break
+            if source_name == "openalex":
+                return scraper.fetch_by_id("doi:" + cleaned)
+            return scraper.fetch_by_id("DOI:" + cleaned)
         except Exception as exc:  # noqa: BLE001
             self.logger.debug(
                 "MetadataEnricher: %s fetch failed for %s: %s",

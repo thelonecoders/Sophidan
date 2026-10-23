@@ -26,12 +26,13 @@ exponential back-off provided by :class:`BaseScraper`.
 
 API key handling
 ----------------
-The API key is read from :mod:`config.settings` lazily.  The
-project reuses ``settings.ai_api_key`` as the Semantic Scholar key
-because the project's central settings object already maps it to
-"third-party AI / data API keys" — document this clearly in your
-deployment notes.  A direct ``api_key`` constructor argument takes
-precedence for tests / overrides.
+The API key is read from :mod:`config.settings` lazily via the dedicated
+``s2_api_key`` setting (or the ``S2_API_KEY`` /
+``SEMANTIC_SCHOLAR_API_KEY`` environment variables).  The LLM key
+``settings.ai_api_key`` is deliberately NOT consulted — sending an
+OpenAI/Anthropic credential to semanticscholar.org would leak it via
+the ``x-api-key`` header (audit 4-b #7, security).  A direct ``api_key``
+constructor argument takes precedence for tests / overrides.
 """
 
 #
@@ -42,6 +43,7 @@ precedence for tests / overrides.
 from __future__ import annotations
 
 import logging
+import os
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Mapping, Optional
 
@@ -122,7 +124,9 @@ class SemanticScholarScraper(BaseScraper):
             user_agent: Optional User-Agent override.
             api_key: Semantic Scholar API key.  If ``None``, the
                 scraper attempts to load it from
-                ``config.settings.ai_api_key`` (see module docstring).
+                ``config.settings.s2_api_key`` (or the
+                ``S2_API_KEY`` / ``SEMANTIC_SCHOLAR_API_KEY`` env vars).
+                The LLM credential ``settings.ai_api_key`` is never used.
         """
         super().__init__(
             proxy_manager=proxy_manager,
@@ -441,15 +445,24 @@ class SemanticScholarScraper(BaseScraper):
         return {}
 
     def _resolve_api_key(self) -> Optional[str]:
-        """Look up the Semantic Scholar key from ``config.settings``.
+        """Look up the Semantic Scholar key from env / ``config.settings``.
 
-        The project reuses ``settings.ai_api_key`` as the S2 key — see
-        the module docstring for rationale.
+        SECURITY (audit 4-b #7): the fallback chain must NEVER include
+        ``settings.ai_api_key`` — that is the OpenAI/Anthropic LLM key
+        and it would be leaked to semanticscholar.org via the
+        ``x-api-key`` request header.  Only the dedicated S2 settings
+        field (``s2_api_key``) and the ``S2_API_KEY`` /
+        ``SEMANTIC_SCHOLAR_API_KEY`` environment variables are honoured.
         """
+        env = os.environ.get("S2_API_KEY") or os.environ.get(
+            "SEMANTIC_SCHOLAR_API_KEY"
+        )
+        if env:
+            return env
         settings = _load_settings()
         if settings is None:
             return None
-        for attr in ("s2_api_key", "semantic_scholar_api_key", "ai_api_key"):
+        for attr in ("s2_api_key", "semantic_scholar_api_key"):
             value = getattr(settings, attr, None)
             if value:
                 return value

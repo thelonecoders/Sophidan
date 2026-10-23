@@ -4,7 +4,7 @@ arxiv_scraper.py
 
 Scraper for the arXiv public preprint API.
 
-Endpoint: ``http://export.arxiv.org/api/query`` — returns an Atom XML
+Endpoint: ``https://export.arxiv.org/api/query`` — returns an Atom XML
 feed.  No API key is required; the service asks clients to keep
 request volume reasonable (the official guideline is "no more than
 one request every 3 seconds", which we enforce via the base class's
@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import time
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
@@ -110,7 +111,7 @@ _ARXIV_TAXONOMY: Dict[str, Dict[str, str]] = {
 class ArxivScraper(BaseScraper):
     """Scraper for the arXiv public API."""
 
-    BASE_URL = "http://export.arxiv.org/api/query"
+    BASE_URL = "https://export.arxiv.org/api/query"
     SOURCE_NAME = "arxiv"
 
     # arXiv asks for ~3s between requests.  Default rate limit ~0.33 r/s.
@@ -269,51 +270,76 @@ class ArxivScraper(BaseScraper):
             )
 
         # arXiv paginates via `start` + `max_results`; cap per-page at 100.
+        # (audit 4-b #11: a single request previously capped results at
+        # 100 regardless of max_results — the loop below follows the
+        # start/offset window until max_results, no more entries, or the
+        # end of the result set.  The token-bucket rate limiter enforces
+        # the ~3 s between pages.)
         per_page = min(max_results, 100)
-        params: Dict[str, Any] = {
-            "search_query": search_query,
-            "start": 0,
-            "max_results": per_page,
-            "sortBy": sort_key,
-            "sortOrder": sort_dir,
-        }
 
         papers: List[Paper] = []
         total_results = 0
         raw_response: Optional[ET.Element] = None
+        fetched = 0
+        start = 0
         try:
-            cache_key = self._cache_key("arxiv", "search", search_query, per_page, sort_key)
-            resp = self._make_request(
-                "GET", self.BASE_URL, params=params, cache_key=cache_key
-            )
-            content = resp.text
-            root = ET.fromstring(content)
-            raw_response = root
-            total_results = self._parse_total_results(root)
-            entries = root.findall("atom:entry", _NS_MAP)
-            self._emit_event(
-                "search.started",
-                {"query": query, "source": self.name, "total": total_results},
-            )
-            for entry in entries[:max_results]:
-                paper = self._parse_entry(entry)
-                if paper is None:
-                    continue
-                if download_pdf and paper.pdf_url:
-                    try:
-                        self._download_pdf(paper)
-                    except Exception as exc:  # noqa: BLE001
-                        msg = f"PDF download failed for {paper.doi or paper.url}: {exc}"
-                        errors.append(msg)
-                        self.logger.warning(msg)
-                papers.append(paper)
-                self._emit_event(
-                    "search.progress",
-                    {
-                        "fetched": len(papers),
-                        "total": min(total_results, max_results),
-                    },
+            while fetched < max_results:
+                params: Dict[str, Any] = {
+                    "search_query": search_query,
+                    "start": start,
+                    "max_results": per_page,
+                    "sortBy": sort_key,
+                    "sortOrder": sort_dir,
+                }
+                cache_key = self._cache_key(
+                    "arxiv", "search", search_query, per_page, sort_key, start
                 )
+                resp = self._make_request(
+                    "GET", self.BASE_URL, params=params, cache_key=cache_key
+                )
+                content = resp.text
+                root = ET.fromstring(content)
+                if raw_response is None:
+                    raw_response = root
+                if start == 0:
+                    total_results = self._parse_total_results(root)
+                    self._emit_event(
+                        "search.started",
+                        {"query": query, "source": self.name, "total": total_results},
+                    )
+                entries = root.findall("atom:entry", _NS_MAP)
+                if not entries:
+                    break
+                for entry in entries:
+                    if fetched >= max_results:
+                        break
+                    paper = self._parse_entry(entry)
+                    if paper is None:
+                        continue
+                    if download_pdf and paper.pdf_url:
+                        try:
+                            self._download_pdf(paper)
+                        except Exception as exc:  # noqa: BLE001
+                            msg = f"PDF download failed for {paper.doi or paper.url}: {exc}"
+                            errors.append(msg)
+                            self.logger.warning(msg)
+                    papers.append(paper)
+                    fetched += 1
+                    self._emit_event(
+                        "search.progress",
+                        {
+                            "fetched": len(papers),
+                            "total": min(total_results, max_results),
+                        },
+                    )
+                # Advance the pagination window.  Stop when the caller's
+                # budget is exhausted, the feed returned a short page
+                # (end of results) or the reported total has been reached.
+                if fetched >= max_results or len(entries) < per_page:
+                    break
+                start += len(entries)
+                if total_results and start >= total_results:
+                    break
         except requests.RequestException as exc:
             errors.append(f"HTTP error: {exc}")
             self.logger.error("arXiv request failed: %s", exc, exc_info=True)
@@ -346,9 +372,10 @@ class ArxivScraper(BaseScraper):
         clean_id = paper_id.strip()
         if clean_id.lower().startswith("arxiv:"):
             clean_id = clean_id[6:]
-        # strip version suffix
-        if "v" in clean_id and clean_id[-2:].startswith("v") and clean_id[-1].isdigit():
-            clean_id = clean_id.rsplit("v", 1)[0]
+        # Strip a trailing version suffix.  The old hand-rolled check
+        # (``clean_id[-2:].startswith("v")``) only matched v0–v9 and left
+        # e.g. ``2106.04561v10`` unchanged (audit 4-b #24).
+        clean_id = re.sub(r"v\d+$", "", clean_id)
         params = {"id_list": clean_id}
         try:
             cache_key = self._cache_key("arxiv", "id", clean_id)
@@ -422,8 +449,15 @@ class ArxivScraper(BaseScraper):
             rel = link_el.get("rel", "")
             if rel == "related" and "doi.org" in href:
                 doi = href.split("doi.org/")[-1]
-            elif rel == "enclosure" and link_el.get("type") == "application/pdf":
-                pdf_url = href
+            elif (
+                link_el.get("type") == "application/pdf"
+                and rel in ("related", "enclosure", "")
+            ):
+                # arXiv Atom feeds advertise the PDF with
+                # rel="related" type="application/pdf" — the old
+                # rel=="enclosure" match never fired, leaving pdf_url
+                # unset and the download_pdf feature dead (audit 4-b #5).
+                pdf_url = pdf_url or href
             elif rel == "alternate":
                 abs_url = href
 
@@ -479,8 +513,14 @@ class ArxivScraper(BaseScraper):
             slug += ".pdf"
         dest = os.path.join(self.pdf_dir, slug)
         try:
-            resp = self._session.get(paper.pdf_url, timeout=self.timeout, stream=True)
-            resp.raise_for_status()
+            # Route through _make_request so the download honours the
+            # token-bucket rate limiter (arXiv's 3 s guideline), retry
+            # policy and proxy rotation — it previously used a raw
+            # session.get that bypassed all of them (audit 4-b #24).
+            resp = self._make_request(
+                "GET", paper.pdf_url, timeout=self.timeout, stream=True,
+                use_cache=False,
+            )
             with open(dest, "wb") as fh:
                 for chunk in resp.iter_content(chunk_size=8192):
                     if chunk:

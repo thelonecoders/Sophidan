@@ -233,11 +233,11 @@ v1 scrapers return):
 
 ```python
 from bibliometrics import AuthorProfile
-profile = AuthorProfile.from_papers(papers, author_id="A123")
+profile = AuthorProfile.from_papers(papers, name="A. Author")
 print(profile.to_dict())
-# {'author_id': 'A123', 'citations': 234, 'publications': 17,
+# {'name': 'A. Author', 'total_citations': 234, 'papers': [...],
 #  'h_index': 6, 'g_index': 7, 'i10_index': 4, 'e_index': 7.94,
-#  'hm_index': 3.21, 'ar_index': 4.55, 'awcr': 9.10, 'h_max_index': 12.4, ...}
+#  'hm_index': 3.21, 'ar_index': 4.55, 'awcr': 9.10, ...}
 ```
 
 For journal-level metrics, see [`MODULE_REFERENCE.md`](MODULE_REFERENCE.md)
@@ -460,7 +460,8 @@ for b in sorted(paper_bursts, key=lambda x: -x.strength)[:10]:
     print(f"{b.entity_name:50s} {b.start_year}→{b.end_year} "
           f"strength={b.strength:.2f}")
 
-det.visualize(paper_bursts, path="bursts.png")
+fig = det.visualize(paper_bursts, figsize=(12, 8))
+fig.savefig("bursts.png", dpi=150)
 ```
 
 ### Knowledge frontiers
@@ -468,16 +469,17 @@ det.visualize(paper_bursts, path="bursts.png")
 ```python
 from innovation.frontier_mapping import KnowledgeFrontier, FrontierTracker
 
-kf = KnowledgeFrontier(papers, approach="embedding_density",
-                       embedder="sentence-transformers")
-frontiers = kf.compute_frontier(top_k=10)
-kf.visualize(frontiers, path="frontiers.png")
+kf = KnowledgeFrontier(papers,
+                       embeddings_model=None)  # default offline embedder
+frontiers = kf.compute_frontier(method="embedding_density", top_n=10)
+fig = kf.visualize(method="tsne", figsize=(12, 10), regions=frontiers)
+fig.savefig("frontiers.png", dpi=150)
 
-# Track frontier evolution over time
-tracker = FrontierTracker(papers)
+# Track frontier evolution over time (per-year paper buckets)
+tracker = FrontierTracker({2015: papers_2015, 2016: papers_2016})
 timeline = tracker.track_over_time(years=range(2015, 2026))
-emerging = tracker.emerging_topics(threshold=0.5)
-fading = tracker.fading_topics(threshold=-0.5)
+emerging = tracker.emerging_topics(year=2025, lookback=3)
+fading = tracker.fading_topics(year=2025, lookback=3)
 ```
 
 ### Trend forecasting
@@ -884,5 +886,5 @@ endpoint.
 
 *Built with care for systematic reviewers. If the pipeline above
 doesn't quite fit your study design, open an issue at
-<https://github.com/academic-research-suite/academic_research_suite/issues>
+<https://github.com/thelonecoders/Sophidan/issues>
 — we'll help you adapt it.*

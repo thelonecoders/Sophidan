@@ -163,9 +163,18 @@ class GoogleScholarScraper(BaseScraper):
             result.elapsed_ms = self._now_ms() - start_ms
             return result
 
-        # Build the scholarly query object.
+        # Build the scholarly query object.  Only pass the dict form when
+        # the caller actually set at least one filter — the old condition
+        # included ``or not patent`` which is always True for the default
+        # ``patent=False`` and sent the dict on every plain query
+        # (audit 4-b, google_scholar #1).
         query_obj: Any = query
-        if any(v is not None for v in (year_lo, year_hi)) or not patent or citations_only:
+        if (
+            year_lo is not None
+            or year_hi is not None
+            or patent
+            or citations_only
+        ):
             query_obj = {
                 "query": query,
                 "year_lo": year_lo,
@@ -254,6 +263,13 @@ class GoogleScholarScraper(BaseScraper):
     def fetch_by_id(self, paper_id: str) -> Optional[Paper]:
         """Fetch a single publication by Google Scholar cluster ID.
 
+        ``scholarly``'s public API has no ``get_by_id`` helper — the old
+        code called one and every lookup returned ``None`` (audit 4-b,
+        google_scholar #2).  The method is therefore gated behind
+        ``hasattr``: when a future/patched scholarly exposes it, it is
+        used; otherwise the call degrades to a publication search on the
+        identifier string via ``search_pubs`` (best effort).
+
         Args:
             paper_id: The Google Scholar cluster ID (numeric) of the
                 paper to fetch.
@@ -266,7 +282,17 @@ class GoogleScholarScraper(BaseScraper):
             return None
         self._apply_proxy()
         try:
-            pub = scholarly.get_by_id(paper_id)  # type: ignore[union-attr]
+            pub = None
+            if hasattr(scholarly, "get_by_id"):
+                pub = scholarly.get_by_id(paper_id)  # type: ignore[union-attr]
+            else:
+                # scholarly has no public get-by-id; best effort is a
+                # publications search for the identifier string.
+                search_fn = getattr(
+                    scholarly, "search_pubs", None
+                ) or getattr(scholarly, "search_pubs_query", None)
+                if search_fn is not None:
+                    pub = next(iter(search_fn(paper_id)), None)
             if not pub:
                 return None
             return self._publication_to_paper(pub)
@@ -347,12 +373,26 @@ class GoogleScholarScraper(BaseScraper):
             self._clear_proxy()
         return papers
 
-    def fetch_citations(self, paper_id: str, max_results: int = 100) -> List[Paper]:
+    def fetch_citations(self, paper_id: Any, max_results: int = 100) -> List[Paper]:
         """Fetch papers citing a given Google Scholar publication.
 
+        Modern ``scholarly`` (>= 1.7) implements ``search_citedby`` as a
+        *generator over a filled Publication object* — passing a bare
+        cluster-id string raises / yields nothing (audit 4-b,
+        google_scholar #3).  The flow therefore accepts either:
+
+          * a filled scholarly Publication (dict) — passed straight to
+            ``scholarly.search_citedby(publication)``;
+          * a string identifier — resolved to a Publication by a
+            ``search_pubs`` lookup first, filled via ``scholarly.fill``
+            when available, and only then handed to ``search_citedby``.
+
+        When scholarly exposes none of the needed callables the feature
+        degrades gracefully (logged, empty list) instead of raising.
+
         Args:
-            paper_id: The Google Scholar cluster ID (numeric) of the
-                paper whose citations should be retrieved.
+            paper_id: A filled scholarly Publication dict **or** a
+                Google Scholar cluster ID / publication title string.
             max_results: Maximum number of citing papers to return.
 
         Returns:
@@ -362,10 +402,38 @@ class GoogleScholarScraper(BaseScraper):
         if not SCHOLARLY_AVAILABLE:
             self.logger.error("scholarly not available; cannot fetch citations.")
             return []
+        search_citedby = getattr(scholarly, "search_citedby", None)
+        if not callable(search_citedby):
+            self.logger.warning(
+                "scholarly.search_citedby is unavailable; fetch_citations "
+                "is a no-op for this scholarly version."
+            )
+            return []
         self._apply_proxy()
         papers: List[Paper] = []
         try:
-            cited_by = scholarly.search_citedby(paper_id)
+            publication = paper_id
+            if not isinstance(paper_id, dict):
+                # Resolve the identifier to a Publication first.
+                search_fn = getattr(scholarly, "search_pubs", None) or getattr(
+                    scholarly, "search_pubs_query", None
+                )
+                if not callable(search_fn):
+                    self.logger.warning(
+                        "scholarly exposes neither search_pubs nor a usable "
+                        "search_citedby input; fetch_citations cannot proceed."
+                    )
+                    return []
+                publication = next(iter(search_fn(str(paper_id))), None)
+                if publication is None:
+                    return []
+                fill = getattr(scholarly, "fill", None)
+                if callable(fill):
+                    try:
+                        publication = fill(publication)
+                    except Exception:  # pragma: no cover - network
+                        pass  # unfilled Publication may still work
+            cited_by = search_citedby(publication)
             for i, pub in enumerate(cited_by):
                 if i >= max_results:
                     break

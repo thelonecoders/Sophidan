@@ -59,7 +59,7 @@ graph TD
     end
 
     subgraph "Domain"
-        DAQ["data_acquisition/<br/>9 scrapers + ScrapingEngine"]
+        DAQ["data_acquisition/<br/>17 scrapers + ScrapingEngine"]
         PROXY["proxy/<br/>6 modules"]
         DS["data_science/<br/>7 modules"]
         KG["knowledge_graph/<br/>5 modules"]

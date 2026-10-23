@@ -6,7 +6,7 @@
 
 A growing collection of answers to questions we get asked often. If
 your question isn't here, search the
-[GitHub issues](https://github.com/academic-research-suite/academic_research_suite/issues)
+[GitHub issues](https://github.com/thelonecoders/Sophidan/issues)
 or open a new one.
 
 ---
@@ -297,8 +297,11 @@ squares mean none of those fonts were found.
 
 ### Q21. Can I customise the report layout?
 
-Not yet — v1.0.0 ships fixed layouts per format. A Jinja2-based
-template system is on the [v1.2.0 roadmap](../README.md#roadmap).
+Not yet — v2.0.0 ships fixed layouts per format (the `reporting/`
+builders — `PDFReport`, `DOCXReport`, `PPTXReport` — expose
+`add_section` / `add_papers_table` / `add_chart` building blocks, but
+no template engine). A Jinja2-based template system is on the
+[v2.2.0 roadmap](../README.md#roadmap).
 
 ---
 
@@ -456,7 +459,7 @@ python main.py --web
 ---
 
 *If your question isn't answered here, please open an issue at
-<https://github.com/academic-research-suite/academic_research_suite/issues>
+<https://github.com/thelonecoders/Sophidan/issues>
 — and if you fix it yourself, contribute the answer back via a
 PR to this file.*
 

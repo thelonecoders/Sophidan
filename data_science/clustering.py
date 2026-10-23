@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Optional, Tuple
+from typing import Any, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -226,15 +226,23 @@ class Clusterer:
     def _safe_silhouette(
         vectors: np.ndarray, labels: np.ndarray
     ) -> Optional[float]:
-        """Best-effort silhouette score (returns ``None`` if undefined)."""
+        """Best-effort silhouette score (returns ``None`` if undefined).
+
+        Noise points (label ``-1``) are excluded before scoring — they
+        form no real cluster and would otherwise drag the score down
+        (and violate silhouette's cluster-count assumptions).
+        """
         try:
             from sklearn.metrics import silhouette_score
         except Exception:  # pragma: no cover - defensive
             return None
+        labels = np.asarray(labels)
+        noise_mask = labels == -1
+        if noise_mask.any():
+            vectors = vectors[~noise_mask]
+            labels = labels[~noise_mask]
         n_labels = len(set(int(x) for x in labels))
         if n_labels < 2 or len(labels) < 3:
-            return None
-        if -1 in labels and n_labels - 1 < 2:
             return None
         try:
             return float(silhouette_score(vectors, labels))
@@ -357,7 +365,11 @@ class Clusterer:
         fig, ax = plt.subplots(figsize=(8, 6), constrained_layout=True)
         labels = np.asarray(labels)
         unique_labels = sorted(set(labels.tolist()))
-        cmap = plt.get_cmap("tab20", max(len(unique_labels), 1))
+        from matplotlib import colormaps as _colormaps  # lazy
+        try:
+            cmap = _colormaps["tab20"].resampled(max(len(unique_labels), 1))
+        except (KeyError, AttributeError):  # pragma: no cover - defensive
+            cmap = _colormaps["tab20"]
         for i, lab in enumerate(unique_labels):
             mask = labels == lab
             color = "k" if int(lab) == -1 else cmap(i % cmap.N)
@@ -371,3 +383,118 @@ class Clusterer:
         ax.set_ylabel(f"{method}_2")
         ax.legend(loc="best", fontsize=8)
         return fig
+
+    # ------------------------------------------------------------------
+    # High-level facade (PATCH CONTRACT #7 — web layer entry point)
+    # ------------------------------------------------------------------
+    def analyze(
+        self,
+        papers: Sequence[Any],
+        text_fields: Sequence[str] = ("title", "abstract"),
+        method: Optional[str] = None,
+        n_clusters: Optional[int] = None,
+        **kw: Any,
+    ) -> dict:
+        """Cluster a paper corpus by its text and return a result dict.
+
+        Contract #7 entry point for the web layer:
+        ``Clusterer(method=m).analyze(papers, **kw)``.
+
+        Papers are featurised with a TF-IDF vector over the extracted
+        text fields (deterministic, no heavy deps). Papers whose text is
+        empty are dropped; use ``kept_indices`` in the result to map
+        labels back to the original input order.
+
+        Args:
+            papers: Sequence of Paper objects / dicts.
+            text_fields: Paper fields used to build the text.
+            method: Optional method override (``'kmeans'``,
+                ``'dbscan'``, ``'hdbscan'``, ``'agglomerative'``).
+            n_clusters: Optional cluster-count override (kmeans /
+                agglomerative).
+            **kw: Extra estimator hyper-parameters (merged into the
+                instance kwargs for this call).
+
+        Returns:
+            Dict with keys ``method``, ``labels`` (list[int], ``-1`` =
+            noise), ``n_clusters``, ``centers`` (np.ndarray | None),
+            ``centers_list`` (JSON-safe), ``metrics`` (dict with
+            ``silhouette`` / ``inertia``), ``papers`` (the retained
+            papers aligned with ``labels``), ``kept_indices``, ``model`
+            (the :class:`ClusterResult`), and ``error`` (``None`` or a
+            message).
+        """
+        if method is not None:
+            m = str(method).lower().strip()
+            if m not in self.SUPPORTED:
+                raise ValueError(
+                    f"Unsupported clustering method '{m}'. "
+                    f"Choose from {self.SUPPORTED}."
+                )
+            self.method = m
+        if n_clusters is not None:
+            self.kwargs["n_clusters"] = int(n_clusters)
+        if kw:
+            self.kwargs.update(kw)
+        result: dict = {
+            "method": self.method,
+            "labels": [],
+            "n_clusters": 0,
+            "centers": None,
+            "centers_list": [],
+            "metrics": {},
+            "papers": [],
+            "kept_indices": None,
+            "model": None,
+            "error": None,
+        }
+        from .topic_modeler import _paper_to_text  # local, avoids cycles
+        kept: List[Any] = []
+        kept_idx: List[int] = []
+        texts: List[str] = []
+        for i, p in enumerate(papers):
+            t = _paper_to_text(p, text_fields)
+            if t.strip():
+                kept.append(p)
+                kept_idx.append(i)
+                texts.append(t)
+        if len(texts) < 2:
+            result["error"] = "need at least 2 papers with usable text"
+            if len(texts) == 1:
+                result.update({
+                    "labels": [0], "papers": kept, "kept_indices": kept_idx,
+                })
+            return result
+        try:
+            from sklearn.feature_extraction.text import TfidfVectorizer
+            vectorizer = TfidfVectorizer(
+                max_features=2048, stop_words="english",
+                sublinear_tf=True,
+            )
+            try:
+                vectors = vectorizer.fit_transform(texts).toarray()
+            except ValueError:
+                vectorizer = TfidfVectorizer(max_features=2048)
+                vectors = vectorizer.fit_transform(texts).toarray()
+        except Exception as exc:  # pragma: no cover - defensive
+            result["error"] = f"vectorisation failed: {exc}"
+            return result
+        cluster_result = self.fit(vectors)
+        centers = cluster_result.centroids
+        result.update({
+            "method": cluster_result.method,
+            "labels": [int(x) for x in cluster_result.labels],
+            "n_clusters": cluster_result.n_clusters,
+            "centers": centers,
+            "centers_list": (
+                np.asarray(centers).tolist() if centers is not None else []
+            ),
+            "metrics": {
+                "silhouette": cluster_result.silhouette,
+                "inertia": cluster_result.inertia,
+            },
+            "papers": kept,
+            "kept_indices": kept_idx,
+            "model": cluster_result,
+        })
+        return result

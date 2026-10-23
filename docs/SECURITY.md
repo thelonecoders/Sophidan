@@ -7,12 +7,12 @@ versions receive security updates:
 
 | Version | Supported | Notes |
 |---|---|---|
-| `v1.0.x` | ✅ | Current release line. |
-| `v1.1.x` (planned) | ✅ | Once released. |
-| `< v1.0` (pre-release alphas, betas) | ❌ | Upgrade to v1.0.x. |
+| `v2.0.x` | ✅ | Current release line. |
+| `v2.1.x` (planned) | ✅ | Once released. |
+| `v1.x` and earlier | ❌ | No security backports — upgrade to v2.0.x. |
 | `develop` branch HEAD | ⚠️ | Best-effort; not a release. |
 
-We backport security fixes to the latest `v1.0.x` tag within **7
+We backport security fixes to the latest `v2.0.x` tag within **7
 days** of disclosure. Older release lines are not supported —
 upgrade to the latest minor release.
 
@@ -131,13 +131,13 @@ python main.py --web --host 0.0.0.0  # DANGEROUS
 then:
 
 1. **Put it behind a reverse proxy** (nginx, Caddy) with TLS.
-2. **Add an authentication layer** (Basic Auth at the proxy,
-   or wait for v1.1.0's built-in API token auth).
+2. **Add an authentication layer** (Basic Auth at the proxy —
+   built-in API token auth is on the v2.1.0 roadmap).
 3. **Restrict CORS** — set `CORS_ORIGINS` in
    `web/server.py::create_app` to your domain.
 
-Until v1.1.0 ships token auth, the web server should be treated
-as **single-user, local-only**.
+Until built-in token auth ships (v2.1.0), the web server should be
+treated as **single-user, local-only**.
 
 ### Local LLM (privacy)
 
@@ -167,19 +167,20 @@ included in your backup rotation.
 
 ### Plugin safety (future)
 
-ARS v1.2.0 will introduce a plugin system. Plugins run with the
-same permissions as the ARS process — **only install plugins
-from sources you trust**. We will publish a curated plugin
-registry at that time.
+ARS will introduce a plugin system (entry-points for drop-in
+scrapers and analyses — see the v2.2.0 roadmap). Plugins run with
+the same permissions as the ARS process — **only install plugins
+from sources you trust**. A curated plugin registry is planned
+alongside that release.
 
 ## Contact
 
 - **Security email:** <security@academic-research-suite.org>
 - **PGP key:** available at <https://keys.openpgp.org> (search for
   the security email).
-- **General issues:** <https://github.com/academic-research-suite/academic_research_suite/issues>
+- **General issues:** <https://github.com/thelonecoders/Sophidan/issues>
 
 ---
 
 *This policy is reviewed at every minor release. Last updated:
-2026-08-25 for v1.0.0.*
+2026-10 for v2.0.0.*

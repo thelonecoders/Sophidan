@@ -36,6 +36,7 @@ import re
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Mapping, Optional
+from urllib.parse import quote
 
 from ._compat import BaseScraper, Paper, ScraperResult, get_logger
 
@@ -89,7 +90,7 @@ class WikipediaScraper(BaseScraper):
 
     DEFAULT_USER_AGENT = (
         "AcademicResearchSuite/2.0 "
-        "(Wikipedia scraper; +https://github.com/academic-research-suite; "
+        "(Wikipedia scraper; +https://github.com/thelonecoders/Sophidan; "
         "academic research)"
     )
 
@@ -124,6 +125,20 @@ class WikipediaScraper(BaseScraper):
 
     # -- BaseScraper interface -------------------------------------------
 
+    @staticmethod
+    def _wiki_url(title: str) -> str:
+        """Build a percent-encoded canonical Wikipedia URL for ``title``.
+
+        ``title.replace(' ', '_')`` alone is NOT url-safe — titles with
+        ``&``, ``?``, ``#``, ``%`` or quotes produced broken/malicious
+        links (audit 4-b #20).  Spaces become underscores and every
+        reserved character is percent-encoded.
+        """
+        return (
+            "https://en.wikipedia.org/wiki/"
+            + quote(title.replace(" ", "_"), safe="()'%!")
+        )
+
     def search(self, query: str, max_results: int = 10, **kwargs: Any) -> ScraperResult:
         """Search Wikipedia for articles matching ``query``.
 
@@ -140,6 +155,9 @@ class WikipediaScraper(BaseScraper):
             :meth:`search_articles` for a typed result instead.
         """
         articles = self.search_articles(query, max_results=max_results)
+        # start_ms MUST be captured BEFORE the network call — the old
+        # code started the clock after search_articles returned, so
+        # elapsed_ms excluded the actual search (audit 4-b #20).
         start_ms = self._now_ms()
         return ScraperResult(
             source=self.name,
@@ -223,7 +241,7 @@ class WikipediaScraper(BaseScraper):
                     continue
                 articles.append(WikipediaArticle(
                     title=title,
-                    url=f"https://en.wikipedia.org/wiki/{title.replace(' ', '_')}",
+                    url=self._wiki_url(title),
                     summary=self._strip_html(item.get("snippet") or ""),
                 ))
         except Exception as exc:  # noqa: BLE001
@@ -308,7 +326,7 @@ class WikipediaScraper(BaseScraper):
 
             return WikipediaArticle(
                 title=title_actual,
-                url=f"https://en.wikipedia.org/wiki/{title_actual.replace(' ', '_')}",
+                url=self._wiki_url(title_actual),
                 summary=self._strip_html(summary),
                 content=self._strip_html(content),
                 categories=categories,

@@ -13,10 +13,11 @@ lazily imported, so the module is always importable even when
 from __future__ import annotations
 
 import logging
+import math
 import re
 import unicodedata
 from dataclasses import dataclass, field
-from typing import Any, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence
 
 import numpy as np
 
@@ -56,12 +57,21 @@ _DEFAULT_STOPWORDS: frozenset[str] = frozenset({
 })
 
 
-def _paper_to_text(paper: Any) -> str:
-    """Extract a representative text string from a Paper-like object."""
+def _paper_to_text(paper: Any, text_fields: Optional[Sequence[str]] = None) -> str:
+    """Extract a representative text string from a Paper-like object.
+
+    Args:
+        paper: Paper-like object (dict / dataclass / attribute carrier) or
+            a raw string.
+        text_fields: Optional list of fields to include, in order.
+            Defaults to ``("title", "abstract", "keywords")``.
+    """
     if paper is None:
         return ""
     if isinstance(paper, str):
         return paper
+    if text_fields is None:
+        text_fields = ("title", "abstract", "keywords")
     if isinstance(paper, dict):
         d = paper
     else:
@@ -74,18 +84,14 @@ def _paper_to_text(paper: Any) -> str:
         except Exception:
             d = {f: getattr(paper, f, None) for f in _PAPER_FIELDS}
     parts: List[str] = []
-    title = d.get("title")
-    if title:
-        parts.append(str(title))
-    abstract = d.get("abstract")
-    if abstract:
-        parts.append(str(abstract))
-    keywords = d.get("keywords")
-    if keywords:
-        if isinstance(keywords, (list, tuple, set)):
-            parts.extend(str(k) for k in keywords)
+    for field_name in text_fields:
+        value = d.get(field_name)
+        if not value:
+            continue
+        if isinstance(value, (list, tuple, set)):
+            parts.extend(str(v) for v in value)
         else:
-            parts.append(str(keywords))
+            parts.append(str(value))
     return " ".join(parts).strip()
 
 
@@ -101,6 +107,86 @@ def _clean_text(text: str) -> str:
     text = re.sub(r"[^A-Za-z\s]", " ", text)
     text = re.sub(r"\s+", " ", text).strip().lower()
     return text
+
+
+# ---------------------------------------------------------------------------
+# c_v-style topic coherence
+# ---------------------------------------------------------------------------
+def _cv_coherence(
+    cleaned_texts: Sequence[str],
+    topics: Sequence[dict],
+    top_n: int = 10,
+    eps: float = 1e-12,
+) -> Optional[float]:
+    """Compute a simple c_v-style topic coherence score.
+
+    Implements a document-level approximation of the Röder et al.
+    (2015) ``c_v`` measure: for each topic, the top ``top_n`` words are
+    extracted, pairwise NPMI (normalized point-wise mutual information)
+    over the fitted documents is computed, and each word's NPMI vector
+    (w.r.t. the other top words) is compared with the next word's
+    vector via cosine similarity, averaged over consecutive pairs and
+    topics — the ``c_v`` aggregation shape.
+
+    Args:
+        cleaned_texts: The (cleaned, lower-cased) documents the model
+            was fitted on.
+        topics: The fitted topics (list of dicts with ``top_words``).
+        top_n: Number of top words per topic to score.
+        eps: Smoothing constant.
+
+    Returns:
+        Mean coherence across topics in ``[-1, 1]`` (approx.; typical
+        "good" values ≳ 0.4), or ``None`` when it cannot be computed.
+    """
+    try:
+        docs_tokens = [set(t.split()) for t in cleaned_texts if t]
+        n_docs = len(docs_tokens)
+        if n_docs == 0 or not topics:
+            return None
+        topic_scores: List[float] = []
+        for topic in topics:
+            words = [w for w in (topic.get("top_words") or [])][:top_n]
+            words = [str(w).lower() for w in words if str(w).strip()]
+            uniq_words = list(dict.fromkeys(words))
+            if len(uniq_words) < 2:
+                continue
+            # Document frequency of each word and of each pair.
+            df: dict = {}
+            for w in uniq_words:
+                df[w] = sum(1 for toks in docs_tokens if w in toks)
+            # NPMI matrix between consecutive-pair candidate words.
+            k = len(uniq_words)
+            npmi = np.zeros((k, k), dtype=float)
+            for a in range(k):
+                for b in range(k):
+                    if a == b:
+                        continue
+                    wa, wb = uniq_words[a], uniq_words[b]
+                    co = sum(1 for toks in docs_tokens if wa in toks and wb in toks)
+                    p_w = (df[wa] + eps) / (n_docs + eps)
+                    p_v = (df[wb] + eps) / (n_docs + eps)
+                    p_wv = (co + eps) / (n_docs + eps)
+                    pmi = math.log(p_wv / (p_w * p_v))
+                    denom = -math.log(p_wv)
+                    npmi[a, b] = pmi / denom if denom > 0 else 0.0
+            # c_v-style: cosine similarity between consecutive words'
+            # NPMI vectors, averaged.
+            sims: List[float] = []
+            for i in range(k - 1):
+                vi, vj = npmi[i], npmi[i + 1]
+                ni = float(np.linalg.norm(vi))
+                nj = float(np.linalg.norm(vj))
+                if ni > 0 and nj > 0:
+                    sims.append(float(np.dot(vi, vj) / (ni * nj)))
+            if sims:
+                topic_scores.append(float(np.mean(sims)))
+        if not topic_scores:
+            return None
+        return float(np.mean(topic_scores))
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("coherence computation failed: %s", exc)
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -121,8 +207,16 @@ class TopicModel:
         model_object: Underlying fitted model (LDA / NMF / BERTopic).
         vectorizer: The vectorizer used (LDA / NMF only).
         method: Name of the backend used.
-        texts: Original input texts (when available).
-        papers: Original input papers (when available).
+        texts: Input texts, aligned 1:1 with ``doc_topic_matrix`` rows.
+        papers: Input papers (when available), aligned 1:1 with matrix
+            rows.
+        n_topics: Number of topics.
+        coherence: Mean c_v-style topic coherence (``None`` when not
+            computable).
+        kept_indices: Indices of the *input* rows retained after
+            empty-text filtering (``None`` when nothing was dropped or
+            the input was plain strings). Maps matrix rows back to the
+            original ``source`` order.
     """
 
     topics: List[dict] = field(default_factory=list)
@@ -133,6 +227,8 @@ class TopicModel:
     texts: Optional[List[str]] = None
     papers: Optional[List[Any]] = None
     n_topics: int = 0
+    coherence: Optional[float] = None
+    kept_indices: Optional[List[int]] = None
 
     def top_papers_per_topic(self, n: int = 5) -> dict[int, List[Any]]:
         """Return the ``n`` most representative papers per topic.
@@ -203,12 +299,21 @@ class TopicModeler:
         self,
         source: Sequence[Any],
         num_topics: int = 10,
+        text_fields: Optional[Sequence[str]] = None,
     ) -> TopicModel:
         """Fit the topic model to a collection of papers or texts.
+
+        Papers whose extracted text is empty after cleaning are dropped
+        *together with* their texts, so ``TopicModel.papers`` /
+        ``TopicModel.texts`` and the ``doc_topic_matrix`` rows always
+        stay aligned. Use ``TopicModel.kept_indices`` to map matrix rows
+        back to the original input order.
 
         Args:
             source: Sequence of Paper objects or raw strings.
             num_topics: Number of topics to extract.
+            text_fields: Optional paper fields used for text extraction
+                (default ``("title", "abstract", "keywords")``).
 
         Returns:
             A :class:`TopicModel` describing the fitted model.
@@ -218,21 +323,46 @@ class TopicModeler:
             raise ValueError("Cannot fit a topic model on an empty collection.")
         # Detect whether source is papers or plain strings
         if all(isinstance(s, str) for s in source):
-            texts = [s for s in source]
-            papers = None
+            raw_texts = list(source)
+            papers: Optional[List[Any]] = None
         else:
             papers = source
-            texts = [_paper_to_text(p) for p in source]
+            raw_texts = [_paper_to_text(p, text_fields) for p in source]
 
-        cleaned = [_clean_text(t) for t in texts]
-        cleaned = [t for t in cleaned if t]
+        # Clean once and filter papers + texts TOGETHER so the doc-topic
+        # matrix rows stay aligned with the retained papers (the old
+        # implementation dropped empty texts but kept the papers list
+        # intact — silent row misalignment).
+        cleaned: List[str] = []
+        kept_texts: List[str] = []
+        kept_papers: List[Any] = []
+        kept_indices: List[int] = []
+        for i, t in enumerate(raw_texts):
+            c = _clean_text(t)
+            if not c:
+                continue
+            cleaned.append(c)
+            kept_texts.append(t)
+            if papers is not None:
+                kept_papers.append(papers[i])
+                kept_indices.append(i)
         if not cleaned:
             raise ValueError("All input texts are empty after cleaning.")
+        if papers is None:
+            kept_papers = None  # type: ignore[assignment]
+            kept_indices = None  # type: ignore[assignment]
 
         if self.method == "bertopic":
-            model = self._fit_bertopic(cleaned, num_topics, source, texts, papers)
+            model = self._fit_bertopic(
+                cleaned, num_topics, source, kept_texts, kept_papers
+            )
         else:
-            model = self._fit_sklearn(cleaned, num_topics, source, texts, papers)
+            model = self._fit_sklearn(
+                cleaned, num_topics, source, kept_texts, kept_papers
+            )
+        model.kept_indices = kept_indices  # type: ignore[assignment]
+        # c_v-style coherence over the texts actually fitted.
+        model.coherence = _cv_coherence(cleaned, model.topics, top_n=10)
         self._last_model = model
         return model
 
@@ -339,12 +469,28 @@ class TopicModeler:
             )
             self.method = "nmf"
             return self._fit_sklearn(cleaned, num_topics, source, texts, papers)
+        estimator_kwargs = {
+            k: v for k, v in self.kwargs.items()
+            if k not in ("n_top_words", "random_state")
+        }
+        # Seed UMAP for run-to-run determinism (BERTopic's default UMAP
+        # is unseeded → different topics on every run).
+        if "umap_model" not in estimator_kwargs:
+            try:
+                from umap import UMAP  # type: ignore
+                estimator_kwargs["umap_model"] = UMAP(
+                    random_state=self.random_state
+                )
+            except Exception as exc:  # pragma: no cover - optional dep
+                self.logger.debug(
+                    "umap-learn unavailable (%s); BERTopic will use its "
+                    "default (unseeded) dimensionality reduction.", exc
+                )
         estimator = BERTopic(
             nr_topics=num_topics,
             calculate_probabilities=True,
             verbose=False,
-            **{k: v for k, v in self.kwargs.items()
-               if k not in ("n_top_words", "random_state")},
+            **estimator_kwargs,
         )
         topics_arr, probs = estimator.fit_transform(cleaned)
         # Build topic descriptions
@@ -439,6 +585,116 @@ class TopicModeler:
         if self._last_model is None:
             raise RuntimeError("TopicModeler must be fitted first.")
         return self._last_model.top_papers_per_topic(n=n)
+
+    # ------------------------------------------------------------------
+    # High-level facade (PATCH CONTRACT #7 — web layer entry point)
+    # ------------------------------------------------------------------
+    def analyze(
+        self,
+        papers: Sequence[Any],
+        text_fields: Sequence[str] = ("title", "abstract"),
+        method: Optional[str] = None,
+        num_topics: int = 10,
+        **kw: Any,
+    ) -> Dict[str, Any]:
+        """Fit on ``papers`` and return a plain-dict result bundle.
+
+        Contract #7 entry point for the web layer:
+        ``TopicModeler(method=m).analyze(papers, **kw)``.
+
+        Args:
+            papers: Sequence of Paper objects / dicts.
+            text_fields: Paper fields used to build each document text
+                (default ``("title", "abstract")``).
+            method: Optional backend override (``'lda'`` / ``'nmf'`` /
+                ``'bertopic'``). When given it overrides the
+                constructor's ``method``.
+            num_topics: Number of topics.
+            **kw: Recognised hyper-parameter overrides: ``random_state``,
+                ``n_top_words``. Unknown keys are ignored with a debug
+                log.
+
+        Returns:
+            Dict with keys:
+            ``method``, ``topics`` (list of ``{id, words, top_words}``),
+            ``labels`` (human-readable per-topic label strings),
+            ``doc_topics`` (per-document dominant topic id, list[int]),
+            ``doc_topic_matrix`` (np.ndarray, also as ``matrix`` list),
+            ``coherence`` (float|None), ``n_topics``, ``papers`` (the
+            aligned retained papers), ``kept_indices`` (matrix row →
+            original input index), ``model`` (the full
+            :class:`TopicModel`), and ``error`` (``None`` or a message).
+        """
+        if method is not None:
+            m = str(method).lower().strip()
+            if m not in self.SUPPORTED:
+                raise ValueError(
+                    f"Unsupported topic method '{m}'. "
+                    f"Choose from {self.SUPPORTED}."
+                )
+            self.method = m
+        for k in ("random_state", "n_top_words"):
+            if k in kw:
+                setattr(self, k, int(kw.pop(k)))
+        if kw:  # pragma: no cover - defensive
+            self.logger.debug("analyze() ignoring unknown kwargs: %s", list(kw))
+        result: Dict[str, Any] = {
+            "method": self.method,
+            "topics": [],
+            "labels": [],
+            "doc_topics": [],
+            "doc_topic_matrix": None,
+            "matrix": [],
+            "coherence": None,
+            "n_topics": 0,
+            "papers": [],
+            "kept_indices": None,
+            "model": None,
+            "error": None,
+        }
+        try:
+            model = self.fit(papers, num_topics=num_topics, text_fields=text_fields)
+        except ValueError as exc:
+            result["error"] = str(exc)
+            return result
+        dtm = model.doc_topic_matrix
+        dominant: List[int] = []
+        if dtm is not None and getattr(dtm, "ndim", 0) == 2 and dtm.size:
+            dominant = [int(i) for i in np.argmax(dtm, axis=1)]
+        labels = [
+            "Topic {}: {}".format(
+                t.get("id", i), ", ".join((t.get("top_words") or [])[:5])
+            )
+            for i, t in enumerate(model.topics)
+        ]
+        result.update({
+            "method": model.method,
+            "topics": [
+                {
+                    "id": t.get("id", i),
+                    "words": [(str(w), float(s)) for w, s in t.get("words", [])],
+                    "top_words": [str(w) for w in t.get("top_words", [])],
+                }
+                for i, t in enumerate(model.topics)
+            ],
+            "labels": labels,
+            "doc_topics": dominant,
+            "doc_topic_matrix": dtm,
+            "matrix": (
+                np.asarray(dtm).tolist()
+                if dtm is not None and getattr(dtm, "ndim", 0) == 2
+                else []
+            ),
+            "coherence": model.coherence,
+            "n_topics": model.n_topics,
+            "papers": list(model.papers) if model.papers is not None else [],
+            "kept_indices": (
+                list(model.kept_indices)
+                if model.kept_indices is not None else None
+            ),
+            "model": model,
+        })
+        return result
 
     # ------------------------------------------------------------------
     # Visualisation

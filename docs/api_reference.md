@@ -2,10 +2,10 @@
 
 > **Base URL:** `http://127.0.0.1:8765`
 > **Live docs:** <http://127.0.0.1:8765/api/docs> (when the web server is running)
-> **Source:** [`web/routes/`](../web/routes/) (8 blueprints)
+> **Source:** [`web/routes/`](../web/routes/) + `web/server.py` (15 blueprints)
 
-The Academic Research Suite web server exposes 35+ REST endpoints
-across eight blueprints, plus a Socket.IO namespace for live
+The Academic Research Suite web server exposes 108 REST endpoints
+across fifteen blueprints, plus a Socket.IO namespace for live
 updates. Every endpoint speaks JSON (request body +
 `application/json` response), every error returns a structured
 `{"error": ..., "message": ...}` body, and every long-running
@@ -46,10 +46,13 @@ WebSocket.
   Common codes: `bad_request` (400), `not_found` (404),
   `service_unavailable` (503), `internal_error` (500),
   `analysis_failed` (502).
-- **Authentication** — none in v1.0.0 (the server binds to
-  `127.0.0.1` by default). Token auth is on the
-  [v1.1.0 roadmap](../README.md#roadmap).
-- **CORS** — open (`*`). Tighten via `app.config["CORS_ORIGINS"]`
+- **Authentication** — none in v2.0.0 (the server binds to
+  `127.0.0.1` by default). The web API currently has no auth; token
+  authentication is on the
+  [v2.1.0 roadmap](../README.md#roadmap). Until then, treat a
+  network-exposed server as unauthenticated and front it with an
+  authenticating reverse proxy (see [SECURITY.md](SECURITY.md)).
+- **CORS** — local origins only by default (`ARS_CORS_ORIGINS` to change; `*` to open). Tighten via `app.config["CORS_ORIGINS"]`
   in production deployments.
 
 ---
@@ -72,7 +75,7 @@ Service health + per-module status.
 ```json
 {
   "status": "ok",
-  "version": "0.1.0",
+  "version": "2.0.0",
   "python": "3.12.4",
   "platform": "linux",
   "timestamp": "2026-08-25T10:30:00+00:00",
@@ -742,7 +745,12 @@ if no papers resolve; `501` for XLSX when `openpyxl` is missing.
 
 ### `POST /api/export/report`
 
-Generate a full project report (PDF / DOCX / PPTX).
+Generate a full project report (PDF / DOCX / PPTX). Internally the
+route fetches the project's papers via `db.list_papers(project_id=…)`
+and runs the `reporting/` builder chain
+(`PDFReport(title, author=…).add_cover_page(…).add_section(…).
+add_papers_table(…).build(path)` — or the DOCX/PPTX equivalent), so
+the response always carries a real, on-disk document.
 
 **Request body:**
 
@@ -868,9 +876,9 @@ sequenceDiagram
     S-->>C: 200 {network: {elements: {nodes, edges}}}
 
     C->>S: POST /api/export/report {type: "pdf", project_id: 1}
-    S->>R: PDFReport.generate(project_id=1)
-    R->>DB: load papers + analytics
-    R-->>S: pdf_bytes
+    S->>R: PDFReport(title, author=…).add_cover_page(…) → build(path)
+    R->>DB: list_papers(project_id=1)
+    R-->>S: pdf file on disk
     S-->>C: 200 (binary PDF)
 ```
 
@@ -943,7 +951,7 @@ this Markdown falls out of date.*
 
 ## v2.0.0 Endpoints
 
-ARS v2.0.0 adds **seven new Flask blueprints** totalling **47 new REST
+ARS v2.0.0 adds **seven new Flask blueprints** totalling **66 new REST
 endpoints** on top of the v1.0.0 baseline. All endpoints follow the
 v1 conventions — JSON in / JSON out, structured `{"error", "message"}`
 on failure, `service_unavailable` (503) when the backend module is not
@@ -1062,7 +1070,7 @@ Status codes: `bad_request` (400), `not_found` (404), `service_unavailable` (503
 
 ---
 
-### `/api/sr` — 11 endpoints
+### `/api/sr` — 12 endpoints
 
 Wraps `systematic_review/` for the full SR workflow.
 

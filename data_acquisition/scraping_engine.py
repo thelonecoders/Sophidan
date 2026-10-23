@@ -93,13 +93,39 @@ except Exception:  # pragma: no cover - fallback for headless environments
                     logging.getLogger(__name__).exception("Signal handler raised")
 
 
-# Optional: core.events.EventBus (sibling agent builds this)
+# Optional: core.events.EventBus (singleton is resolved via
+# core.events.get_event_bus() — PATCH CONTRACT #2)
 try:
     from core.events import EventBus  # type: ignore
     _EVENT_BUS_AVAILABLE = True
 except Exception:  # pragma: no cover
     EventBus = None  # type: ignore
     _EVENT_BUS_AVAILABLE = False
+
+
+def _try_get_event_bus() -> Optional[Any]:
+    """Resolve the process-wide ``EventBus`` singleton.
+
+    PATCH CONTRACT #2: engines must NOT instantiate ``EventBus()``
+    themselves (that creates a second, disconnected bus) — they resolve
+    the shared bus via :func:`core.events.get_event_bus`.  Older
+    single-accessor spellings are tried defensively.  Returns ``None``
+    when no bus is available (headless / unit-test environments).
+    """
+    try:  # pragma: no cover - depends on core.events
+        from core.events import get_event_bus  # type: ignore
+        return get_event_bus()
+    except Exception:  # noqa: BLE001
+        pass
+    if _EVENT_BUS_AVAILABLE and EventBus is not None:
+        try:  # pragma: no cover - legacy accessors
+            if hasattr(EventBus, "instance"):
+                return EventBus.instance()
+            if hasattr(EventBus, "get_instance"):
+                return EventBus.get_instance()
+        except Exception:  # noqa: BLE001
+            pass
+    return None
 
 # Optional: core.task_queue.TaskQueue
 try:
@@ -125,13 +151,14 @@ class ScrapingEngine(QObject):
         task_queue: Optional[Any] = None,
         max_workers: int = 4,
         proxy_manager: Optional[Any] = None,
+        cache: Optional[Any] = None,
     ) -> None:
         """Initialize the engine.
 
         Args:
-            event_bus: Optional ``EventBus`` instance. If omitted and
-                :mod:`core.events` is importable, the singleton bus
-                from that module is used.
+            event_bus: Optional ``EventBus`` instance. If omitted, the
+                process-wide singleton from :func:`core.events.get_event_bus`
+                is used (PATCH CONTRACT #2 — never a fresh ``EventBus()``).
             task_queue: Optional ``TaskQueue`` instance for background
                 execution. If omitted and :mod:`core.task_queue` is
                 importable, no default queue is bound (callers must
@@ -144,46 +171,54 @@ class ScrapingEngine(QObject):
                 exposes a ``proxy_manager`` settable attribute. Duck-
                 typed so :class:`proxy.proxy_manager.ProxyManager` or
                 :class:`proxy.proxy_pool.ProxyPool` both work.
+            cache: Optional ``utils.cache.Cache`` instance shared by
+                all registered scrapers.  When omitted, a default
+                ``Cache()`` is built lazily if the module is importable;
+                caching stays disabled when it is not (audit 4-b:
+                engine never injected a cache, so scraping was never
+                cached in production paths).
         """
         super().__init__()
         self.logger: logging.Logger = get_logger(__name__)
         self._scrapers: Dict[str, BaseScraper] = {}
         self._max_workers = max_workers
         self._proxy_manager = proxy_manager
+        # Engine-level cache reference (shared with all scrapers).
+        self._cache = cache if cache is not None else self._build_default_cache()
 
-        # EventBus resolution.
+        # EventBus resolution — the shared singleton via
+        # core.events.get_event_bus() (PATCH CONTRACT #2); a caller-
+        # supplied bus still wins.
         if event_bus is not None:
             self._event_bus = event_bus
-        elif _EVENT_BUS_AVAILABLE:
-            try:
-                self._event_bus = (
-                    EventBus.get_instance()  # type: ignore[assignment]
-                    if hasattr(EventBus, "get_instance")
-                    else EventBus()  # type: ignore[assignment]
-                )
-            except Exception:  # pragma: no cover - defensive
-                self._event_bus = None
         else:
-            self._event_bus = None
+            self._event_bus = _try_get_event_bus()
 
         # TaskQueue (kept by reference; not auto-instantiated).
         self._task_queue = task_queue
 
         # Wire signals to also publish on the EventBus (if any).
+        # Topic spellings follow PATCH CONTRACT #2's verbatim strings
+        # ("scrape:progress", "scrape:completed", "scrape:failed",
+        # "scrape:error"); payloads are JSON-safe dicts.
         if self._event_bus is not None:
             self.scrape_started.connect(
-                lambda q: self._publish("scrape.started", {"query": q})
+                lambda q: self._publish(
+                    "scrape:progress",
+                    {"percent": 0, "message": f"search started: {q}", "query": q,
+                     "phase": "started"},
+                )
             )
             self.progress.connect(
                 lambda pct, msg: self._publish(
-                    "scrape.progress", {"percent": pct, "message": msg}
+                    "scrape:progress", {"percent": pct, "message": msg}
                 )
             )
             self.scrape_completed.connect(
-                lambda r: self._publish("scrape.completed", {"result": r})
+                lambda r: self._publish("scrape:completed", self._result_payload(r))
             )
             self.scrape_error.connect(
-                lambda err: self._publish("scrape.error", {"error": err})
+                lambda err: self._publish("scrape:error", {"error": err})
             )
 
         # v2.0.0 — auto-register the built-in scrapers.  Each scraper
@@ -337,6 +372,16 @@ class ScrapingEngine(QObject):
                 self.logger.debug(
                     "Could not propagate proxy_manager to %s: %s", name, exc,
                 )
+        # Propagate the engine-level response cache so per-source caching
+        # actually activates in production paths (audit 4-b).
+        if self._cache is not None:
+            try:
+                if getattr(scraper, "_cache", None) is None:
+                    setattr(scraper, "_cache", self._cache)
+            except Exception as exc:  # pragma: no cover - defensive
+                self.logger.debug(
+                    "Could not propagate cache to %s: %s", name, exc,
+                )
         self._scrapers[name] = scraper
 
     def unregister_scraper(self, name: str) -> None:
@@ -377,24 +422,45 @@ class ScrapingEngine(QObject):
         self,
         query: str,
         sources: Optional[List[str]] = None,
-        **kwargs: Any,
+        max_results: int = 10,
+        should_cancel: Optional[Callable[[], bool]] = None,
+        progress_callback: Optional[Callable[..., None]] = None,
+        **filters: Any,
     ) -> ScraperResult:
         """Run ``query`` against multiple scrapers in parallel.
+
+        Headless-safe (PATCH CONTRACT #8): no Qt event loop is required.
 
         Args:
             query: Search string.
             sources: Optional list of scraper names; defaults to all
                 registered scrapers.
-            **kwargs: Additional keyword arguments forwarded to each
-                scraper's ``search`` method.
+            max_results: Maximum number of papers requested from each
+                source (default 10).
+            should_cancel: Optional zero-argument callable checked
+                BETWEEN sources; when it returns ``True`` the remaining
+                per-source futures are cancelled and the merged partial
+                result is returned immediately.
+            progress_callback: Optional callable invoked as
+                ``progress_callback(percent, message)`` after each
+                source completes (signature-tolerant: also tried as
+                ``progress_callback(percent=..., message=...)``).
+            **filters: Cross-source filters (``year``, ``year_lo``,
+                ``year_hi``, ``venue``, ``author``, ``type``, ...).
+                Recognised keys are translated per source via
+                :meth:`_translate_filters`; unknown keys are passed
+                through to every scraper's ``search`` verbatim.
 
         Returns:
             A merged :class:`ScraperResult` with de-duplicated papers.
         """
+        filter_dict, passthrough = self._split_filters(filters)
+
         target_sources = self._resolve_sources(sources)
         if not target_sources:
             err = "No scrapers registered."
             self.scrape_error.emit(err)
+            self._publish("scrape:failed", {"error": err, "query": query})
             merged = ScraperResult(source="multi", query=query)
             merged.errors.append(err)
             return merged
@@ -410,13 +476,30 @@ class ScrapingEngine(QObject):
         total = len(target_sources)
         completed = 0
         max_workers = max(1, min(self._max_workers, total))
+        cancelled = False
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {
-                executor.submit(self._invoke_scraper, name, query, kwargs): name
-                for name in target_sources
-            }
+            futures = {}
+            for name in target_sources:
+                scraper = self._scrapers[name]
+                scraper_kwargs = dict(passthrough)
+                if max_results is not None:
+                    scraper_kwargs.setdefault("max_results", max_results)
+                if filter_dict:
+                    scraper_kwargs.update(
+                        self._translate_filters(name, scraper, filter_dict)
+                    )
+                futures[
+                    executor.submit(self._invoke_scraper, name, query, scraper_kwargs)
+                ] = name
+
             for future in as_completed(futures):
+                if self._should_stop(should_cancel):
+                    cancelled = True
+                    # Cancel every future that has not started running.
+                    for pending in futures:
+                        pending.cancel()
+                    break
                 name = futures[future]
                 completed += 1
                 pct = int(100 * completed / total)
@@ -426,6 +509,7 @@ class ScrapingEngine(QObject):
                     self.logger.warning("Scraper %s raised: %s", name, exc)
                     self.scrape_error.emit(f"[{name}] {exc}")
                     self.progress.emit(pct, f"{name} failed: {exc}")
+                    self._report_progress(progress_callback, pct, f"{name} failed: {exc}")
                     continue
                 per_source[name] = sub_result
                 if sub_result.errors:
@@ -433,7 +517,9 @@ class ScrapingEngine(QObject):
                         self.scrape_error.emit(f"[{name}] {err}")
                 merged.papers.extend(sub_result.papers)
                 merged.errors.extend(f"[{name}] {err}" for err in sub_result.errors)
-                self.progress.emit(pct, f"{name}: {len(sub_result.papers)} papers")
+                msg = f"{name}: {len(sub_result.papers)} papers"
+                self.progress.emit(pct, msg)
+                self._report_progress(progress_callback, pct, msg)
 
         # Deduplicate.
         before = len(merged.papers)
@@ -449,7 +535,18 @@ class ScrapingEngine(QObject):
                 name: len(r.papers) for name, r in per_source.items()
             },
             "deduped_count": before - after,
+            "cancelled": cancelled,
         }
+        if cancelled:
+            merged.errors.append(
+                "Search cancelled by caller before all sources completed."
+            )
+            self.logger.info("search_all cancelled after %d source(s).", completed)
+            self._publish(
+                "scrape:progress",
+                {"percent": int(100 * completed / total),
+                 "message": "cancelled", "cancelled": True},
+            )
         self.scrape_completed.emit(merged)
         return merged
 
@@ -479,17 +576,44 @@ class ScrapingEngine(QObject):
         if self._task_queue is None:
             self.logger.error(
                 "search_all_async called without a bound TaskQueue; "
-                "running synchronously."
-            )
+                "running synchronously.")
             result = self.search_all(query, sources, **kwargs)
             if callback:
                 callback(result)
             return None
+
+        # The completion callback must fire on BOTH queue styles — it
+        # was silently dropped on the submit/enqueue paths (audit 4-b #28).
+        def _with_callback(res: ScraperResult) -> ScraperResult:
+            if callback:
+                try:
+                    callback(res)
+                except Exception:  # pragma: no cover - defensive
+                    self.logger.exception("search_all_async callback raised")
+            return res
+
         # Submit using whatever API the TaskQueue exposes.
         if hasattr(self._task_queue, "submit"):
-            return self._task_queue.submit(self.search_all, query, sources, **kwargs)
+            return self._task_queue.submit(
+                lambda: _with_callback(self.search_all(query, sources, **kwargs))
+            )
         if hasattr(self._task_queue, "enqueue"):
-            return self._task_queue.enqueue(self.search_all, query, sources, **kwargs)
+            task = self._task_queue.enqueue(
+                f"scrape: {str(query)[:60]}",
+                self.search_all,
+                query,
+                sources,
+                **kwargs,
+            )
+            future = getattr(task, "future", None)
+            if callback and future is not None:
+                def _invoke_callback(fut: Any) -> None:
+                    try:
+                        callback(fut.result())
+                    except Exception:  # pragma: no cover - defensive
+                        self.logger.exception("search_all_async callback raised")
+                future.add_done_callback(_invoke_callback)
+            return task
         # Fallback to thread.
         thread = threading.Thread(
             target=self._run_async,
@@ -523,6 +647,8 @@ class ScrapingEngine(QObject):
         query: str,
         filters: Dict[str, Any],
         sources: Optional[List[str]] = None,
+        should_cancel: Optional[Callable[[], bool]] = None,
+        progress_callback: Optional[Callable[..., None]] = None,
     ) -> ScraperResult:
         """Run a multi-source search with translated per-source filters.
 
@@ -533,6 +659,11 @@ class ScrapingEngine(QObject):
                 ``venue``, ``author``, ``type``,
                 ``has_full_text`` (bool), ``has_license`` (bool).
             sources: Optional list of source names.
+            should_cancel: Optional zero-argument callable checked
+                between sources; when it returns ``True`` the remaining
+                futures are cancelled and the partial result returned.
+            progress_callback: Optional callable invoked as
+                ``progress_callback(percent, message)`` per source.
 
         Returns:
             A merged :class:`ScraperResult`.
@@ -544,15 +675,22 @@ class ScrapingEngine(QObject):
         total = len(target_sources)
         completed = 0
         max_workers = max(1, min(self._max_workers, total))
+        cancelled = False
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {}
             for name in target_sources:
                 scraper = self._scrapers[name]
                 kwargs = self._translate_filters(name, scraper, filters)
+                kwargs.setdefault("max_results", 50)
                 futures[executor.submit(self._invoke_scraper, name, query, kwargs)] = name
 
             for future in as_completed(futures):
+                if self._should_stop(should_cancel):
+                    cancelled = True
+                    for pending in futures:
+                        pending.cancel()
+                    break
                 name = futures[future]
                 completed += 1
                 pct = int(100 * completed / total)
@@ -561,16 +699,23 @@ class ScrapingEngine(QObject):
                 except Exception as exc:
                     self.scrape_error.emit(f"[{name}] {exc}")
                     self.progress.emit(pct, f"{name} failed: {exc}")
+                    self._report_progress(progress_callback, pct, f"{name} failed: {exc}")
                     continue
                 merged.papers.extend(sub_result.papers)
                 merged.errors.extend(f"[{name}] {err}" for err in sub_result.errors)
-                self.progress.emit(pct, f"{name}: {len(sub_result.papers)} papers")
+                msg = f"{name}: {len(sub_result.papers)} papers"
+                self.progress.emit(pct, msg)
+                self._report_progress(progress_callback, pct, msg)
 
         before = len(merged.papers)
         merged.papers = self._dedupe(merged.papers)
         after = len(merged.papers)
         merged.total_results = before
-        merged.raw_response = {"deduped_count": before - after}
+        merged.raw_response = {"deduped_count": before - after, "cancelled": cancelled}
+        if cancelled:
+            merged.errors.append(
+                "Search cancelled by caller before all sources completed."
+            )
         self.scrape_completed.emit(merged)
         return merged
 
@@ -677,9 +822,17 @@ class ScrapingEngine(QObject):
         scraper: BaseScraper,
         filters: Dict[str, Any],
     ) -> Dict[str, Any]:
-        """Translate a cross-source filter dict to a per-source kwargs dict."""
+        """Translate a cross-source filter dict to a per-source kwargs dict.
+
+        Each branch mirrors the REAL ``search`` signature of the target
+        scraper (verified by AST against every scraper in this package).
+        The previous implementation leaked ``oa_filter``/``year_lo``
+        kwargs that OpenAlex/Semantic Scholar silently ignored, and
+        "semantic_scholar" fell into the generic ``"scholar"`` branch
+        (audit 4-b #9).
+        """
         kwargs: Dict[str, Any] = {}
-        name = source_name.lower()
+        name = (source_name or "").lower()
         year_lo = filters.get("year_lo")
         year_hi = filters.get("year_hi")
         year = filters.get("year")
@@ -687,16 +840,40 @@ class ScrapingEngine(QObject):
         author = filters.get("author")
         has_full_text = filters.get("has_full_text")
         has_license = filters.get("has_license")
-        doc_type = filters.get("type")
+        doc_type = filters.get("type") or filters.get("doc_type")
+        open_access = filters.get("open_access", filters.get("is_oa"))
+        journal = filters.get("journal")
 
-        if "crossref" in name:
-            cr_filters: Dict[str, Any] = {}
-            if year_lo:
-                cr_filters["from_pub_date"] = f"{year_lo}-01-01"
-            if year_hi:
-                cr_filters["until_pub_date"] = f"{year_hi}-12-31"
+        if "semantic_scholar" in name:
+            # S2 /paper/search takes a single ``year`` string:
+            # "2021" or "2019-2023" (open-ended via "2019-" / "-2023").
+            if year is not None:
+                kwargs["year"] = str(year)
+            elif year_lo is not None and year_hi is not None:
+                kwargs["year"] = f"{year_lo}-{year_hi}"
+            elif year_lo is not None:
+                kwargs["year"] = f"{year_lo}-"
+            elif year_hi is not None:
+                kwargs["year"] = f"-{year_hi}"
             if venue:
-                cr_filters["container_title"] = venue
+                kwargs["venue"] = venue
+            if doc_type:
+                kwargs["publication_types"] = [doc_type]
+        elif "scholar" in name:  # google_scholar
+            if year_lo is not None:
+                kwargs["year_lo"] = int(year_lo)
+            if year_hi is not None:
+                kwargs["year_hi"] = int(year_hi)
+        elif "crossref" in name:
+            cr_filters: Dict[str, Any] = {}
+            eff_lo = year_lo if year_lo is not None else year
+            eff_hi = year_hi if year_hi is not None else year
+            if eff_lo:
+                cr_filters["from_pub_date"] = f"{eff_lo}-01-01"
+            if eff_hi:
+                cr_filters["until_pub_date"] = f"{eff_hi}-12-31"
+            if venue or journal:
+                cr_filters["container_title"] = venue or journal
             if author:
                 cr_filters["author"] = author
             if doc_type:
@@ -709,35 +886,144 @@ class ScrapingEngine(QObject):
                 kwargs["filters"] = cr_filters
         elif "dblp" in name:
             if year is not None:
-                kwargs["year"] = year
+                kwargs["year"] = int(year)
             elif year_lo is not None and year_hi is not None and year_lo == year_hi:
-                kwargs["year"] = year_lo
+                kwargs["year"] = int(year_lo)
             if venue:
                 kwargs["venue"] = venue
-        elif "scholar" in name:
-            if year_lo is not None:
-                kwargs["year_lo"] = year_lo
-            if year_hi is not None:
-                kwargs["year_hi"] = year_hi
         elif "openalex" in name:
-            # OpenAlex takes filter strings like
-            # "from_publication_date:YYYY-MM-DD".
-            oa_filters: List[str] = []
-            if year_lo:
-                oa_filters.append(f"from_publication_date:{year_lo}-01-01")
-            if year_hi:
-                oa_filters.append(f"to_publication_date:{year_hi}-12-31")
+            # OpenAlexScraper.search(filters=Mapping[str, Any]) — a dict
+            # of OpenAlex filter key:value pairs joined by _build_filters.
+            oa_filters: Dict[str, Any] = {}
+            if year is not None:
+                oa_filters["publication_year"] = year
+            else:
+                if year_lo:
+                    oa_filters["from_publication_date"] = f"{year_lo}-01-01"
+                if year_hi:
+                    oa_filters["to_publication_date"] = f"{year_hi}-12-31"
             if venue:
-                oa_filters.append(
-                    f"primary_location.source.display_name.search:{venue}"
-                )
+                oa_filters["primary_location.source.display_name.search"] = venue
+            if author:
+                oa_filters["raw_author_name.search"] = author
+            if doc_type:
+                oa_filters["type"] = doc_type
+            if open_access is not None:
+                oa_filters["is_oa"] = bool(open_access)
             if oa_filters:
-                # Pass through as a string for the OpenAlex scraper to consume.
-                kwargs["oa_filter"] = ",".join(oa_filters)
-        # Generic pass-through.
-        if author and "author" not in kwargs:
-            kwargs["author"] = author
+                kwargs["filters"] = oa_filters
+        elif "springer" in name:
+            if year_lo:
+                kwargs["year_from"] = int(year_lo)
+            if year_hi:
+                kwargs["year_to"] = int(year_hi)
+            if venue or journal:
+                kwargs["journal"] = venue or journal
+            if doc_type:
+                kwargs["type"] = doc_type
+            if open_access is not None:
+                kwargs["openaccess"] = bool(open_access)
+        elif "ieee" in name:
+            eff_year = year if year is not None else year_lo
+            if eff_year:
+                kwargs["publication_year"] = int(eff_year)
+            if doc_type:
+                kwargs["article_type"] = doc_type
+            if open_access is not None:
+                kwargs["open_access"] = bool(open_access)
+        elif "opencitations" in name:
+            # DOI-only source: no free-text filters to translate.
+            pass
+        elif "core" in name:
+            if year_lo:
+                kwargs["year_from"] = int(year_lo)
+            if year_hi:
+                kwargs["year_to"] = int(year_hi)
+            if doc_type:
+                kwargs["type"] = doc_type
+            if has_full_text is not None:
+                kwargs["fulltext"] = bool(has_full_text)
+        elif "base" in name:
+            if year is not None:
+                kwargs["year"] = int(year)
+            if doc_type:
+                kwargs["type"] = doc_type
+            if filters.get("language"):
+                kwargs["language"] = filters["language"]
+            if filters.get("country"):
+                kwargs["country"] = filters["country"]
+        elif "arxiv" in name:
+            if year_lo:
+                kwargs["date_from"] = f"{year_lo}-01-01"
+            if year_hi:
+                kwargs["date_to"] = f"{year_hi}-12-31"
+            if author:
+                kwargs["author"] = author
+        elif "pubmed" in name:
+            if year_lo:
+                kwargs["mindate"] = f"{year_lo}/01/01"
+            if year_hi:
+                kwargs["maxdate"] = f"{year_hi}/12/31"
+            if venue or journal:
+                kwargs["journal"] = venue or journal
+        elif "unpaywall" in name or "wikipedia" in name or "orcid" in name:
+            # These sources expose no meaningful year/venue filters.
+            pass
         return kwargs
+
+    # Cross-source filter keys recognised by _split_filters / _translate_filters.
+    _FILTER_KEYS = (
+        "year", "year_lo", "year_hi", "venue", "author", "type", "doc_type",
+        "has_full_text", "has_license", "journal", "open_access", "is_oa",
+    )
+
+    def _split_filters(
+        self, filters: Dict[str, Any]
+    ) -> tuple[Dict[str, Any], Dict[str, Any]]:
+        """Split ``**filters`` into (recognised filter dict, passthrough kwargs).
+
+        Recognised cross-source keys are routed through
+        :meth:`_translate_filters`; everything else is forwarded to each
+        scraper's ``search`` verbatim (so source-specific options such as
+        arXiv's ``categories`` still work).
+        """
+        filter_dict: Dict[str, Any] = {}
+        passthrough: Dict[str, Any] = {}
+        for key, value in (filters or {}).items():
+            if key in self._FILTER_KEYS and value is not None:
+                filter_dict[key] = value
+            else:
+                passthrough[key] = value
+        return filter_dict, passthrough
+
+    @staticmethod
+    def _should_stop(should_cancel: Optional[Callable[[], bool]]) -> bool:
+        """Safely evaluate a cancellation callable (never raises)."""
+        if should_cancel is None:
+            return False
+        try:
+            return bool(should_cancel())
+        except Exception:  # pragma: no cover - defensive
+            return False
+
+    @staticmethod
+    def _report_progress(
+        progress_callback: Optional[Callable[..., None]],
+        percent: int,
+        message: str,
+    ) -> None:
+        """Invoke a progress callback signature-tolerantly (never raises)."""
+        if progress_callback is None:
+            return
+        try:
+            progress_callback(percent, message)
+        except TypeError:
+            try:
+                progress_callback(percent=percent, message=message)
+            except Exception:  # pragma: no cover - defensive
+                pass
+        except Exception:  # pragma: no cover - defensive
+            pass
 
     @staticmethod
     def _dedupe(papers: List[Paper]) -> List[Paper]:
@@ -859,7 +1145,12 @@ class ScrapingEngine(QObject):
         )
 
     def _publish(self, topic: str, payload: Dict[str, Any]) -> None:
-        """Publish a message on the EventBus if one is bound."""
+        """Publish a message on the EventBus if one is bound.
+
+        Uses the 2-arg ``publish(topic, payload)`` form required by the
+        core.events contract (PATCH CONTRACT #2); legacy ``emit`` /
+        ``post`` buses are supported defensively.
+        """
         if self._event_bus is None:
             return
         try:
@@ -871,6 +1162,39 @@ class ScrapingEngine(QObject):
                 self._event_bus.post(topic, payload)
         except Exception:  # pragma: no cover - defensive
             self.logger.debug("EventBus publish failed for %s", topic, exc_info=True)
+
+    def _build_default_cache(self) -> Optional[Any]:
+        """Lazily build the shared ``utils.cache.Cache`` (or ``None``)."""
+        try:  # pragma: no cover - depends on utils.cache availability
+            from utils.cache import Cache  # type: ignore
+            return Cache()
+        except Exception:  # noqa: BLE001
+            self.logger.debug(
+                "utils.cache.Cache unavailable; scraper response caching "
+                "is disabled for this engine."
+            )
+            return None
+
+    #: Cap on papers embedded in "scrape:completed" event payloads (the
+    #: full result is delivered via the Qt signal / return value).
+    _EVENT_PAPERS_CAP = 100
+
+    def _result_payload(self, result: ScraperResult) -> Dict[str, Any]:
+        """JSON-safe summary of a ``ScraperResult`` for event payloads."""
+        papers = list(getattr(result, "papers", []) or [])
+        payload: Dict[str, Any] = {
+            "source": result.source,
+            "query": result.query,
+            "total_results": result.total_results,
+            "papers_count": len(papers),
+            "papers": [
+                p.to_dict() if hasattr(p, "to_dict") else str(p)
+                for p in papers[: self._EVENT_PAPERS_CAP]
+            ],
+            "papers_truncated": len(papers) > self._EVENT_PAPERS_CAP,
+            "errors": list(getattr(result, "errors", []) or []),
+        }
+        return payload
 
     # ---- Exporters -----------------------------------------------------
     def _paper_to_row(self, paper: Paper) -> Dict[str, Any]:
@@ -902,7 +1226,12 @@ class ScrapingEngine(QObject):
         writer = csv.DictWriter(out, fieldnames=list(rows[0].keys()))
         writer.writeheader()
         for row in rows:
-            writer.writerow(row)
+            # Excel formula-injection guard (audit 4-b): neutralise cells
+            # beginning with = + - @ and control chars, matching
+            # reporting.csv_export.sanitize_csv_value.
+            writer.writerow(
+                {k: _sanitize_csv_cell(v) for k, v in row.items()}
+            )
         return out.getvalue()
 
     def _export_json(self, result: ScraperResult) -> str:
@@ -922,11 +1251,27 @@ class ScrapingEngine(QObject):
         return json.dumps(payload, indent=2, default=_default, ensure_ascii=False)
 
     def _export_bibtex(self, result: ScraperResult) -> str:
-        lookup = DOILookup()
-        entries: List[str] = []
-        for p in result.papers:
-            entries.append(lookup.to_bibtex(p))
-        return "\n\n".join(entries)
+        """Render a :class:`ScraperResult` as BibTeX text.
+
+        Uses ``reporting.bibtex_export.BibTeXExporter`` locally — the
+        previous implementation built a :class:`DOILookup` per paper and
+        fired a content-negotiation HTTP request for every DOI (an
+        unthrottled N-paper network fan-out, audit 4-b #28).  The local
+        exporter formats from already-fetched metadata; the offline
+        fallback formatter below never touches the network either.
+        """
+        try:  # pragma: no cover - reporting is an optional sibling
+            from reporting.bibtex_export import BibTeXExporter
+
+            return BibTeXExporter().to_string(result.papers)
+        except Exception as exc:
+            self.logger.debug(
+                "BibTeXExporter unavailable (%s); using local formatter.", exc
+            )
+        # Network-free fallback: template BibTeX from the Paper fields.
+        return "\n\n".join(
+            DOILookup._fallback_bibtex(p) for p in result.papers
+        )
 
     def _export_xlsx(self, result: ScraperResult) -> bytes:
         try:
@@ -956,6 +1301,32 @@ class ScrapingEngine(QObject):
 # ---------------------------------------------------------------------------
 # Module-level helper
 # ---------------------------------------------------------------------------
+
+#: Excel/Sheets formula prefixes that must be neutralised in CSV cells.
+_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
+
+
+def _sanitize_csv_cell(value: Any) -> Any:
+    """Return a CSV/Excel-safe version of ``value``.
+
+    Mirrors :func:`reporting.csv_export.sanitize_csv_value`: numeric
+    cells pass through, CR/LF/TAB are replaced with spaces and a leading
+    ``=``/``+``/``-``/``@`` is prefixed with an apostrophe so it is not
+    interpreted as a formula when opened in Excel & friends.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return str(value)
+    if isinstance(value, (int, float)):
+        return value
+    s = str(value)
+    if any(ch in s for ch in ("\r", "\n", "\t")):
+        s = s.replace("\r", " ").replace("\n", " ").replace("\t", " ")
+    if s[:1] in _FORMULA_PREFIXES:
+        s = "'" + s
+    return s
+
 
 def _merge_paper_fields(target: Paper, source: Paper) -> None:
     """Merge non-empty fields from ``source`` into ``target`` (in place).

@@ -26,12 +26,14 @@ and is configurable via ``rate_limit``.
 from __future__ import annotations
 
 import logging
+import os
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 import requests
 
+from ._compat import contact_email
 from .base_scraper import BaseScraper, Paper, ScraperResult
 
 logger = logging.getLogger(__name__)
@@ -39,6 +41,8 @@ logger = logging.getLogger(__name__)
 _ESEARCH_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
 _EFETCH_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
 _PMC_OA_URL = "https://www.ncbi.nlm.nih.gov/pmc/utils/oa/oa.fcgi"
+# PMID -> PMCID resolution (audit 4-b #8: oa.fcgi only accepts PMCIDs).
+_IDCONV_URL = "https://www.ncbi.nlm.nih.gov/pmc/utils/idconv/v1.0/"
 
 _PUBMED_XML_NS = {
     "pm": "http://www.ncbi.nlm.nih.gov/pubmed",
@@ -87,7 +91,8 @@ class PubMedScraper(BaseScraper):
         max_retries: int = 3,
         user_agent: Optional[str] = None,
         tool: str = "AcademicResearchSuite",
-        email: str = "ars_user@example.com",
+        email: Optional[str] = None,
+        api_key: Optional[str] = None,
     ) -> None:
         """Initialize a :class:`PubMedScraper`.
 
@@ -100,7 +105,14 @@ class PubMedScraper(BaseScraper):
             max_retries: Maximum retry attempts.
             user_agent: Optional User-Agent override.
             tool: ``tool`` parameter sent to E-utilities.
-            email: ``email`` parameter sent to E-utilities.
+            email: ``email`` parameter sent to E-utilities.  Defaults
+                to ``config.settings.unpaywall_email`` or the project
+                contact constant — NCBI rejects the historical
+                ``example.com`` placeholders (audit 4-b #27).
+            api_key: Optional NCBI API key (raises the rate limit from
+                3 to 10 req/s).  Falls back to the ``NCBI_API_KEY``
+                env var or ``config.settings.ncbi_api_key`` /
+                ``config.settings.pubmed_api_key``.
         """
         super().__init__(
             proxy_manager=proxy_manager,
@@ -111,7 +123,30 @@ class PubMedScraper(BaseScraper):
             user_agent=user_agent,
         )
         self.tool = tool
-        self.email = email
+        self.email = email or contact_email()
+        self.api_key = api_key or self._resolve_api_key()
+
+    def _resolve_api_key(self) -> Optional[str]:
+        """Resolve the optional NCBI API key (env var or settings)."""
+        env = os.environ.get("NCBI_API_KEY")
+        if env:
+            return env
+        try:  # pragma: no cover - settings availability dependent
+            from config import settings as _settings  # type: ignore
+            for attr in ("ncbi_api_key", "pubmed_api_key"):
+                value = getattr(_settings, attr, None)
+                if value:
+                    return value
+        except Exception:  # noqa: BLE001
+            pass
+        return None
+
+    def _ncbi_params(self) -> Dict[str, Any]:
+        """Common E-utilities identification parameters (tool/email/api_key)."""
+        params: Dict[str, Any] = {"tool": self.tool, "email": self.email}
+        if self.api_key:
+            params["api_key"] = self.api_key
+        return params
 
     # -- public API ------------------------------------------------------
 
@@ -241,56 +276,121 @@ class PubMedScraper(BaseScraper):
             self.logger.error("PubMed fetch_by_id(%s) failed: %s", paper_id, exc)
             return None
 
-    def fetch_full_text(self, pmid: str) -> Optional[str]:
-        """Fetch the full text for a PMID via the PMC OA web service.
+    def fetch_full_text(self, pmid: str) -> Optional[bytes]:
+        """Fetch the full text for a PMID via the PMC Open-Access service.
+
+        The previous implementation was 100 % dead (audit 4-b #8): it
+        passed a PMID to ``oa.fcgi`` (which only accepts PMCIDs), read
+        a nonexistent ``record['availability']`` attribute and returned
+        binary PDF bytes through ``.text``.  The rewritten pipeline:
+
+          1. PMID → PMCID via the NCBI **ID Converter API**
+             (``/pmc/utils/idconv/v1.0/?format=json``).
+          2. ``oa.fcgi?id=<PMCID>`` — locate the OA package and parse
+             ``record/link[@format]`` correctly (``xml`` → ``tgz`` →
+             ``pdf`` preference; thumbnail/``gif``/``tif`` links are
+             ignored).
+          3. The package is downloaded through the rate-limited,
+             retrying request pipeline and returned as raw **bytes**
+             (never ``.text`` of a PDF).
 
         Args:
-            pmid: The PubMed identifier.
+            pmid: The PubMed identifier (``PMID:`` prefix tolerated).
 
         Returns:
-            The full text as a string (XML or extracted plain text),
-            or ``None`` if the article is not in PMC OA or the request
-            fails.
+            The full-text payload as ``bytes`` (XML/NXML, TGZ or PDF),
+            or ``None`` when the article is not in the PMC Open-Access
+            subset or any request fails.
         """
+        pmid_clean = (pmid or "").strip()
+        if pmid_clean.upper().startswith("PMID:"):
+            pmid_clean = pmid_clean[5:].strip()
+        if not pmid_clean:
+            return None
+
+        # ---- Step 1: PMID -> PMCID via the ID Converter API ----------
+        idconv_params = self._ncbi_params()
+        idconv_params.update({"ids": pmid_clean, "format": "json"})
         try:
-            cache_key = self._cache_key("pubmed", "fulltext", pmid)
+            resp = self._make_request(
+                "GET",
+                _IDCONV_URL,
+                params=idconv_params,
+                cache_key=self._cache_key("pubmed", "idconv", pmid_clean),
+            )
+            data = resp.json()
+        except (requests.RequestException, ValueError) as exc:
+            self.logger.warning("fetch_full_text(%s): idconv failed: %s", pmid, exc)
+            return None
+        records = data.get("records", []) if isinstance(data, dict) else []
+        if not records:
+            self.logger.debug(
+                "fetch_full_text(%s): PMID not recognised by idconv.", pmid
+            )
+            return None
+        pmcid = (records[0] or {}).get("pmcid") if isinstance(records[0], dict) else None
+        if not pmcid:
+            # Article exists in PubMed but is not deposited in PMC.
+            self.logger.debug(
+                "fetch_full_text(%s): no PMCID — article not in PMC.", pmid
+            )
+            return None
+
+        # ---- Step 2: locate the OA package for the PMCID -------------
+        oa_params = self._ncbi_params()
+        oa_params["id"] = pmcid
+        try:
             resp = self._make_request(
                 "GET",
                 _PMC_OA_URL,
-                params={"id": pmid},
-                cache_key=cache_key,
+                params=oa_params,
+                cache_key=self._cache_key("pubmed", "fulltext", pmcid),
             )
             root = ET.fromstring(resp.text)
-            for record in root.findall("record"):
-                oa_status = record.get("availability", "")
-                if oa_status.lower() in ("oa", "openaccess"):
-                    # Prefer the PDF link; fall back to tgz/XML.
-                    for link in record.findall("link"):
-                        fmt = link.get("format", "").lower()
-                        if fmt in ("pdf", "xml", "tgz"):
-                            url = link.get("href", "")
-                            if url:
-                                try:
-                                    pdf_resp = self._session.get(
-                                        url, timeout=self.timeout
-                                    )
-                                    pdf_resp.raise_for_status()
-                                    # PMC OA tgz/xml returns raw bytes; for
-                                    # PDF we just return the text preview.
-                                    try:
-                                        return pdf_resp.text
-                                    except UnicodeDecodeError:
-                                        return pdf_resp.content.decode(
-                                            "utf-8", errors="replace"
-                                        )
-                                except requests.RequestException as exc:
-                                    self.logger.warning(
-                                        "PMC OA fetch failed for %s: %s", pmid, exc
-                                    )
-                                    return None
         except (requests.RequestException, ET.ParseError) as exc:
-            self.logger.warning("fetch_full_text(%s) failed: %s", pmid, exc)
+            self.logger.warning("fetch_full_text(%s): oa.fcgi failed: %s", pmid, exc)
             return None
+
+        error_el = root.find("error")
+        if error_el is not None:
+            self.logger.debug(
+                "fetch_full_text(%s): PMC OA error: %s",
+                pmid, (error_el.text or "").strip(),
+            )
+            return None
+        record = root.find("record")
+        if record is None:
+            return None
+        license_name = (record.get("license") or "").strip()
+        self.logger.debug(
+            "fetch_full_text(%s): %s (%s license)", pmid, pmcid, license_name or "unknown"
+        )
+
+        # ---- Step 3: pick the best link[@format] ----------------------
+        # oa.fcgi advertises file formats in link[@format]; the old code
+        # read a nonexistent availability attribute instead.
+        href_by_format: Dict[str, str] = {}
+        for link in record.findall("link"):
+            fmt = (link.get("format") or "").strip().lstrip(".").lower()
+            href = (link.get("href") or "").strip()
+            if fmt and href:
+                href_by_format.setdefault(fmt, href)
+        for fmt in ("xml", "nxml", "tgz", "pdf"):
+            href = href_by_format.get(fmt)
+            if not href:
+                continue
+            if href.startswith("ftp://"):
+                # NCBI publishes its FTP tree over HTTPS as well.
+                href = href.replace("ftp://", "https://", 1)
+            try:
+                payload = self._make_request(
+                    "GET", href, timeout=self.timeout, use_cache=False,
+                )
+                return payload.content  # raw bytes — never .text of a PDF
+            except requests.RequestException as exc:
+                self.logger.warning(
+                    "fetch_full_text(%s): download %s failed: %s", pmid, href, exc
+                )
         return None
 
     # -- E-utilities helpers ---------------------------------------------
@@ -312,14 +412,16 @@ class PubMedScraper(BaseScraper):
             "term": full_query,
             "retmax": max_results,
             "retmode": "xml",
-            "tool": self.tool,
-            "email": self.email,
         }
+        params.update(self._ncbi_params())
         if mindate:
-            params["mindate"] = mindate.replace("/", "/")
+            # E-utilities requires YYYY/MM/DD; normalise ISO dashed
+            # input instead of the old no-op .replace("/", "/")
+            # (audit 4-b #18).
+            params["mindate"] = str(mindate).replace("-", "/")
             params["datetype"] = "pdat"
         if maxdate:
-            params["maxdate"] = maxdate.replace("/", "/")
+            params["maxdate"] = str(maxdate).replace("-", "/")
             params["datetype"] = "pdat"
         cache_key = self._cache_key("pubmed", "esearch", full_query, max_results)
         resp = self._make_request(
@@ -347,9 +449,8 @@ class PubMedScraper(BaseScraper):
             "id": ",".join(pmids),
             "retmode": "xml",
             "rettype": "abstract",
-            "tool": self.tool,
-            "email": self.email,
         }
+        params.update(self._ncbi_params())
         cache_key = self._cache_key("pubmed", "efetch", "|".join(pmids))
         resp = self._make_request(
             "GET", _EFETCH_URL, params=params, cache_key=cache_key

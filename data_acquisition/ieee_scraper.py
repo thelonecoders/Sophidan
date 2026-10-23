@@ -75,6 +75,16 @@ class IEEEXploreScraper(BaseScraper):
         "Courses",
     }
 
+    # sort_field values IEEE actually documents (audit 4-b #16:
+    # "relevance" is NOT in the set and risks HTTP 400 — it is dropped).
+    _VALID_SORT_FIELDS = {
+        "article_number",
+        "article_title",
+        "publication_title",
+        "publication_year",
+        "citedby_count",
+    }
+
     def __init__(
         self,
         proxy_manager: Optional[Any] = None,
@@ -118,6 +128,7 @@ class IEEEXploreScraper(BaseScraper):
         article_type: Optional[str] = None,
         open_access: Optional[bool] = None,
         publication_year: Optional[int] = None,
+        sort_field: Optional[str] = None,
         **kwargs: Any,
     ) -> ScraperResult:
         """Search IEEE Xplore for articles matching ``query``.
@@ -130,8 +141,17 @@ class IEEEXploreScraper(BaseScraper):
                 ``"Journals"``, ``"Magazines"``, ``"Early Access"``,
                 ``"Standards"``, ``"Books"``, ``"Courses"``.
             open_access: If ``True`` returns only open-access content;
-                ``False`` for closed; ``None`` for no filter.
+                ``False`` for closed; ``None`` for no filter.  IEEE's
+                API expects a **Boolean** (``true``/``false``) — the
+                old ``yes``/``no`` strings were silently ignored
+                (audit 4-b #16).
             publication_year: 4-digit publication year filter.
+            sort_field: Optional sort field — one of
+                ``"article_number"``, ``"article_title"``,
+                ``"publication_title"``, ``"publication_year"``,
+                ``"citedby_count"``.  Unrecognised values (including
+                the previously hardcoded ``"relevance"``) are omitted
+                so IEEE applies its default ordering.
             **kwargs: Reserved for future use.
 
         Returns:
@@ -157,9 +177,17 @@ class IEEEXploreScraper(BaseScraper):
             "querytext": query,
             "max_records": min(max_results, 200),
             "start_record": 1,
-            "sort_field": "relevance",
             "sort_order": "desc",
         }
+        # Only send a sort_field IEEE documents; "relevance" is not in
+        # the API's vocabulary and risks HTTP 400 (audit 4-b #16).
+        if sort_field and str(sort_field).lower() in self._VALID_SORT_FIELDS:
+            params["sort_field"] = str(sort_field).lower()
+        elif sort_field:
+            self.logger.warning(
+                "Unknown IEEE sort_field=%r; omitted (valid: %s)",
+                sort_field, sorted(self._VALID_SORT_FIELDS),
+            )
         if article_type:
             if article_type not in self._VALID_ARTICLE_TYPES:
                 self.logger.warning(
@@ -169,7 +197,8 @@ class IEEEXploreScraper(BaseScraper):
             else:
                 params["article_type"] = article_type
         if open_access is not None:
-            params["open_access"] = "yes" if open_access else "no"
+            # IEEE expects a Boolean, not "yes"/"no" (audit 4-b #16).
+            params["open_access"] = "true" if open_access else "false"
         if publication_year:
             params["publication_year"] = int(publication_year)
 

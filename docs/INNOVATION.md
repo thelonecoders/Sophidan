@@ -153,10 +153,11 @@ scraped data, manual entries, or imported BibTeX):
   evolution animation / growth-curve utilities (GIF output via
   `imageio`).
 
-Every graph class exposes `to_cytoscape(papers)` for web
-embedding, `build(papers)` for the raw `networkx.Graph`, and
-visually renders in the `NetworkViewWidget` (matplotlib canvas
-with hover / click / drill-in).
+Every graph class exposes `build(papers)` for the raw
+`networkx.Graph`, and visually renders in the `NetworkViewWidget`
+(matplotlib canvas with hover / click / drill-in). For web embedding,
+`networkx_pro.graph_io.GraphIO.to_cytoscape(graph)` converts any built
+graph to Cytoscape JSON.
 
 **Why it's novel.** Combining three graph types + temporal
 evolution + a real interactive UI in one tool — that's a
@@ -218,7 +219,7 @@ Most are either/or (cloud SaaS OR local desktop).
 | Capability | Reference managers | ARS |
 |---|---|---|
 | Bibliography management | ✅ | ⚠️ (BibTeX export) |
-| PDF organization | ✅ | ❌ (planned v1.1.0) |
+| PDF organization | ✅ | ❌ (planned v2.1.0) |
 | Citation plugins (Word/LaTeX) | ✅ | ❌ |
 | **Multi-source scraping** | ❌ | ✅ (8 sources in parallel) |
 | **Proxy management** | ❌ | ✅ (6-module suite) |

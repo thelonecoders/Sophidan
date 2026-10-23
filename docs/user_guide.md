@@ -38,8 +38,8 @@ Follow [INSTALL.md](INSTALL.md) for platform-specific instructions.
 The TL;DR on Linux / macOS:
 
 ```bash
-git clone https://github.com/academic-research-suite/academic_research_suite.git
-cd academic_research_suite
+git clone https://github.com/thelonecoders/Sophidan.git
+cd Sophidan
 python -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
 ```
@@ -365,14 +365,15 @@ This declutters dense graphs.
 ### Exporting
 
 **Export PNG** and **Export SVG** save the current figure. For
-programmatic access, every graph class also exposes
-`to_cytoscape(papers)` returning a JSON-serialisable dict for the
-web viewer:
+programmatic access, `networkx_pro.graph_io.GraphIO.to_cytoscape(graph)`
+returns a JSON-serialisable dict for the web viewer:
 
 ```python
 from knowledge_graph import CitationGraph
+from networkx_pro.graph_io import GraphIO
 import json
-data = CitationGraph().to_cytoscape(papers)
+graph = CitationGraph().build(papers)
+data = GraphIO.to_cytoscape(graph)
 open("graph.json", "w").write(json.dumps(data, indent=2))
 ```
 
@@ -783,7 +784,7 @@ a missing optional dependency — install via
 
 *If this guide doesn't answer your question, see
 [FAQ.md](FAQ.md) or open an issue at
-<https://github.com/academic-research-suite/academic_research_suite/issues>.*
+<https://github.com/thelonecoders/Sophidan/issues>.*
 
 ---
 

@@ -93,7 +93,7 @@ class ACMDigitalLibraryScraper(BaseScraper):
     # Identifies the scraper in server logs.
     DEFAULT_USER_AGENT = (
         "AcademicResearchSuite/2.0 "
-        "(ACM DL scraper; +https://github.com/academic-research-suite; "
+        "(ACM DL scraper; +https://github.com/thelonecoders/Sophidan; "
         "academic research, contact via GitHub)"
     )
 

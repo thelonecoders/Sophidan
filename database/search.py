@@ -3,12 +3,14 @@
 Wraps an FTS5 virtual table that mirrors the ``papers`` table and exposes
 BM25-ranked search, advanced field-filtered search, autocomplete and
 snippet highlighting. The FTS index is kept in sync via :meth:`index_paper`
-— call this whenever a paper is inserted/updated.
+— call this whenever a paper is inserted/updated (``DatabaseConnection
+.add_paper`` does this automatically).
 
 The class is a thin facade over the SQLAlchemy connection exposed by
 :class:`database.connection.DatabaseConnection`. It degrades gracefully
 when FTS5 is unavailable (older SQLite builds): ``search`` falls back to
-``LIKE``-based matching.
+``LIKE``-based matching and ``index_paper`` / ``rebuild_index`` become
+safe no-ops.
 """
 #
 # MIT License — Academic Research Suite
@@ -16,6 +18,7 @@ when FTS5 is unavailable (older SQLite builds): ``search`` falls back to
 #
 from __future__ import annotations
 
+import html
 import logging
 import re
 from typing import Any, Dict, List, Optional
@@ -30,20 +33,41 @@ _FTS5_AVAILABLE: Optional[bool] = None
 
 
 def _detect_fts5(conn) -> bool:
-    """Return True if the SQLite connection supports FTS5."""
+    """Return True if the given (open) connection supports FTS5.
+
+    Accepts either a SQLAlchemy :class:`~sqlalchemy.engine.Connection` or a
+    raw :class:`sqlite3.Connection`. The probe table is created and dropped
+    within the caller's connection; the result is cached module-wide (FTS5
+    support is a property of the SQLite *library*, not of a database file).
+    """
     global _FTS5_AVAILABLE
     if _FTS5_AVAILABLE is not None:
         return _FTS5_AVAILABLE
     try:
-        cur = conn.connection.cursor() if hasattr(conn, "connection") else conn.cursor()
-        cur.execute("CREATE VIRTUAL TABLE IF NOT EXISTS __fts5_probe USING fts5(x);")
-        cur.execute("DROP TABLE IF EXISTS __fts5_probe;")
-        cur.close()
+        if hasattr(conn, "exec_driver_sql"):
+            # SQLAlchemy Connection — stays within its transaction handling.
+            conn.exec_driver_sql(
+                "CREATE VIRTUAL TABLE IF NOT EXISTS __fts5_probe USING fts5(x);"
+            )
+            conn.exec_driver_sql("DROP TABLE IF EXISTS __fts5_probe;")
+            conn.commit()
+        else:
+            cur = conn.cursor()
+            cur.execute("CREATE VIRTUAL TABLE IF NOT EXISTS __fts5_probe USING fts5(x);")
+            cur.execute("DROP TABLE IF EXISTS __fts5_probe;")
+            conn.commit()
+            cur.close()
         _FTS5_AVAILABLE = True
     except Exception as exc:  # pragma: no cover - depends on sqlite build
         logger.warning("FTS5 unavailable (%s) — falling back to LIKE search.", exc)
         _FTS5_AVAILABLE = False
     return _FTS5_AVAILABLE
+
+
+def _db_supports_fts5(db: DatabaseConnection) -> bool:
+    """Feature-detect FTS5 on a short-lived (properly closed) connection."""
+    with db.get_engine().connect() as conn:
+        return _detect_fts5(conn)
 
 
 def _escape_fts_query(query: str) -> str:
@@ -92,9 +116,9 @@ class FullTextSearch:
         """
         from sqlalchemy import text
 
+        if not _db_supports_fts5(self.db):
+            return
         with self.db.get_engine().connect() as conn:
-            if not _detect_fts5(conn):
-                return
             conn.execute(text(
                 f"CREATE VIRTUAL TABLE IF NOT EXISTS {self.TABLE} USING fts5("
                 "paper_id UNINDEXED, "
@@ -157,7 +181,7 @@ class FullTextSearch:
             logger.debug("Indexed paper id=%s in FTS (in-session).", pid)
             return
 
-        if not _detect_fts5(self.db.get_engine().connect()):
+        if not _db_supports_fts5(self.db):
             return
         with self.db.get_engine().begin() as conn:
             conn.execute(del_sql, params)
@@ -168,7 +192,7 @@ class FullTextSearch:
         """Drop and recreate the FTS table from the current ``papers`` rows.
 
         Returns:
-            The number of papers indexed.
+            The number of papers indexed (0 when FTS5 is unavailable).
         """
         from database.models import PaperModel
         from sqlalchemy import text
@@ -176,7 +200,7 @@ class FullTextSearch:
         with self.db.get_engine().begin() as conn:
             conn.execute(text(f"DROP TABLE IF EXISTS {self.TABLE}"))
         self._ensure_table()
-        if not _detect_fts5(self.db.get_engine().connect()):
+        if not _db_supports_fts5(self.db):
             return 0
         session = self.db.get_session()
         try:
@@ -185,7 +209,7 @@ class FullTextSearch:
                 self.index_paper(p)
             return len(papers)
         finally:
-            self.db._session_factory.remove()
+            self.db.remove_session()
 
     # ------------------------------------------------------------------
     # Search
@@ -205,7 +229,7 @@ class FullTextSearch:
 
         session = self.db.get_session()
         try:
-            if not _detect_fts5(self.db.get_engine().connect()):
+            if not _db_supports_fts5(self.db):
                 return self._like_search(session, query, limit)
             fts_query = _escape_fts_query(query)
             if fts_query == "*":
@@ -218,9 +242,15 @@ class FullTextSearch:
                 f"ORDER BY bm25({self.TABLE}) LIMIT :lim"
             )
             from sqlalchemy import text
-            rows = session.execute(
-                text(sql), {"q": fts_query, "lim": limit},
-            ).fetchall()
+            try:
+                rows = session.execute(
+                    text(sql), {"q": fts_query, "lim": limit},
+                ).fetchall()
+            except Exception as exc:
+                # Malformed MATCH expressions or a missing/corrupt FTS table
+                # must never break search — degrade to LIKE matching.
+                logger.warning("FTS5 MATCH failed (%s) — LIKE fallback.", exc)
+                return self._like_search(session, query, limit)
             ids = [r[0] for r in rows]
             if not ids:
                 return []
@@ -232,7 +262,7 @@ class FullTextSearch:
             results.sort(key=lambda p: id_to_pos.get(p.id, len(ids)))
             return results
         finally:
-            self.db._session_factory.remove()
+            self.db.remove_session()
 
     def _like_search(self, session, query: str, limit: int) -> List[Any]:
         """Fallback LIKE-based search when FTS5 is unavailable."""
@@ -297,7 +327,7 @@ class FullTextSearch:
             limit = int(query.get("limit", 50))
             return q.limit(limit).all()
         finally:
-            self.db._session_factory.remove()
+            self.db.remove_session()
 
     def suggest(self, query: str, n: int = 10) -> List[str]:
         """Return up to ``n`` autocomplete suggestions for ``query``.
@@ -325,13 +355,15 @@ class FullTextSearch:
             ).distinct().limit(n).all()
             return [r[0] for r in rows if r[0]]
         finally:
-            self.db._session_factory.remove()
+            self.db.remove_session()
 
     def highlight(self, query: str, paper: Any, max_tokens: int = 32) -> str:
         """Return a snippet of the paper abstract with ``<mark>`` highlights.
 
-        Uses FTS5's ``highlight()`` function when available; otherwise
-        performs a simple regex-based highlight in Python.
+        The returned text is always **HTML-escaped** (both the abstract and
+        the title fallback path); the only markup injected by this method is
+        the ``<mark>`` element around matched tokens, so the result is safe
+        to embed in HTML views.
 
         Args:
             query: The original search query (used to find matching tokens).
@@ -341,15 +373,24 @@ class FullTextSearch:
         Returns:
             An HTML-escaped snippet with ``<mark>`` tags around matches.
         """
-        abstract = (getattr(paper, "abstract", None) or "").strip()
-        if not abstract:
+        raw_abstract = (getattr(paper, "abstract", None) or "").strip()
+        raw_title = (getattr(paper, "title", None) or "").strip()
+        source_text = raw_abstract or raw_title
+        if not source_text:
             return ""
+        # Escape BEFORE matching so no raw HTML from paper metadata can
+        # survive into the output.
+        abstract = html.escape(source_text)
         tokens = re.findall(r"[\w]+", (query or ""), flags=re.UNICODE)
         if not tokens:
             return abstract[:200]
-        # Build a case-insensitive alternation regex.
+        # Build a case-insensitive alternation regex (tokens escaped for
+        # both regex and HTML so queries containing & < > still match the
+        # escaped body text).
         pattern = re.compile(
-            r"(" + "|".join(re.escape(t) for t in tokens) + r")",
+            r"(" + "|".join(
+                re.escape(html.escape(t)) for t in tokens
+            ) + r")",
             flags=re.IGNORECASE,
         )
         # Find first match offset, then carve out a context window.
