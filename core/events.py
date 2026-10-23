@@ -6,8 +6,36 @@ This module defines:
   application (``ScrapeStarted``, ``ScrapeProgress``, … ``DBMigrated``).
 * An :class:`Event` dataclass carrying a payload alongside the type.
 * An :class:`EventBus` implementing the observer pattern with thread-safe
-  :py:meth:`subscribe` / :py:meth:`publish` and Qt-signal integration through
-  :class:`SignalBridge`.
+  :py:meth:`subscribe` / :py:meth:`publish`, string-topic interop and
+  Qt-signal integration through :class:`SignalBridge`.
+
+API CONTRACT (worklog "PATCH CONTRACTS" #2)
+-------------------------------------------
+
+* ``bus.publish(event_or_topic, payload=None)`` — accepts a ready-made
+  :class:`Event`, an :class:`EventType`, **or** a plain string topic with a
+  payload (``bus.publish("scrape:completed", {...})``). String topics are
+  stored/matched *verbatim*; well-known spellings are additionally mapped
+  onto their :class:`EventType` so enum-subscribers also fire.
+* ``bus.subscribe(topic_or_type, handler)`` — accepts a string topic, an
+  :class:`EventType`, or ``None`` (wildcard). Handlers always receive the
+  :class:`Event` object; use ``event.payload`` for the published body
+  (``Event.get(key)`` is a dict-payload convenience).
+* ``get_event_bus()`` returns the process-wide singleton;
+  ``EventBus.instance()`` is a classmethod alias (UI/web code calls it).
+
+String-topic ↔ EventType interop
+--------------------------------
+
+Publishing an :class:`Event` also notifies string-subscribers whose topic
+matches the event type (separator-insensitively): e.g. an
+``Event(EventType.ScrapeCompleted)`` notifies subscribers of
+``"scrape:completed"``, ``"scrape.completed"``, ``"scrape_completed"`` and
+the synonyms ``"scrape_finished"`` / ``"scrape:complete"``. Conversely,
+publishing the string ``"scrape:completed"`` also fires handlers registered
+for ``EventType.ScrapeCompleted``. Topics with no matching event type
+(``"paper_added"``, ``"log:line"``, ``"ai:token"``, …) are delivered to
+their verbatim (and separator-normalised) string subscribers only.
 
 The bus is intentionally Qt-agnostic at its core — handlers are plain Python
 callables invoked on the publishing thread. The optional :class:`SignalBridge`
@@ -26,10 +54,11 @@ from __future__ import annotations
 
 import enum
 import logging
+import re
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +74,7 @@ class EventType(enum.Enum):
     ScrapeCompleted = "scrape_completed"
     ScrapeFailed = "scrape_failed"
     AnalysisProgress = "analysis_progress"
+    AnalysisCompleted = "analysis_completed"
     ExportCompleted = "export_completed"
     ProxyRotated = "proxy_rotated"
     AIResponse = "ai_response"
@@ -57,10 +87,52 @@ ScrapeProgress = EventType.ScrapeProgress
 ScrapeCompleted = EventType.ScrapeCompleted
 ScrapeFailed = EventType.ScrapeFailed
 AnalysisProgress = EventType.AnalysisProgress
+AnalysisCompleted = EventType.AnalysisCompleted
 ExportCompleted = EventType.ExportCompleted
 ProxyRotated = EventType.ProxyRotated
 AIResponse = EventType.AIResponse
 DBMigrated = EventType.DBMigrated
+
+
+def _norm_topic(topic: str) -> str:
+    """Normalise a topic string for alias matching (not for storage).
+
+    ``"scrape:completed"`` / ``"scrape.completed"`` / ``"Scrape_Completed"``
+    all normalise to ``"scrape_completed"``. Registry keys themselves are
+    always stored verbatim.
+    """
+    return re.sub(r"[^a-z0-9]+", "_", str(topic).lower()).strip("_")
+
+
+# Alias sets: every string spelling that a published EventType also notifies.
+_EVENT_ALIASES: Dict[EventType, Tuple[str, ...]] = {
+    EventType.ScrapeStarted: ("scrape_started",),
+    EventType.ScrapeProgress: ("scrape_progress",),
+    EventType.ScrapeCompleted: (
+        "scrape_completed", "scrape_complete", "scrape_finished",
+        "scrape_done",
+    ),
+    EventType.ScrapeFailed: (
+        "scrape_failed", "scrape_error", "scrape_failure",
+    ),
+    EventType.AnalysisProgress: ("analysis_progress",),
+    EventType.AnalysisCompleted: (
+        "analysis_completed", "analysis_finished", "analysis_done",
+    ),
+    EventType.ExportCompleted: (
+        "export_completed", "export_finished", "export_done",
+    ),
+    EventType.ProxyRotated: ("proxy_rotated", "proxy_rotation"),
+    EventType.AIResponse: ("ai_response", "ai_done"),
+    EventType.DBMigrated: ("db_migrated", "database_migrated",
+                           "migration_completed"),
+}
+
+# Reverse lookup: normalised string topic -> EventType (if any).
+_STRING_TO_EVENT: Dict[str, EventType] = {}
+for _etype, _aliases in _EVENT_ALIASES.items():
+    for _alias in _aliases:
+        _STRING_TO_EVENT[_alias] = _etype
 
 
 # ---------------------------------------------------------------------------
@@ -71,16 +143,35 @@ class Event:
     """A single event published on the :class:`EventBus`.
 
     Attributes:
-        type: One of :class:`EventType`.
+        type: One of :class:`EventType`, or the verbatim topic string for
+            free-form topics (``"paper_added"``, ``"log:line"``, …).
         payload: Arbitrary structured data for the handler.
         timestamp: Monotonic creation time (epoch seconds).
         source: Optional name of the publishing component.
     """
 
-    type: EventType
+    type: Union[EventType, str]
     payload: Any = None
     timestamp: float = field(default_factory=time.time)
     source: Optional[str] = None
+
+    def get(self, key: str, default: Any = None) -> Any:
+        """Dict-style accessor over a dict payload (convenience for bridges).
+
+        Returns ``default`` when the payload is not a dict or the key is
+        missing, so consumers written as ``event.get("task_id")`` work for
+        both structured and empty payloads.
+        """
+        payload = self.payload
+        if isinstance(payload, dict):
+            return payload.get(key, default)
+        return default
+
+    def topic_name(self) -> str:
+        """Return the canonical string name of this event's type."""
+        if isinstance(self.type, EventType):
+            return self.type.value
+        return str(self.type)
 
 
 EventHandler = Callable[[Event], None]
@@ -92,90 +183,180 @@ EventHandler = Callable[[Event], None]
 class EventBus:
     """Thread-safe observer-pattern event bus.
 
-    Multiple handlers may subscribe to the same :class:`EventType`. Handlers
-    are invoked synchronously on the publishing thread, so they must be cheap
-    or offload long work themselves.
+    Handlers may subscribe by :class:`EventType`, by verbatim string topic,
+    or wildcard (``None``). Handlers are invoked synchronously on the
+    publishing thread, so they must be cheap or offload long work
+    themselves. See the module docstring for the topic-interop rules.
     """
 
     def __init__(self) -> None:
         self._lock = threading.RLock()
         self._handlers: Dict[EventType, List[EventHandler]] = {}
+        self._string_handlers: Dict[str, List[EventHandler]] = {}
         self._wildcard_handlers: List[EventHandler] = []
         self._bridge: Optional["SignalBridge"] = None
+
+    # ------------------------------------------------------------------ keys
+    @staticmethod
+    def _string_keys_for(event_type: EventType) -> Set[str]:
+        """Return the normalised topic keys notified for ``event_type``."""
+        return set(_EVENT_ALIASES.get(event_type, ())) | {event_type.value}
+
+    @staticmethod
+    def _event_for_topic(topic: str) -> Optional[EventType]:
+        """Return the :class:`EventType` a string topic maps to, if any."""
+        return _STRING_TO_EVENT.get(_norm_topic(topic))
 
     # ------------------------------------------------------------------ subscribe
     def subscribe(
         self,
-        event_type: Optional[EventType],
+        topic_or_type: Optional[Union[EventType, str]],
         handler: EventHandler,
     ) -> EventHandler:
-        """Register ``handler`` for events of ``event_type``.
+        """Register ``handler`` for a topic / event type / every event.
 
         Args:
-            event_type: The :class:`EventType` to listen for, or ``None`` to
-                receive every event (wildcard subscriber).
+            topic_or_type: An :class:`EventType`, a verbatim string topic
+                (``"scrape:completed"``, ``"paper_added"``, …), or ``None``
+                to receive every event (wildcard subscriber).
             handler: A callable accepting an :class:`Event`.
 
         Returns:
             The same handler, for use as a decorator.
         """
         with self._lock:
-            if event_type is None:
+            if topic_or_type is None:
                 self._wildcard_handlers.append(handler)
+            elif isinstance(topic_or_type, EventType):
+                self._handlers.setdefault(topic_or_type, []).append(handler)
             else:
-                self._handlers.setdefault(event_type, []).append(handler)
+                # Stored verbatim under the exact string given.
+                self._string_handlers.setdefault(
+                    str(topic_or_type), [],
+                ).append(handler)
         return handler
 
     def unsubscribe(
         self,
-        event_type: Optional[EventType],
+        topic_or_type: Optional[Union[EventType, str]],
         handler: EventHandler,
     ) -> bool:
         """Remove a previously-registered handler.
 
         Args:
-            event_type: The same type passed to :meth:`subscribe`, or ``None``
-                for wildcard handlers.
+            topic_or_type: The same key passed to :meth:`subscribe`
+                (``None`` for wildcard handlers).
             handler: The handler callable to remove.
 
         Returns:
             ``True`` if the handler was removed, ``False`` if not registered.
         """
         with self._lock:
-            lst = (
-                self._wildcard_handlers
-                if event_type is None
-                else self._handlers.get(event_type, [])
-            )
+            if topic_or_type is None:
+                lst = self._wildcard_handlers
+            elif isinstance(topic_or_type, EventType):
+                lst = self._handlers.get(topic_or_type, [])
+            else:
+                lst = self._string_handlers.get(str(topic_or_type), [])
             if handler in lst:
                 lst.remove(handler)
                 return True
             return False
 
     # ------------------------------------------------------------------ publish
-    def publish(self, event: Event) -> None:
-        """Dispatch ``event`` to all matching handlers.
+    def publish(
+        self,
+        event_or_topic: Union[Event, EventType, str],
+        payload: Any = None,
+        *,
+        source: Optional[str] = None,
+    ) -> Optional[Event]:
+        """Dispatch an event (or topic + payload) to all matching handlers.
 
-        Handlers are invoked synchronously. Exceptions raised by individual
-        handlers are logged but do not prevent subsequent handlers from
-        running.
+        Overloads:
+
+        * ``publish(event)`` — dispatch a ready-made :class:`Event`
+          (backward compatible with the original API).
+        * ``publish(EventType.X)`` / ``publish(EventType.X, payload)`` —
+          wrap into an :class:`Event` and dispatch.
+        * ``publish("topic", payload)`` — wrap the verbatim string topic
+          into an :class:`Event` and dispatch. If the topic maps to a
+          known :class:`EventType` (e.g. ``"scrape:completed"``), the
+          corresponding enum subscribers are notified as well.
+
+        Handlers are invoked synchronously and always receive the
+        :class:`Event` object. Exceptions raised by individual handlers are
+        logged but do not prevent subsequent handlers from running.
 
         Args:
-            event: The :class:`Event` to publish.
+            event_or_topic: The :class:`Event`, :class:`EventType` or string
+                topic to publish.
+            payload: Payload used when wrapping (ignored when a ready-made
+                :class:`Event` is passed).
+            source: Optional component name for wrapped events.
+
+        Returns:
+            The :class:`Event` that was dispatched (``None`` if the input
+            was invalid).
         """
+        if isinstance(event_or_topic, Event):
+            event = event_or_topic
+        elif isinstance(event_or_topic, EventType):
+            event = Event(type=event_or_topic, payload=payload, source=source)
+        elif isinstance(event_or_topic, str):
+            topic = event_or_topic
+            mapped = self._event_for_topic(topic)
+            if mapped is not None:
+                event = Event(type=mapped, payload=payload, source=source)
+            else:
+                event = Event(type=topic, payload=payload, source=source)
+        else:
+            logger.warning(
+                "EventBus.publish got unsupported %r — ignored",
+                type(event_or_topic).__name__,
+            )
+            return None
+
         with self._lock:
-            handlers = list(self._handlers.get(event.type, [])) + list(self._wildcard_handlers)
+            handler_lists: List[List[EventHandler]] = []
+            if isinstance(event.type, EventType):
+                handler_lists.append(list(self._handlers.get(event.type, [])))
+                wanted = self._string_keys_for(event.type)
+                for topic, lst in self._string_handlers.items():
+                    if _norm_topic(topic) in wanted and lst:
+                        handler_lists.append(list(lst))
+            else:
+                canonical = _norm_topic(str(event.type))
+                for topic, lst in self._string_handlers.items():
+                    if _norm_topic(topic) == canonical and lst:
+                        handler_lists.append(list(lst))
+                mapped = self._event_for_topic(str(event.type))
+                if mapped is not None:
+                    handler_lists.append(list(self._handlers.get(mapped, [])))
+            handler_lists.append(list(self._wildcard_handlers))
             bridge = self._bridge
-        for handler in handlers:
-            try:
-                handler(event)
-            except Exception:  # pragma: no cover - defensive
-                logger.exception("Event handler %r raised", handler)
+
+        for handlers in handler_lists:
+            for handler in handlers:
+                try:
+                    handler(event)
+                except Exception:  # pragma: no cover - defensive
+                    logger.exception("Event handler %r raised", handler)
         if bridge is not None:
             try:
                 bridge.forward(event)
             except Exception:  # pragma: no cover - defensive
                 logger.debug("SignalBridge.forward failed", exc_info=True)
+        return event
+
+    # ------------------------------------------------------------------ singleton
+    @classmethod
+    def instance(cls) -> "EventBus":
+        """Return the process-wide singleton (alias of :func:`get_event_bus`).
+
+        Provided because UI / web code calls ``EventBus.instance()``.
+        """
+        return get_event_bus()
 
     # ------------------------------------------------------------------ bridge
     def attach_bridge(self, bridge: "SignalBridge") -> None:
@@ -187,6 +368,7 @@ class EventBus:
         """Remove every subscribed handler (mainly for tests)."""
         with self._lock:
             self._handlers.clear()
+            self._string_handlers.clear()
             self._wildcard_handlers.clear()
 
 
@@ -267,6 +449,10 @@ class SignalBridge(_QObjectBase):  # type: ignore[misc]
             bus: The :class:`EventBus` to attach to. Defaults to the singleton.
         """
         super().__init__()
+        if not _HAS_QT:
+            # Per-instance stub so concurrent bridges never share slots
+            # (the class attribute would otherwise be one shared object).
+            self.event_published = _signal(object)
         self._bus: EventBus = bus or get_event_bus()
         self._bus.attach_bridge(self)
 
@@ -290,6 +476,7 @@ __all__ = [
     "ScrapeCompleted",
     "ScrapeFailed",
     "AnalysisProgress",
+    "AnalysisCompleted",
     "ExportCompleted",
     "ProxyRotated",
     "AIResponse",

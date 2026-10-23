@@ -25,8 +25,12 @@ from __future__ import annotations
 #
 
 import logging
+import re
 import threading
+import uuid
 from typing import Any, Callable, Dict, List, Optional
+
+from utils.workers import accepts_progress_callback
 
 logger = logging.getLogger(__name__)
 
@@ -137,22 +141,26 @@ class SignalHub:
     _instance_lock = threading.Lock()
 
     def __new__(cls) -> "SignalHub":
-        if cls._instance is None:
-            cls._instance = super().__new__(cls)
-        return cls._instance
+        with cls._instance_lock:
+            if cls._instance is None:
+                cls._instance = super().__new__(cls)
+            return cls._instance
 
     def __init__(self) -> None:
         if getattr(self, "_initialized", False):
             return
-        # Instantiate the real (or stub) QObject-backed implementation.
-        self._impl = _SignalHubImpl()
-        # Expose the signal attributes on the hub itself for convenience.
-        self.task_started = self._impl.task_started
-        self.task_progress = self._impl.task_progress
-        self.task_completed = self._impl.task_completed
-        self.task_failed = self._impl.task_failed
-        self.stage_changed = self._impl.stage_changed
-        self._initialized: bool = True
+        with self._instance_lock:
+            if getattr(self, "_initialized", False):
+                return
+            # Instantiate the real (or stub) QObject-backed implementation.
+            self._impl = _SignalHubImpl()
+            # Expose the signal attributes on the hub itself for convenience.
+            self.task_started = self._impl.task_started
+            self.task_progress = self._impl.task_progress
+            self.task_completed = self._impl.task_completed
+            self.task_failed = self._impl.task_failed
+            self.stage_changed = self._impl.stage_changed
+            self._initialized: bool = True
 
     @classmethod
     def instance(cls) -> "SignalHub":
@@ -230,6 +238,45 @@ class Orchestrator:
             return list(self._modules.keys())
 
     # ------------------------------------------------------------------ tasks
+    # Pipeline stage -> event "kind" used to pick the emitted EventTypes.
+    _STAGE_KINDS = {
+        "scrape": "scrape",
+        "clean": "analysis",
+        "analyze": "analysis",
+        "visualize": "export",
+        "report": "export",
+    }
+
+    @staticmethod
+    def _detect_kind(stage: Optional[str], name: str) -> Optional[str]:
+        """Guess the task "kind" from its stage / name.
+
+        The kind selects which :class:`core.events.EventType` values are
+        published (``scrape`` → ScrapeStarted/Progress/Completed/Failed,
+        ``analysis`` → AnalysisProgress/AnalysisCompleted, ``export`` →
+        ExportCompleted, ``migrate`` → DBMigrated, ``ai`` → AIResponse,
+        ``proxy`` → ProxyRotated). Unknown kinds emit only the generic
+        SignalHub signals — never a misleading ``ScrapeStarted``.
+        """
+        if stage and stage in Orchestrator._STAGE_KINDS:
+            return Orchestrator._STAGE_KINDS[stage]
+        hay = f"{stage or ''} {name or ''}".lower()
+        if "migrat" in hay:
+            return "migrate"
+        if "scrape" in hay or "crawl" in hay or "harvest" in hay:
+            return "scrape"
+        if "export" in hay or "report" in hay:
+            return "export"
+        if "analy" in hay or "cluster" in hay or "topic" in hay or "embed" in hay:
+            return "analysis"
+        if "proxy" in hay or "rotat" in hay:
+            return "proxy"
+        if re.search(r"\b(ai|llm|chat|summar|gpt|rag)\b", hay):
+            return "ai"
+        if "search" in hay or "query" in hay or "fetch" in hay:
+            return "scrape"
+        return None
+
     def submit_task(
         self,
         name: str,
@@ -241,9 +288,13 @@ class Orchestrator:
         """Submit a task for background execution.
 
         Emits ``task_started`` synchronously on the calling thread (before
-        the task actually begins running on the worker pool), then wraps the
-        callable so that ``task_completed`` / ``task_failed`` are emitted
-        from the worker thread.
+        the task actually begins running on the worker pool), publishes the
+        kind-appropriate ``Event`` on the :class:`core.events.EventBus`
+        (see :meth:`_detect_kind`), and arranges for completion / failure /
+        progress events to be emitted from the worker thread. If ``fn``
+        accepts a ``progress_callback`` parameter (signature-aware), one is
+        injected that drives both the ``task_progress`` Qt signal and the
+        progress ``EventType`` for the task kind.
 
         Args:
             name: Human-readable task name.
@@ -256,50 +307,144 @@ class Orchestrator:
         Returns:
             The :class:`core.task_queue.Task` instance.
         """
-        Event, EventType, _, _ = _import_event_bus()  # noqa: F841 - EventType used below
+        _, Event, EventType, _ = _import_event_bus()
 
+        kind = self._detect_kind(stage, name)
         if stage is not None and stage in self.STAGES:
             self._set_stage(stage)
 
-        # First enqueue the raw callable so we can capture the assigned id,
-        # then wrap it. We do this by inserting a sentinel hook into kwargs
-        # that the wrapped closure consults.
-        task = self._queue.enqueue(name, fn, *args, **kwargs)
-        task_id = task.id
+        # Pre-generate the task id so the progress hook (and any callbacks)
+        # can bind to it BEFORE the executor starts the callable.
+        task_id = uuid.uuid4().hex
 
-        # Emit started immediately on the calling thread (no race possible).
+        def _emit_progress(percent: Any, message: Any = "") -> None:
+            try:
+                pct = max(0, min(100, int(percent)))
+            except (TypeError, ValueError):
+                return
+            try:
+                self._hub.task_progress.emit(task_id, pct, str(message))
+            except Exception:  # pragma: no cover - defensive
+                logger.debug("task_progress emission failed", exc_info=True)
+            progress_type = {
+                "scrape": EventType.ScrapeProgress,
+                "analysis": EventType.AnalysisProgress,
+            }.get(kind)
+            if progress_type is not None:
+                try:
+                    self._bus.publish(
+                        Event(
+                            type=progress_type,
+                            payload={
+                                "task_id": task_id,
+                                "name": name,
+                                "percent": pct,
+                                "message": str(message),
+                            },
+                            source="orchestrator",
+                        )
+                    )
+                except Exception:  # pragma: no cover - defensive
+                    logger.debug("progress publish failed", exc_info=True)
+
+        # The TaskQueue runner injects a progress callback into fn ONLY when
+        # fn's signature accepts it (signature-aware, zero-arg callables are
+        # never broken) and routes it through task.progress_hook — which is
+        # bound before submit, so there is no identify/submit race.
+        task = self._queue.enqueue(
+            name, fn, *args,
+            task_id=task_id,
+            progress_hook=_emit_progress,
+            **kwargs,
+        )
+
+        # Emit started immediately on the calling thread.
         try:
             self._hub.task_started.emit(task_id)
-            self._bus.publish(
-                Event(
-                    type=EventType.ScrapeStarted,
-                    payload={"name": name, "id": task_id},
-                    source="orchestrator",
-                )
-            )
         except Exception:  # pragma: no cover - defensive
             logger.debug("task_started emission failed", exc_info=True)
+        # Publish a bus start event ONLY for the scrape kind — emitting
+        # ScrapeStarted for every task kind was the audited bug.
+        if kind == "scrape":
+            try:
+                self._bus.publish(
+                    Event(
+                        type=EventType.ScrapeStarted,
+                        payload={"name": name, "task_id": task_id},
+                        source="orchestrator",
+                    )
+                )
+            except Exception:  # pragma: no cover - defensive
+                logger.debug("ScrapeStarted publish failed", exc_info=True)
 
         # Attach completion / failure hooks to the underlying Future so we
         # can emit signals without re-wrapping the callable. This avoids
         # any race between enqueue and the worker picking the task up.
         original_future = task.future
 
+        done_events = {
+            "scrape": EventType.ScrapeCompleted,
+            "analysis": EventType.AnalysisCompleted,
+            "export": EventType.ExportCompleted,
+            "migrate": EventType.DBMigrated,
+            "ai": EventType.AIResponse,
+            "proxy": EventType.ProxyRotated,
+        }
+
         def _on_done(fut: Any) -> None:
+            from core.task_queue import TaskStatus  # local, cheap
             try:
                 exc = fut.exception()
             except Exception:  # pragma: no cover - defensive
                 exc = None
+            cancelled = getattr(task, "cancel_requested", False) and (
+                task.status is TaskStatus.CANCELLED
+            )
             if exc is not None:
                 try:
                     self._hub.task_failed.emit(task_id, str(exc))
                 except Exception:  # pragma: no cover - defensive
                     pass
-            else:
+                if kind == "scrape":
+                    try:
+                        self._bus.publish(
+                            Event(
+                                type=EventType.ScrapeFailed,
+                                payload={
+                                    "task_id": task_id,
+                                    "name": name,
+                                    "error": str(exc),
+                                },
+                                source="orchestrator",
+                            )
+                        )
+                    except Exception:  # pragma: no cover - defensive
+                        pass
+                return
+            if cancelled:
+                # cancel() promised post-finish CANCELLED marking — do not
+                # advertise a completion event for it.
+                return
+            try:
+                self._hub.task_completed.emit(task_id, fut.result())
+            except Exception:  # pragma: no cover - defensive
+                pass
+            done_type = done_events.get(kind)
+            if done_type is not None:
                 try:
-                    self._hub.task_completed.emit(task_id, fut.result())
+                    self._bus.publish(
+                        Event(
+                            type=done_type,
+                            payload={
+                                "task_id": task_id,
+                                "name": name,
+                                "result": fut.result(),
+                            },
+                            source="orchestrator",
+                        )
+                    )
                 except Exception:  # pragma: no cover - defensive
-                    pass
+                    logger.debug("done publish failed", exc_info=True)
 
         if original_future is not None:
             try:

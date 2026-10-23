@@ -20,6 +20,7 @@ from __future__ import annotations
 #
 
 import enum
+import inspect
 import logging
 import threading
 import time
@@ -78,6 +79,10 @@ class Task:
     started_at: Optional[float] = None
     finished_at: Optional[float] = None
     future: Optional[Future] = field(default=None, repr=False)
+    cancel_requested: bool = False
+    progress_hook: Optional[Callable[[int, str], None]] = field(
+        default=None, repr=False, compare=False,
+    )
 
     def to_dict(self) -> Dict[str, Any]:
         """Serialize to a JSON-friendly dict (for UI / IPC)."""
@@ -126,6 +131,8 @@ class TaskQueue:
         name: str,
         fn: Callable[..., Any],
         *args: Any,
+        task_id: Optional[str] = None,
+        progress_hook: Optional[Callable[[int, str], None]] = None,
         **kwargs: Any,
     ) -> Task:
         """Schedule ``fn`` for execution and return the associated :class:`Task`.
@@ -134,26 +141,90 @@ class TaskQueue:
             name: Human-readable task name.
             fn: The callable to run.
             *args: Positional arguments forwarded to ``fn``.
+            task_id: Optional pre-generated id. Callers that need to bind
+                callbacks to the task id *before* the executor may start
+                the callable (e.g. the orchestrator's progress emitters)
+                can supply one to avoid the submit/identify race.
+            progress_hook: Optional ``(percent, message)`` callback invoked
+                whenever the injected progress callback fires. Bound to the
+                task *before* the executor starts it (no race). The runner
+                only injects a progress callback when ``fn``'s signature
+                accepts one; the hook is then invoked in addition to the
+                task's ``progress`` field being updated.
             **kwargs: Keyword arguments forwarded to ``fn``.
 
         Returns:
             The :class:`Task` instance (already queued).
         """
-        task = Task(name=name, callable=fn, args=args, kwargs=kwargs)
-        future = self._executor.submit(self._run, task)
-        task.future = future
+        task = Task(
+            name=name, callable=fn, args=args, kwargs=kwargs,
+            id=task_id or uuid.uuid4().hex,
+            progress_hook=progress_hook,
+        )
+        # Register the task BEFORE submitting it to the executor: otherwise a
+        # fast worker thread (or cancel()/get() from another thread) could
+        # observe the running/finished task before it appears in ``_tasks``.
         with self._lock:
             self._tasks[task.id] = task
+        future = self._executor.submit(self._run, task)
+        with self._lock:
+            task.future = future
         logger.info("Enqueued task %s (%s)", task.id, task.name)
         return task
 
     # ------------------------------------------------------------------ runner
+    @staticmethod
+    def _fn_accepts_progress(fn: Callable[..., Any]) -> bool:
+        """Signature-aware check for a ``progress_callback`` parameter."""
+        try:
+            sig = inspect.signature(fn)
+        except (TypeError, ValueError):  # pragma: no cover - C builtins
+            return False
+        for pname, param in sig.parameters.items():
+            if pname in ("progress_callback", "progress") and param.kind in (
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                inspect.Parameter.KEYWORD_ONLY,
+            ):
+                return True
+            if param.kind is inspect.Parameter.VAR_KEYWORD:
+                return True
+        return False
+
+    def _set_progress(self, task: Task, percent: Any, message: Any = "") -> None:
+        """Update a task's progress and fire its hook (worker thread)."""
+        try:
+            pct = max(0, min(100, int(percent)))
+        except (TypeError, ValueError):
+            return
+        with self._lock:
+            task.progress = pct
+        hook = task.progress_hook
+        if hook is not None:
+            try:
+                hook(pct, str(message or ""))
+            except Exception:  # pragma: no cover - defensive
+                logger.debug("task progress hook failed", exc_info=True)
+
     def _run(self, task: Task) -> Any:
         """Internal: actually execute the task and update its lifecycle."""
-        task.status = TaskStatus.RUNNING
-        task.started_at = time.time()
+        with self._lock:
+            if task.cancel_requested:
+                task.status = TaskStatus.CANCELLED
+                task.finished_at = time.time()
+                logger.info("Task %s (%s) cancelled before start",
+                            task.id, task.name)
+                return None
+            task.status = TaskStatus.RUNNING
+            task.started_at = time.time()
+        kwargs = dict(task.kwargs)
+        if ("progress_callback" not in kwargs
+                and "progress" not in kwargs
+                and self._fn_accepts_progress(task.callable)):
+            kwargs["progress_callback"] = (
+                lambda pct, msg="": self._set_progress(task, pct, msg)
+            )
         try:
-            result = task.callable(*task.args, **task.kwargs)
+            result = task.callable(*task.args, **kwargs)
         except Exception as exc:
             task.error = exc
             task.status = TaskStatus.FAILED
@@ -163,9 +234,18 @@ class TaskQueue:
         else:
             task.result = result
             task.progress = 100
-            task.status = TaskStatus.COMPLETED
+            # Honour the cancel() promise: a task whose cancel() was requested
+            # while running is marked CANCELLED once it finishes, not COMPLETED.
+            task.status = (
+                TaskStatus.CANCELLED if task.cancel_requested
+                else TaskStatus.COMPLETED
+            )
             task.finished_at = time.time()
-            logger.info("Task %s (%s) completed", task.id, task.name)
+            if task.status is TaskStatus.CANCELLED:
+                logger.info("Task %s (%s) finished (marked CANCELLED)",
+                            task.id, task.name)
+            else:
+                logger.info("Task %s (%s) completed", task.id, task.name)
             return result
 
     # ------------------------------------------------------------------ ops
@@ -173,24 +253,54 @@ class TaskQueue:
         """Attempt to cancel a task.
 
         Tasks that have not started running yet are cancelled directly; tasks
-        that are already running cannot be interrupted but are marked as
-        ``CANCELLED`` once they finish (best-effort).
+        that are already running cannot be interrupted but ARE marked as
+        ``CANCELLED`` once they finish (implemented via a done-callback and
+        the :attr:`Task.cancel_requested` flag, which the runner also checks
+        at start-up and completion).
 
         Args:
             task_id: The :attr:`Task.id` to cancel.
 
         Returns:
-            ``True`` if the task was cancelled before it started running.
+            ``True`` if the task was cancelled before it started running,
+            ``False`` otherwise (a cancel *request* on a running task still
+            marks it ``CANCELLED`` when it finishes, but returns ``False``).
         """
         with self._lock:
             task = self._tasks.get(task_id)
-            if task is None or task.future is None:
+            if task is None:
                 return False
-            cancelled = task.future.cancel()
-            if cancelled:
+            if task.status in (TaskStatus.COMPLETED, TaskStatus.FAILED,
+                               TaskStatus.CANCELLED):
+                return False
+            future = task.future
+            if future is None:
+                # Not yet submitted (or submitted racing) — mark cancelled now.
+                task.cancel_requested = True
                 task.status = TaskStatus.CANCELLED
                 task.finished_at = time.time()
-            return cancelled
+                return True
+            if future.cancel():
+                task.cancel_requested = True
+                task.status = TaskStatus.CANCELLED
+                task.finished_at = time.time()
+                return True
+            # Already running — promise: mark CANCELLED once it finishes.
+            task.cancel_requested = True
+
+        def _mark_cancelled_on_finish(fut: Future) -> None:
+            with self._lock:
+                if task.cancel_requested and not fut.cancelled():
+                    task.status = TaskStatus.CANCELLED
+                    if task.finished_at is None:
+                        task.finished_at = time.time()
+
+        try:
+            future.add_done_callback(_mark_cancelled_on_finish)
+        except Exception:  # pragma: no cover - defensive
+            logger.debug("add_done_callback failed for cancel marking",
+                         exc_info=True)
+        return False
 
     def wait_all(self, timeout: Optional[float] = None) -> None:
         """Block until every submitted task has reached a terminal state.
