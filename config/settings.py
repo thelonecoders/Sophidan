@@ -4,17 +4,19 @@ This module exposes a singleton ``Settings`` instance accessible through
 :func:`get_settings`. Settings are loaded in the following priority order
 (lowest to highest):
 
-1. Hard-coded defaults baked into the :class:`Settings` class.
+1. Hard-coded defaults baked into the :class:`Settings` dataclass.
 2. ``config/default_config.yaml`` (shipped with the package).
 3. ``config/secrets.yaml`` (optional, user-provided, .gitignored).
-4. Environment variables prefixed with ``ARS_`` (case-insensitive). Underscores
-   in the variable name map directly to the field name, e.g.
-   ``ARS_AI_API_KEY`` -> ``ai_api_key``.
+4. Environment variables prefixed with ``ARS_`` (case-insensitive lookup).
+   Underscores in the variable name map directly to the field name, e.g.
+   both ``ARS_AI_API_KEY`` and ``ars_ai_api_key`` set ``ai_api_key``.
+5. Bare (unprefixed) fallback variables for the per-source API keys:
+   ``SPRINGER_API_KEY``, ``IEEE_API_KEY``, ``CORE_API_KEY``,
+   ``BASE_API_KEY``, ``S2_API_KEY``, ``UNPAYWALL_EMAIL``.
 
-If ``pydantic`` is available, :class:`Settings` subclasses
-``pydantic.BaseSettings``-style behavior. Otherwise we fall back to a plain
-``dataclasses.dataclass`` that mimics the same surface area. Either way the
-module remains independently importable even when pydantic is missing.
+The loader is a plain :mod:`dataclasses` implementation that keeps the
+module importable without pydantic (the optional pydantic path from the
+original design was never wired; the dataclass surface is canonical).
 
 Example:
     >>> from config.settings import get_settings
@@ -48,6 +50,18 @@ _DEFAULT_CONFIG_PATH: Path = _CONFIG_DIR / "default_config.yaml"
 _SECRETS_PATH: Path = _CONFIG_DIR / "secrets.yaml"
 
 _ENV_PREFIX = "ARS_"
+
+# Bare (unprefixed) environment fallbacks — CONTRACT #9. Checked in addition
+# to the standard ``ARS_<FIELD>`` name.
+_BARE_ENV_ALIASES: Dict[str, tuple] = {
+    "springer_api_key": ("SPRINGER_API_KEY",),
+    "ieee_api_key": ("IEEE_API_KEY",),
+    "core_api_key": ("CORE_API_KEY",),
+    "base_api_key": ("BASE_API_KEY",),
+    "s2_api_key": ("S2_API_KEY", "SEMANTIC_SCHOLAR_API_KEY"),
+    "unpaywall_email": ("UNPAYWALL_EMAIL",),
+    "ai_api_key": ("OPENAI_API_KEY", "ANTHROPIC_API_KEY"),
+}
 
 
 def _coerce(default: Any, raw: str) -> Any:
@@ -125,10 +139,18 @@ class Settings:
         scraping_rate_limit_per_sec: Max requests per second per host.
         scraping_max_concurrent: Maximum concurrent scraper workers.
         user_agent: Default ``User-Agent`` header for outbound HTTP.
+        springer_api_key: Per-source API key for the Springer scraper.
+        ieee_api_key: Per-source API key for the IEEE Xplore scraper.
+        core_api_key: Per-source API key for the CORE aggregator.
+        base_api_key: Per-source API key for the BASE index.
+        s2_api_key: Per-source API key for Semantic Scholar.
+        unpaywall_email: Contact e-mail required by the Unpaywall API.
+        first_run_completed: Set once the first-run welcome screen has been
+            shown (persisted to ``secrets.yaml`` so it is not shown again).
     """
 
     app_name: str = "Academic Research Suite"
-    version: str = "1.0.0"
+    version: str = "2.0.0"
     data_dir: str = "data"
     cache_dir: str = "data/cache"
     projects_dir: str = "data/projects"
@@ -145,8 +167,17 @@ class Settings:
     scraping_max_concurrent: int = 4
     user_agent: str = (
         "Mozilla/5.0 (compatible; AcademicResearchSuite/1.0; "
-        "+https://github.com/academic-research-suite)"
+        "+https://github.com/thelonecoders/Sophidan)"
     )
+    # Per-source API keys (CONTRACT #9) — all optional.
+    springer_api_key: Optional[str] = None
+    ieee_api_key: Optional[str] = None
+    core_api_key: Optional[str] = None
+    base_api_key: Optional[str] = None
+    s2_api_key: Optional[str] = None
+    unpaywall_email: Optional[str] = None
+    # One-shot UI state.
+    first_run_completed: bool = False
 
     # ------------------------------------------------------------------ helpers
     def to_dict(self) -> Dict[str, Any]:
@@ -190,22 +221,31 @@ def _build_settings() -> Settings:
         A fully populated :class:`Settings` instance.
     """
     defaults = Settings()
-    merged: Dict[str, Any] = defaults.to_dict()
+    default_dict = defaults.to_dict()
+    merged: Dict[str, Any] = dict(default_dict)
 
     # 1. default_config.yaml
     merged.update(_load_yaml(_DEFAULT_CONFIG_PATH))
     # 2. secrets.yaml (optional)
     merged.update(_load_yaml(_SECRETS_PATH))
-    # 3. ARS_-prefixed environment variables
-    for field_name in defaults.to_dict().keys():
-        env_name = f"{_ENV_PREFIX}{field_name.upper()}"
-        if env_name in os.environ:
-            merged[field_name] = _coerce(
-                defaults.to_dict()[field_name], os.environ[env_name]
-            )
+    # 3. ARS_-prefixed environment variables — CASE-INSENSITIVE lookup
+    #    (the docstring promised this; the implementation was upper-case
+    #    only). Also honour bare per-source fallbacks (CONTRACT #9).
+    env_map: Dict[str, str] = {
+        str(k).upper(): v for k, v in os.environ.items()
+    }
+    for field_name, default_value in default_dict.items():
+        env_names = [f"{_ENV_PREFIX}{field_name.upper()}"]
+        env_names.extend(_BARE_ENV_ALIASES.get(field_name, ()))
+        for env_name in env_names:
+            if env_name in env_map:
+                merged[field_name] = _coerce(
+                    default_value, env_map[env_name],
+                )
+                break
 
     # Filter to known fields only (ignore unknown keys in yaml/env).
-    known = set(defaults.to_dict().keys())
+    known = set(default_dict.keys())
     clean = {k: v for k, v in merged.items() if k in known}
 
     try:

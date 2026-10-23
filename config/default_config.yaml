@@ -14,7 +14,7 @@
 
 # --- Application identity ----------------------------------------------------
 app_name: "Academic Research Suite"
-version: "1.0.0"
+version: "2.0.0"
 
 # --- Filesystem layout (relative paths resolve under the app data dir) -------
 data_dir: "data"
@@ -42,4 +42,4 @@ ai_base_url: ""
 # --- Scraping policy ----------------------------------------------------------
 scraping_rate_limit_per_sec: 1.0
 scraping_max_concurrent: 4
-user_agent: "Mozilla/5.0 (compatible; AcademicResearchSuite/1.0; +https://github.com/academic-research-suite)"
+user_agent: "Mozilla/5.0 (compatible; AcademicResearchSuite/1.0; +https://github.com/thelonecoders/Sophidan)"
