@@ -1,0 +1,3 @@
+[console_scripts]
+ars = main:main
+ars-web = web.server:run_server
