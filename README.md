@@ -5,15 +5,9 @@
 > systematic reviews, meta-analysis, PRISMA 2020 flow diagrams,
 > Q1-journal figures, and a local-LLM RAG assistant.
 >
-> v2.0.0 adds Publish-or-Perish-grade bibliometrics, Gephi-grade network
-> visualization, systematic-review & meta-analysis workflows, PRISMA 2020
-> flow-diagram generation, publication-grade Q1-journal figure factory,
-> end-to-end research-lifecycle tooling, and innovation analytics
-> (citation-burst detection, knowledge-frontier mapping, trend
-> forecasting, novelty scoring).
 
 > **Compliance and security notes:** journal-level indicators are proxies
-> computed from your local corpus (not official JCR/SJR/CiteScore values); the
+> computed from local corpus (not official JCR/SJR/CiteScore values); the
 > web API has no authentication and defaults to local CORS origins; some
 > scrapers and the proxy pool may conflict with provider terms. See
 > [docs/COMPLIANCE_AND_LICENSING.md](docs/COMPLIANCE_AND_LICENSING.md).
