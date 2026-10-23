@@ -7,6 +7,11 @@ imports cleanly even when those packages are not installed. When ``provider``
 is ``LLMProvider.NONE`` (or any of the string aliases ``"none"``, ``"echo"``,
 ``"offline"``), a deterministic in-process echo backend is used so the entire
 suite is testable without network access or API keys.
+
+Defaults are read from the **flat** settings fields (``ai_provider``,
+``ai_model``, ``ai_api_key``, ``ai_base_url``) exposed by
+``config.settings.get_settings()``. The client also accumulates token/call
+usage statistics (see :meth:`LLMClient.usage_stats`).
 """
 #
 # MIT License — Academic Research Suite
@@ -18,6 +23,8 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+import re
+import threading
 from enum import Enum
 from typing import Any, Dict, Iterator, List, Optional, Union
 
@@ -40,6 +47,32 @@ class LLMProvider(Enum):
     OPENAI = "openai"
     ANTHROPIC = "anthropic"
     NONE = "none"
+
+
+def _estimate_tokens(text: Union[str, List[str], None]) -> int:
+    """Estimate a token count as ``chars / 4`` (heuristic fallback)."""
+    if text is None:
+        return 0
+    if isinstance(text, str):
+        return max(0, len(text) // 4)
+    return max(0, sum(len(t or "") for t in text) // 4)
+
+
+_REASONING_MODEL_RE = re.compile(r"(^o\d)")
+
+
+def _is_reasoning_model(model: str) -> bool:
+    """Return ``True`` for OpenAI o-series / reasoning-style models.
+
+    These models reject ``temperature`` values other than the default,
+    so the parameter must be omitted rather than sent.
+    """
+    m = (model or "").strip().lower()
+    if not m:
+        return False
+    if _REASONING_MODEL_RE.match(m):
+        return True
+    return "reasoning" in m
 
 
 class _EchoBackend:
@@ -135,6 +168,9 @@ class LLMClient:
     never requires any of them. The ``NONE`` provider uses an in-process
     echo backend suitable for offline / test mode.
 
+    Usage / cost accounting: every chat, streaming-chat and embedding call
+    updates an internal counter exposed via :meth:`usage_stats`.
+
     Example:
         >>> client = LLMClient(provider="none", model="echo")
         >>> client.chat([{"role": "user", "content": "hello"}])
@@ -142,6 +178,11 @@ class LLMClient:
     """
 
     DEFAULT_EMBEDDING_DIM = 384
+
+    # Ollama context-window option (tokens). Ollama defaults to a small
+    # num_ctx which silently truncates long prompts; we request a sane,
+    # explicit window instead.
+    OLLAMA_NUM_CTX = 4096
 
     _PROVIDER_ALIASES: Dict[str, LLMProvider] = {
         "openai": LLMProvider.OPENAI,
@@ -158,12 +199,21 @@ class LLMClient:
         "": LLMProvider.NONE,
     }
 
+    _PROVIDER_DEFAULT_MODELS: Dict[LLMProvider, str] = {
+        LLMProvider.OPENAI: "gpt-4o",
+        LLMProvider.ANTHROPIC: "claude-3-5-sonnet-20241022",
+        LLMProvider.OLLAMA: "llama3.1",
+        LLMProvider.NONE: "echo",
+    }
+
     def __init__(
         self,
         provider: Union[LLMProvider, str] = LLMProvider.NONE,
         model: str = "echo",
         api_key: Optional[str] = None,
         base_url: Optional[str] = None,
+        allow_synthetic: bool = False,
+        embedding_model: Optional[str] = None,
     ) -> None:
         """Initialize the unified LLM client.
 
@@ -175,9 +225,16 @@ class LLMClient:
                 ``"claude-3-5-sonnet-20241022"``, ``"llama3.1"``). For the
                 echo backend any string is accepted.
             api_key: API key for cloud providers. When ``None`` the client
-                falls back to ``config.settings.get_settings()`` and then to
-                the appropriate environment variable.
+                falls back to the flat settings fields (``ai_api_key``) and
+                then to the appropriate environment variable.
             base_url: Optional override for the provider's API endpoint.
+            allow_synthetic: Explicit opt-in to the deterministic hash-based
+                embedding fallback for providers without a native embeddings
+                endpoint (currently Anthropic). When ``False`` (default),
+                :meth:`embed` raises a clear error for such providers instead
+                of silently producing synthetic vectors.
+            embedding_model: Optional embedding-model identifier override
+                (e.g. ``"text-embedding-3-small"`` or ``"nomic-embed-text"``).
 
         Raises:
             ValueError: If ``provider`` cannot be resolved.
@@ -186,7 +243,20 @@ class LLMClient:
         self.model = model or "echo"
         self.api_key = api_key
         self.base_url = base_url
+        self.allow_synthetic = bool(allow_synthetic)
+        self.embedding_model = embedding_model
+        self.ollama_num_ctx = self.OLLAMA_NUM_CTX
         self._client: Any = None
+        self._usage_lock = threading.Lock()
+        self._usage: Dict[str, int] = {
+            "calls": 0,
+            "chat_calls": 0,
+            "stream_calls": 0,
+            "embedding_calls": 0,
+            "errors": 0,
+            "tokens_in": 0,
+            "tokens_out": 0,
+        }
         self._apply_defaults_from_settings()
         logger.debug(
             "LLMClient initialized: provider=%s, model=%s, base_url=%s",
@@ -194,6 +264,39 @@ class LLMClient:
             self.model,
             self.base_url,
         )
+
+    # --- Usage accounting --------------------------------------------------
+    def _record(
+        self,
+        kind: str,
+        tokens_in: int = 0,
+        tokens_out: int = 0,
+        error: bool = False,
+    ) -> None:
+        """Update the internal usage counters (thread-safe)."""
+        with self._usage_lock:
+            self._usage["calls"] += 1
+            if kind in self._usage:
+                self._usage[kind] += 1
+            self._usage["tokens_in"] += max(0, int(tokens_in))
+            self._usage["tokens_out"] += max(0, int(tokens_out))
+            if error:
+                self._usage["errors"] += 1
+
+    def usage_stats(self) -> Dict[str, int]:
+        """Return a copy of the accumulated usage totals.
+
+        Keys: ``calls``, ``chat_calls``, ``stream_calls``,
+        ``embedding_calls``, ``errors``, ``tokens_in``, ``tokens_out``.
+        """
+        with self._usage_lock:
+            return dict(self._usage)
+
+    def reset_usage(self) -> None:
+        """Zero all usage counters (primarily for tests)."""
+        with self._usage_lock:
+            for k in self._usage:
+                self._usage[k] = 0
 
     # --- Provider resolution ----------------------------------------------
     @classmethod
@@ -209,12 +312,24 @@ class LLMClient:
         except ValueError as exc:
             raise ValueError(f"Unknown LLM provider: {provider!r}") from exc
 
+    @staticmethod
+    def _settings_field(settings: Any, name: str) -> Any:
+        """Read a **flat** field from a settings object or mapping."""
+        if settings is None:
+            return None
+        if isinstance(settings, dict):
+            return settings.get(name)
+        return getattr(settings, name, None)
+
     def _apply_defaults_from_settings(self) -> None:
         """Populate missing fields from ``config.settings.get_settings()``.
 
-        The settings module is imported lazily and the call is wrapped in a
-        broad ``try/except`` so this method is a no-op when config is not yet
-        available (e.g. during early bootstrap or tests).
+        Settings expose FLAT fields (``ai_provider``, ``ai_model``,
+        ``ai_api_key``, ``ai_base_url``) — there is no nested
+        ``ai_assistant`` section. The settings module is imported lazily and
+        the call is wrapped in a broad ``try/except`` so this method is a
+        no-op when config is not yet available (e.g. during early bootstrap
+        or tests).
         """
         settings: Any = None
         try:
@@ -224,27 +339,46 @@ class LLMClient:
         except Exception:  # noqa: BLE001 - settings is optional at this layer
             settings = None
 
-        ai_cfg: Dict[str, Any] = {}
-        if isinstance(settings, dict):
-            ai_cfg = settings.get("ai_assistant", {}) or {}
-        elif settings is not None:
-            # Best-effort: try attribute / method access on a settings object.
-            ai_cfg = getattr(settings, "ai_assistant", {}) or {}
-            if not isinstance(ai_cfg, dict):
-                ai_cfg = {}
+        # Flat settings fields (CONTRACT #5). Fall back to a nested
+        # "ai_assistant" mapping only if it exists (defensive, some
+        # deployments used that shape historically).
+        flat: Dict[str, Any] = {}
+        for name in ("ai_provider", "ai_model", "ai_api_key", "ai_base_url"):
+            val = self._settings_field(settings, name)
+            if val:
+                flat[name] = val
+        if not any(flat.values()):
+            nested = self._settings_field(settings, "ai_assistant")
+            if isinstance(nested, dict):
+                alias = {
+                    "provider": "ai_provider",
+                    "model": "ai_model",
+                    "api_key": "ai_api_key",
+                    "base_url": "ai_base_url",
+                }
+                for k, v in nested.items():
+                    if k in alias and v and alias[k] not in flat:
+                        flat[alias[k]] = v
 
-        if self.provider is LLMProvider.NONE and ai_cfg.get("provider"):
+        if self.provider is LLMProvider.NONE and flat.get("ai_provider"):
             try:
-                self.provider = self._resolve_provider(ai_cfg["provider"])
+                self.provider = self._resolve_provider(flat["ai_provider"])
             except ValueError:
-                logger.warning("Ignoring unknown provider in settings: %r", ai_cfg["provider"])
+                logger.warning(
+                    "Ignoring unknown provider in settings: %r", flat["ai_provider"]
+                )
 
-        if self.model in ("", "echo", None) and ai_cfg.get("model"):
-            self.model = ai_cfg["model"]
-        if self.api_key is None and ai_cfg.get("api_key"):
-            self.api_key = ai_cfg["api_key"]
-        if self.base_url is None and ai_cfg.get("base_url"):
-            self.base_url = ai_cfg["base_url"]
+        if self.model in ("", "echo", None) and flat.get("ai_model"):
+            self.model = str(flat["ai_model"])
+        if self.api_key is None and flat.get("ai_api_key"):
+            self.api_key = str(flat["ai_api_key"])
+        if self.base_url is None and flat.get("ai_base_url"):
+            self.base_url = str(flat["ai_base_url"])
+
+        # A real provider was configured but no concrete model: pick a
+        # provider-appropriate default rather than leaving the echo model.
+        if self.provider is not LLMProvider.NONE and self.model in ("", "echo", None):
+            self.model = self._PROVIDER_DEFAULT_MODELS.get(self.provider, self.model)
 
         # Final fallback: well-known environment variables.
         env_keys = {
@@ -315,6 +449,72 @@ class LLMClient:
 
         return self._client
 
+    # --- OpenAI parameter handling ----------------------------------------
+    @staticmethod
+    def _openai_params(
+        model: str,
+        messages: List[Dict[str, str]],
+        temperature: float,
+        max_tokens: int,
+        stream: bool,
+    ) -> Dict[str, Any]:
+        """Build Chat-Completions kwargs for the current (2026) OpenAI API.
+
+        * ``max_completion_tokens`` replaces the deprecated ``max_tokens``.
+        * ``temperature`` is omitted for o-series / reasoning models (the
+          API only accepts the default temperature there).
+        """
+        params: Dict[str, Any] = {
+            "model": model,
+            "messages": messages,
+            "stream": stream,
+            "max_completion_tokens": int(max_tokens),
+        }
+        if not _is_reasoning_model(model):
+            params["temperature"] = float(temperature)
+        return params
+
+    def _openai_create(
+        self,
+        client: Any,
+        params: Dict[str, Any],
+        max_tokens: int,
+    ) -> Any:
+        """Call ``client.chat.completions.create`` with compatibility retries.
+
+        Handles two legacy-server failure modes:
+        1. Server rejects ``max_completion_tokens`` → retry with deprecated
+           ``max_tokens``.
+        2. Server rejects ``temperature`` (BadRequest) → retry without it.
+        """
+        try:
+            return client.chat.completions.create(**params)
+        except Exception as exc:  # noqa: BLE001 - inspected + re-raised below
+            import openai  # imported lazily but guaranteed by _ensure_client
+
+            message = str(exc)
+            lowered = message.lower()
+            bad_request = getattr(openai, "BadRequestError", None)
+            is_bad = isinstance(exc, bad_request) if bad_request else False
+
+            retry: Dict[str, Any] = dict(params)
+            changed = False
+            if "max_completion_tokens" in lowered and "max_completion_tokens" in retry:
+                retry.pop("max_completion_tokens")
+                retry["max_tokens"] = int(max_tokens)
+                changed = True
+            if "temperature" in retry and (
+                is_bad and "temperature" in lowered
+                or "unsupported" in lowered and "temperature" in lowered
+            ):
+                retry.pop("temperature")
+                changed = True
+            if not changed:
+                self._record("chat_calls", error=True)
+                raise
+            logger.debug("Retrying OpenAI call with adjusted params: %s", message[:200])
+            return client.chat.completions.create(**retry)
+
     # --- Public API --------------------------------------------------------
     def chat(
         self,
@@ -350,22 +550,28 @@ class LLMClient:
     ) -> str:
         """Synchronous (non-streaming) chat implementation."""
         if self.provider is LLMProvider.NONE:
-            result = client.chat(
-                messages,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                stream=False,
-            )
-            return str(result)
+            try:
+                result = client.chat(
+                    messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    stream=False,
+                )
+                out = str(result)
+                self._record(
+                    "chat_calls",
+                    tokens_in=_estimate_tokens([m.get("content", "") for m in messages]),
+                    tokens_out=_estimate_tokens(out),
+                )
+                return out
+            except Exception:  # noqa: BLE001
+                self._record("chat_calls", error=True)
+                raise
 
         if self.provider is LLMProvider.OPENAI:
-            response = client.chat.completions.create(
-                model=self.model,
-                messages=messages,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                stream=False,
-            )
+            params = self._openai_params(self.model, messages, temperature, max_tokens, False)
+            response = self._openai_create(client, params, max_tokens)
+            self._record_openai_usage(response, input_texts=messages)
             return response.choices[0].message.content or ""
 
         if self.provider is LLMProvider.ANTHROPIC:
@@ -378,7 +584,12 @@ class LLMClient:
             }
             if system_text:
                 kwargs["system"] = system_text
-            response = client.messages.create(**kwargs)
+            try:
+                response = client.messages.create(**kwargs)
+            except Exception:  # noqa: BLE001
+                self._record("chat_calls", error=True)
+                raise
+            self._record_anthropic_usage(response, input_texts=messages)
             parts: List[str] = []
             for block in response.content:
                 text = getattr(block, "text", None)
@@ -387,12 +598,22 @@ class LLMClient:
             return "".join(parts)
 
         if self.provider is LLMProvider.OLLAMA:
-            response = client.chat(
-                model=self.model,
-                messages=messages,
-                options={"temperature": temperature, "num_predict": max_tokens},
-                stream=False,
-            )
+            options = {
+                "temperature": temperature,
+                "num_predict": max_tokens,
+                "num_ctx": int(getattr(self, "ollama_num_ctx", self.OLLAMA_NUM_CTX)),
+            }
+            try:
+                response = client.chat(
+                    model=self.model,
+                    messages=messages,
+                    options=options,
+                    stream=False,
+                )
+            except Exception:  # noqa: BLE001
+                self._record("chat_calls", error=True)
+                raise
+            self._record_ollama_usage(response, input_texts=messages)
             if isinstance(response, dict):
                 return str(response.get("message", {}).get("content", ""))
             try:
@@ -411,30 +632,56 @@ class LLMClient:
     ) -> Iterator[str]:
         """Yield response text chunks from the active provider."""
         if self.provider is LLMProvider.NONE:
-            for chunk in client.chat(
-                messages,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                stream=True,
-            ):
-                yield chunk
+            collected: List[str] = []
+            try:
+                for chunk in client.chat(
+                    messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    stream=True,
+                ):
+                    collected.append(chunk)
+                    yield chunk
+            except Exception:  # noqa: BLE001
+                self._record("stream_calls", error=True)
+                raise
+            self._record(
+                "stream_calls",
+                tokens_in=_estimate_tokens([m.get("content", "") for m in messages]),
+                tokens_out=_estimate_tokens("".join(collected)),
+            )
             return
 
         if self.provider is LLMProvider.OPENAI:
-            stream = client.chat.completions.create(
-                model=self.model,
-                messages=messages,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                stream=True,
-            )
-            for event in stream:
-                try:
-                    delta = event.choices[0].delta.content
-                except (AttributeError, IndexError):
-                    delta = None
-                if delta:
-                    yield delta
+            params = self._openai_params(self.model, messages, temperature, max_tokens, True)
+            stream = self._openai_create(client, params, max_tokens)
+            collected: List[str] = []
+            usage = None
+            try:
+                for event in stream:
+                    try:
+                        # Some servers emit a final chunk carrying usage stats.
+                        usage = getattr(event, "usage", None) or usage
+                    except Exception:  # noqa: BLE001 - defensive
+                        pass
+                    try:
+                        delta = event.choices[0].delta.content
+                    except (AttributeError, IndexError):
+                        delta = None
+                    if delta:
+                        collected.append(delta)
+                        yield delta
+            except Exception:  # noqa: BLE001
+                self._record("stream_calls", error=True)
+                raise
+            if usage is not None:
+                self._record_openai_usage(usage, input_texts=messages, streamed=True)
+            else:
+                self._record(
+                    "stream_calls",
+                    tokens_in=_estimate_tokens([m.get("content", "") for m in messages]),
+                    tokens_out=_estimate_tokens(collected),
+                )
             return
 
         if self.provider is LLMProvider.ANTHROPIC:
@@ -447,29 +694,109 @@ class LLMClient:
             }
             if system_text:
                 kwargs["system"] = system_text
-            with client.messages.stream(**kwargs) as s:
-                for text in s.text_stream:
-                    if text:
-                        yield text
+            collected: List[str] = []
+            try:
+                with client.messages.stream(**kwargs) as s:
+                    for text in s.text_stream:
+                        if text:
+                            collected.append(text)
+                            yield text
+            except Exception:  # noqa: BLE001
+                self._record("stream_calls", error=True)
+                raise
+            self._record(
+                "stream_calls",
+                tokens_in=_estimate_tokens([m.get("content", "") for m in messages]),
+                tokens_out=_estimate_tokens(collected),
+            )
             return
 
         if self.provider is LLMProvider.OLLAMA:
+            options = {
+                "temperature": temperature,
+                "num_predict": max_tokens,
+                "num_ctx": int(getattr(self, "ollama_num_ctx", self.OLLAMA_NUM_CTX)),
+            }
             stream = client.chat(
                 model=self.model,
                 messages=messages,
-                options={"temperature": temperature, "num_predict": max_tokens},
+                options=options,
                 stream=True,
             )
-            for event in stream:
-                if isinstance(event, dict):
-                    content = event.get("message", {}).get("content", "")
-                else:
-                    content = getattr(getattr(event, "message", None), "content", "")
-                if content:
-                    yield content
+            collected: List[str] = []
+            last_event: Any = None
+            try:
+                for event in stream:
+                    last_event = event
+                    if isinstance(event, dict):
+                        content = event.get("message", {}).get("content", "")
+                    else:
+                        content = getattr(getattr(event, "message", None), "content", "")
+                    if content:
+                        collected.append(content)
+                        yield content
+            except Exception:  # noqa: BLE001
+                self._record("stream_calls", error=True)
+                raise
+            self._record_ollama_usage(last_event, input_texts=messages, streamed=True)
             return
 
         raise ValueError(f"Unsupported provider: {self.provider}")
+
+    # --- Usage extraction from provider responses --------------------------
+    def _record_openai_usage(
+        self,
+        response: Any,
+        input_texts: Any,
+        streamed: bool = False,
+    ) -> None:
+        """Record usage from an OpenAI response (or streaming usage chunk)."""
+        usage = getattr(response, "usage", None)
+        tokens_in = tokens_out = 0
+        if usage is not None:
+            tokens_in = int(getattr(usage, "prompt_tokens", 0) or 0)
+            tokens_out = int(getattr(usage, "completion_tokens", 0) or 0)
+        if not tokens_in:
+            if isinstance(input_texts, list):
+                tokens_in = _estimate_tokens(
+                    [m.get("content", "") if isinstance(m, dict) else str(m) for m in input_texts]
+                )
+            else:
+                tokens_in = _estimate_tokens(input_texts)
+        kind = "stream_calls" if streamed else "chat_calls"
+        self._record(kind, tokens_in=tokens_in, tokens_out=tokens_out)
+
+    def _record_anthropic_usage(self, response: Any, input_texts: Any) -> None:
+        """Record usage from an Anthropic Messages response."""
+        usage = getattr(response, "usage", None)
+        tokens_in = int(getattr(usage, "input_tokens", 0) or 0) if usage else 0
+        tokens_out = int(getattr(usage, "output_tokens", 0) or 0) if usage else 0
+        if not tokens_in:
+            tokens_in = _estimate_tokens(
+                [m.get("content", "") if isinstance(m, dict) else str(m) for m in input_texts]
+            )
+        self._record("chat_calls", tokens_in=tokens_in, tokens_out=tokens_out)
+
+    def _record_ollama_usage(
+        self,
+        response: Any,
+        input_texts: Any,
+        streamed: bool = False,
+    ) -> None:
+        """Record usage from an Ollama response (final event when streaming)."""
+        def _get(obj: Any, key: str) -> int:
+            if isinstance(obj, dict):
+                return int(obj.get(key, 0) or 0)
+            return int(getattr(obj, key, 0) or 0)
+
+        tokens_in = _get(response, "prompt_eval_count")
+        tokens_out = _get(response, "eval_count")
+        if not tokens_in:
+            tokens_in = _estimate_tokens(
+                [m.get("content", "") if isinstance(m, dict) else str(m) for m in input_texts]
+            )
+        kind = "stream_calls" if streamed else "chat_calls"
+        self._record(kind, tokens_in=tokens_in, tokens_out=tokens_out)
 
     @staticmethod
     def _split_anthropic_messages(
@@ -518,16 +845,28 @@ class LLMClient:
             ``(n, dim)`` for a list. The dimension depends on the provider
             (384 for the echo backend; OpenAI ``text-embedding-3-small``
             returns 1536 dimensions).
+
+        Raises:
+            RuntimeError: If the provider has no native embeddings endpoint
+                (Anthropic) and ``allow_synthetic`` was not set.
         """
         client = self._ensure_client()
 
         if self.provider is LLMProvider.NONE:
+            self._record("embedding_calls", tokens_in=_estimate_tokens(text))
             return client.embed(text)
 
         if self.provider is LLMProvider.OPENAI:
             model = self._resolve_embedding_model("text-embedding-3-small")
             inputs = [text] if isinstance(text, str) else list(text)
-            response = client.embeddings.create(model=model, input=inputs)
+            try:
+                response = client.embeddings.create(model=model, input=inputs)
+            except Exception:  # noqa: BLE001
+                self._record("embedding_calls", error=True)
+                raise
+            usage = getattr(response, "usage", None)
+            tokens_in = int(getattr(usage, "prompt_tokens", 0) or 0) if usage else _estimate_tokens(inputs)
+            self._record("embedding_calls", tokens_in=tokens_in)
             mat = np.array(
                 [d.embedding for d in response.data],
                 dtype=np.float32,
@@ -535,29 +874,78 @@ class LLMClient:
             return mat[0] if isinstance(text, str) else mat
 
         if self.provider is LLMProvider.ANTHROPIC:
-            # Anthropic does not expose a native embeddings endpoint in the
-            # SDK; fall back to the deterministic hash-based embedder so RAG
-            # pipelines still function.
+            # Anthropic has no native embeddings endpoint. Never fall back to
+            # synthetic vectors silently — a RAG index built on hash vectors
+            # looks plausible but retrieves garbage.
+            if not self.allow_synthetic:
+                self._record("embedding_calls", error=True)
+                raise RuntimeError(
+                    "Anthropic has no native embeddings API, and this LLMClient "
+                    "was created with allow_synthetic=False. Configure a real "
+                    "embedder for the RAG engine (e.g. OpenAI or Ollama "
+                    "embeddings, or data_science.embeddings.EmbeddingsModel), "
+                    "or construct LLMClient(..., allow_synthetic=True) to "
+                    "explicitly accept degraded hash-based vectors (NOT "
+                    "recommended for production retrieval)."
+                )
             logger.warning(
-                "Anthropic has no native embeddings API; using hash-based fallback."
+                "Anthropic has no native embeddings API; using the explicitly "
+                "allowed hash-based synthetic fallback (allow_synthetic=True)."
             )
+            self._record("embedding_calls", tokens_in=_estimate_tokens(text))
             return _EchoBackend().embed(text)
 
         if self.provider is LLMProvider.OLLAMA:
             model = self._resolve_embedding_model("nomic-embed-text")
             inputs = [text] if isinstance(text, str) else list(text)
-            vecs: List[np.ndarray] = []
-            for t in inputs:
-                response = client.embeddings(model=model, prompt=t)
-                if isinstance(response, dict):
-                    vec = response.get("embedding", [])
-                else:
-                    vec = getattr(response, "embedding", [])
-                vecs.append(np.asarray(vec, dtype=np.float32))
-            mat = np.stack(vecs) if vecs else np.zeros((0, 0), dtype=np.float32)
-            return mat[0] if isinstance(text, str) else mat
+            try:
+                self._record("embedding_calls", tokens_in=_estimate_tokens(inputs))
+                return self._ollama_embed(client, model, inputs, single=isinstance(text, str))
+            except Exception:  # noqa: BLE001
+                self._record("embedding_calls", error=True)
+                raise
 
         raise ValueError(f"Unsupported provider: {self.provider}")
+
+    def _ollama_embed(
+        self,
+        client: Any,
+        model: str,
+        inputs: List[str],
+        single: bool,
+    ) -> np.ndarray:
+        """Ollama embeddings via the batched ``client.embed`` API.
+
+        Falls back to the legacy per-item ``client.embeddings`` endpoint when
+        the installed Ollama server/SDK does not expose ``embed``.
+        """
+        if hasattr(client, "embed"):
+            response = client.embed(model=model, input=inputs)
+            if isinstance(response, dict):
+                vecs = response.get("embeddings") or []
+            else:
+                vecs = getattr(response, "embeddings", None) or []
+            mat = np.asarray(vecs, dtype=np.float32)
+            if mat.ndim == 1 and mat.size:
+                mat = mat.reshape(1, -1)
+            if mat.shape[0] != len(inputs):
+                raise ValueError(
+                    f"Ollama embed returned {mat.shape[0]} vectors for "
+                    f"{len(inputs)} inputs."
+                )
+            return mat[0] if single else mat
+
+        # Legacy endpoint: one request per input.
+        vecs_out: List[np.ndarray] = []
+        for t in inputs:
+            response = client.embeddings(model=model, prompt=t)
+            if isinstance(response, dict):
+                vec = response.get("embedding", [])
+            else:
+                vec = getattr(response, "embedding", [])
+            vecs_out.append(np.asarray(vec, dtype=np.float32))
+        mat = np.stack(vecs_out) if vecs_out else np.zeros((0, 0), dtype=np.float32)
+        return mat[0] if single else mat
 
     def _resolve_embedding_model(self, default: str) -> str:
         """Return the configured embedding model name or a sensible default."""
@@ -580,8 +968,23 @@ class LLMClient:
                 return ["gpt-4o", "gpt-4o-mini", "gpt-3.5-turbo"]
 
         if self.provider is LLMProvider.ANTHROPIC:
-            # Anthropic does not expose a public list-models endpoint.
+            # Prefer the real Models API (client.models.list, 2026 SDKs);
+            # fall back to a hardcoded known-good list.
+            try:
+                response = client.models.list()
+                names: List[str] = []
+                for m in getattr(response, "data", []) or []:
+                    mid = getattr(m, "id", None) or getattr(m, "name", None)
+                    if mid:
+                        names.append(str(mid))
+                if names:
+                    return names
+            except Exception:  # noqa: BLE001 - degraded but usable
+                logger.debug("Anthropic models.list() unavailable; using fallback list.")
             return [
+                "claude-sonnet-5-5",
+                "claude-opus-5-5",
+                "claude-haiku-4-5-20251001",
                 "claude-3-5-sonnet-20241022",
                 "claude-3-5-haiku-20241022",
                 "claude-3-opus-20240229",

@@ -105,7 +105,7 @@ $text
 
 Return your answer as a JSON array of objects with "keyword" and "score"
 fields, e.g.:
-[{{"keyword": "transformer architecture", "score": 0.95}}, ...]
+[{"keyword": "transformer architecture", "score": 0.95}, ...]
 """
     )
     """Variables: ``$text``."""
@@ -115,10 +115,10 @@ fields, e.g.:
     # ------------------------------------------------------------------
     EXTRACT_ENTITIES: string.Template = string.Template(
         """Identify named entities in the text below. Return JSON with these keys:
-- authors: list of {{"name": str, "affiliation": str}}
+- authors: list of {"name": str, "affiliation": str}
 - institutions: list of str
 - methods: list of str
-- datasets: list of {{"name": str, "url": str?}}
+- datasets: list of {"name": str, "url": str or null}
 
 TEXT:
 $text
