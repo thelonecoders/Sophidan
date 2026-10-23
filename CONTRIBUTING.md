@@ -35,7 +35,7 @@ Participation in this project is governed by the
 [Contributor Covenant 2.1](docs/CODE_OF_CONDUCT.md). By
 participating you are expected to uphold this code. Please report
 unacceptable behaviour to
-<conduct@academic-research-suite.org>.
+<academicresearchsuite@proton.me>.
 
 ---
 
