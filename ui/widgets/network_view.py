@@ -31,6 +31,9 @@ from qtpy.QtWidgets import (
     QWidget,
 )
 
+
+from ui.modern_theme import ModernTheme
+
 logger = logging.getLogger(__name__)
 
 # Graph-type identifiers exposed in the toolbar.
@@ -143,7 +146,8 @@ class NetworkViewWidget(QWidget):
         # Bottom legend + zoom
         bottom = QHBoxLayout()
         legend = QLabel(
-            "<span style='color:#888'>● Node size = degree (drag toolbar to zoom/pan)</span>"
+            f"<span style='color:{ModernTheme.DARK_TEXT_MUTED}'>● Node size = "
+            "degree (drag toolbar to zoom/pan)</span>"
         )
         bottom.addWidget(legend)
         bottom.addStretch()
@@ -176,7 +180,8 @@ class NetworkViewWidget(QWidget):
             xy=(0, 0),
             xytext=(10, 10),
             textcoords="offset points",
-            bbox=dict(boxstyle="round", fc="#2b2b2b", ec="#888", alpha=0.92),
+            bbox=dict(boxstyle="round", fc=ModernTheme.DARK_BG_SIDEBAR,
+                      ec=ModernTheme.DARK_TEXT_MUTED, alpha=0.92),
             arrowprops=dict(arrowstyle="->"),
         )
         self._hover_annotation.set_visible(False)
@@ -343,7 +348,8 @@ class NetworkViewWidget(QWidget):
         g = self._filter_graph()
         if g is None or g.number_of_nodes() == 0:
             self._ax.text(0.5, 0.5, "No graph loaded", ha="center", va="center",
-                          transform=self._ax.transAxes, color="#888")
+                          transform=self._ax.transAxes,
+                          color=ModernTheme.DARK_TEXT_MUTED)
             self._canvas.draw_idle()
             return
 
@@ -353,11 +359,11 @@ class NetworkViewWidget(QWidget):
             colors = self._node_colors(g)
         except Exception as exc:  # noqa: BLE001
             logger.warning("Coloring failed (%s); using single color", exc)
-            colors = ["#007acc"] * g.number_of_nodes()
+            colors = [ModernTheme.ACCENT] * g.number_of_nodes()
 
         try:
             nx.draw_networkx_edges(g, self._positions, ax=self._ax, alpha=0.4,
-                                   edge_color="#888")
+                                   edge_color=ModernTheme.DARK_TEXT_MUTED)
             nx.draw_networkx_nodes(g, self._positions, ax=self._ax, node_size=sizes,
                                    node_color=colors, edgecolors="white",
                                    linewidths=0.5)
@@ -375,10 +381,11 @@ class NetworkViewWidget(QWidget):
         try:
             coloring = nx.coloring.greedy_color(g, strategy="largest_first")
         except Exception:  # noqa: BLE001
-            return ["#007acc"] * g.number_of_nodes()
+            return [ModernTheme.ACCENT] * g.number_of_nodes()
         n_colors = max(coloring.values()) + 1 if coloring else 1
         cmap = [
-            "#007acc", "#d62728", "#2ca02c", "#ff7f0e", "#9467bd",
+            ModernTheme.ACCENT, ModernTheme.DANGER, ModernTheme.SUCCESS,
+            ModernTheme.WARNING, "#9467bd",
             "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf",
         ]
         return [cmap[coloring.get(n, 0) % len(cmap)] for n in g.nodes()]

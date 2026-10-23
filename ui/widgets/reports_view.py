@@ -48,10 +48,13 @@ from typing import Any, List, Optional, Sequence
 
 from qtpy.QtCore import Qt, Signal
 from qtpy.QtWidgets import (
-    QAbstractItemView, QFileDialog, QFrame, QGridLayout, QGroupBox,
+    QApplication, QAbstractItemView, QFileDialog, QFrame, QGridLayout, QGroupBox,
     QHBoxLayout, QLabel, QMessageBox, QPushButton, QSizePolicy, QTableWidget,
     QTableWidgetItem, QVBoxLayout, QWidget,
 )
+
+
+from ui.modern_theme import ModernTheme
 
 logger = logging.getLogger(__name__)
 
@@ -238,7 +241,7 @@ class ReportsView(QWidget):
         lay.addWidget(title)
         lay.addStretch(1)
         self.btn_new_report = QPushButton("\U0001F4DD  Generate New Report", self)
-        self.btn_new_report.setObjectName("PrimaryButton")
+        self.btn_new_report.setObjectName("PrimaryBtn")
         self.btn_new_report.setToolTip(
             "Open the multi-step report wizard (type, scope, sections, "
             "output path)."
@@ -347,7 +350,7 @@ class ReportsView(QWidget):
             group,
         )
         empty.setAlignment(Qt.AlignCenter)
-        empty.setStyleSheet("color: #94A3B8; padding: 32px;")
+        empty.setStyleSheet(f"color: {ModernTheme.DARK_TEXT_MUTED}; padding: 32px;")
         empty.setVisible(False)
         outer.addWidget(empty)
 
@@ -494,23 +497,37 @@ class ReportsView(QWidget):
         )
         if not path:
             return
-        try:
-            saved = self._run_export(fmt_key, self._papers, path)
-        except Exception as exc:  # pragma: no cover — depends on heavy deps
-            logger.error("Quick export %r failed: %s", fmt_key, exc,
-                         exc_info=True)
+        # Run the (blocking) report generation on a worker thread with a
+        # busy cursor so a large corpus never freezes the UI.
+        from utils.workers import Worker, WorkerPool
+        papers = list(self._papers)
+        label = fmt["label"]
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+
+        def _finished() -> None:
+            QApplication.restoreOverrideCursor()
+
+        def _ok(saved: object) -> None:
+            if saved:
+                self.report_generated.emit(str(saved))
+                self.refresh_recent_reports()
+                QMessageBox.information(
+                    self, "Report generated",
+                    f"Saved: {saved}",
+                )
+
+        def _fail(err: str) -> None:
+            logger.error("Quick export %r failed: %s", fmt_key, err)
             QMessageBox.critical(
                 self, "Export failed",
-                f"Could not generate {fmt['label']} report:\n{exc}",
+                f"Could not generate {label} report:\n{err}",
             )
-            return
-        if saved:
-            self.report_generated.emit(saved)
-            self.refresh_recent_reports()
-            QMessageBox.information(
-                self, "Report generated",
-                f"Saved: {saved}",
-            )
+
+        worker = Worker(self._run_export, fmt_key, papers, path)
+        worker.signals.result.connect(_ok)
+        worker.signals.error.connect(_fail)
+        worker.signals.finished.connect(_finished)
+        WorkerPool.instance().submit(worker)
 
     def _on_template(self, template_key: str) -> None:
         """Open the reporting dashboard pre-loaded with a template config."""
@@ -532,18 +549,28 @@ class ReportsView(QWidget):
             dlg = ReportingDashboard(parent=self, data=self._papers or None)
         except TypeError:
             dlg = ReportingDashboard(self)
-        # Apply template defaults if the dialog exposes them.
+        # Apply template defaults.  ReportingDashboard reads the plain
+        # ``preferred_*`` attributes in its config builder; prefer its
+        # explicit setters when available.
+        if hasattr(dlg, "set_preferred_config"):
+            try:
+                dlg.set_preferred_config(
+                    report_type=tpl["report_type"],
+                    sections=list(tpl["sections"]),
+                    title=tpl["title"],
+                )
+            except Exception:
+                logger.debug("set_preferred_config failed.", exc_info=True)
         for attr, value in (
             ("preferred_report_type", tpl["report_type"]),
             ("preferred_sections", list(tpl["sections"])),
             ("preferred_title", tpl["title"]),
         ):
-            if hasattr(dlg, attr):
-                try:
-                    setattr(dlg, attr, value)
-                except Exception:
-                    logger.debug("Could not set %s on ReportingDashboard.",
-                                 attr)
+            try:
+                setattr(dlg, attr, value)
+            except Exception:
+                logger.debug("Could not set %s on ReportingDashboard.",
+                             attr)
         try:
             dlg.report_generated.connect(self.report_generated.emit)
         except Exception:

@@ -16,6 +16,7 @@ from typing import Any, Dict, List, Optional
 
 from qtpy.QtCore import Qt, Signal
 from qtpy.QtWidgets import (
+    QApplication,
     QCheckBox,
     QColorDialog,
     QComboBox,
@@ -129,7 +130,7 @@ class SettingsPanel(QWidget):
         self.defaults_button = QPushButton("Reset to Defaults")
         self.reset_button = QPushButton("Reset (Discard)")
         self.save_button = QPushButton("Save")
-        self.save_button.setObjectName("PrimaryButton")
+        self.save_button.setObjectName("PrimaryBtn")
         btns.addWidget(self.defaults_button)
         btns.addWidget(self.reset_button)
         btns.addWidget(self.save_button)
@@ -465,13 +466,36 @@ class SettingsPanel(QWidget):
         if color.isValid():
             self.accent_color_edit.setText(color.name())
 
+    def _run_db_op(self, label: str, fn, *args, **kwargs) -> None:
+        """Run a blocking database maintenance op on a background worker
+        with a busy cursor, then surface the outcome to the user."""
+        from utils.workers import Worker, WorkerPool
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+
+        def _finished() -> None:
+            QApplication.restoreOverrideCursor()
+
+        def _ok(_result: Any) -> None:
+            QMessageBox.information(self, label, f"{label} completed.")
+
+        def _fail(err: str) -> None:
+            logger.error("%s failed: %s", label, err)
+            QMessageBox.critical(self, label, f"Failed:\n{err}")
+
+        worker = Worker(fn, *args, **kwargs)
+        worker.signals.result.connect(_ok)
+        worker.signals.error.connect(_fail)
+        worker.signals.finished.connect(_finished)
+        WorkerPool.instance().submit(worker)
+
     def _on_vacuum(self) -> None:
         try:
             from database.connection import DatabaseConnection
-            DatabaseConnection().vacuum()
-            QMessageBox.information(self, "Vacuum", "Database vacuumed.")
+            db = DatabaseConnection()
         except Exception as exc:  # noqa: BLE001
             QMessageBox.critical(self, "Vacuum", f"Failed: {exc}")
+            return
+        self._run_db_op("Vacuum", db.vacuum)
 
     def _on_backup(self) -> None:
         path, _ = QFileDialog.getSaveFileName(
@@ -481,10 +505,11 @@ class SettingsPanel(QWidget):
             return
         try:
             from database.connection import DatabaseConnection
-            DatabaseConnection().backup(path)
-            QMessageBox.information(self, "Backup", f"Backed up to {path}")
+            db = DatabaseConnection()
         except Exception as exc:  # noqa: BLE001
             QMessageBox.critical(self, "Backup", f"Failed: {exc}")
+            return
+        self._run_db_op("Backup", db.backup, path)
 
     def _on_restore(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
@@ -494,18 +519,26 @@ class SettingsPanel(QWidget):
             return
         try:
             from database.connection import DatabaseConnection
-            DatabaseConnection().restore(path)
-            QMessageBox.information(self, "Restore", "Database restored.")
+            db = DatabaseConnection()
         except Exception as exc:  # noqa: BLE001
             QMessageBox.critical(self, "Restore", f"Failed: {exc}")
+            return
+        self._run_db_op("Restore", db.restore, path)
 
     def _on_fts_rebuild(self) -> None:
+        """Rebuild the full-text-search index.
+
+        The real class is ``database.search.FullTextSearch(DatabaseConnection())``
+        (``SearchIndexer`` does not exist).
+        """
         try:
-            from database.search import SearchIndexer
-            SearchIndexer().rebuild_index()
-            QMessageBox.information(self, "FTS", "FTS index rebuilt.")
+            from database.search import FullTextSearch
+            from database.connection import DatabaseConnection
+            fts = FullTextSearch(DatabaseConnection())
         except Exception as exc:  # noqa: BLE001
             QMessageBox.critical(self, "FTS", f"Failed: {exc}")
+            return
+        self._run_db_op("FTS", fts.rebuild_index)
 
     def _on_vector_reset(self) -> None:
         confirm = QMessageBox.question(

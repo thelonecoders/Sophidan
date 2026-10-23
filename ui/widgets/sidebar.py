@@ -55,6 +55,7 @@ def default_nav_items() -> List[NavItem]:
     sidebar degrades gracefully when no icon-font library is installed.
     """
     return [
+        NavItem("Home",     "\U0001F3E0", "welcome",   "top"),
         NavItem("Dashboard", "\U0001F3E0", "dashboard", "top"),
         NavItem("Search",    "\U0001F50D", "search",    "top"),
         NavItem("Projects",  "\U0001F4C1", "projects",  "top"),

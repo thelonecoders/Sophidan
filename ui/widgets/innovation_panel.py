@@ -28,10 +28,12 @@ from typing import Any, List, Optional
 
 from qtpy.QtCore import Qt
 from qtpy.QtWidgets import (
-    QComboBox, QFileDialog, QFrame, QGroupBox, QHBoxLayout, QLabel,
-    QListWidget, QListWidgetItem, QPushButton, QSizePolicy, QSplitter,
-    QTabWidget, QTextEdit, QVBoxLayout, QWidget,
+    QApplication, QComboBox, QFileDialog, QFrame, QGroupBox, QHBoxLayout,
+    QLabel, QListWidget, QListWidgetItem, QMessageBox, QPushButton,
+    QSizePolicy, QSplitter, QTabWidget, QTextEdit, QVBoxLayout, QWidget,
 )
+
+from ui.modern_theme import ModernTheme
 
 logger = logging.getLogger(__name__)
 
@@ -167,6 +169,14 @@ class InnovationPanel(QWidget):
         self.btn_refresh.clicked.connect(self._on_refresh)
         self.btn_export.clicked.connect(self._on_export)
 
+        # Status line — surfaces empty-corpus hints / per-analysis failures
+        # that were previously only visible in the logs.
+        self.status_label = QLabel("Ready — bind papers via set_papers().", self)
+        self.status_label.setWordWrap(True)
+        self.status_label.setStyleSheet(
+            f"color:{ModernTheme.DARK_TEXT_MUTED}; font-size:8pt;")
+        outer.addWidget(self.status_label)
+
     def _build_canvas(self, layout: QVBoxLayout) -> None:
         _configure_matplotlib()
         try:
@@ -179,9 +189,23 @@ class InnovationPanel(QWidget):
         except Exception as exc:
             logger.warning("matplotlib canvas unavailable: %s", exc)
 
-    # ----------------------------------------------------------------- API
+    # ----------------------------------------------------------------- Helpers
+    def _set_status(self, message: str, is_error: bool = False) -> None:
+        """Show a user-visible status/error line at the bottom of the page."""
+        if hasattr(self, "status_label") and self.status_label is not None:
+            self.status_label.setStyleSheet(
+                f"color:{ModernTheme.DANGER if is_error else ModernTheme.DARK_TEXT_MUTED}; "
+                "font-size:8pt;")
+            self.status_label.setText(message)
+        if is_error:
+            logger.error("%s", message)
+        else:
+            logger.info("%s", message)
+
     def set_papers(self, papers: List[Any]) -> None:
         self._papers = list(papers or [])
+        self._set_status(f"{len(self._papers)} paper(s) bound — "
+                         "click Refresh to run the innovation analyses.")
 
     # ----------------------------------------------------------------- Slots
     def _on_tab_changed(self, idx: int) -> None:
@@ -200,18 +224,34 @@ class InnovationPanel(QWidget):
     def _on_refresh(self) -> None:
         """Re-run all innovation analyses on the bound corpus."""
         if not self._papers:
-            logger.info("No papers bound — cannot refresh.")
+            self._set_status("No papers loaded — run a search and add papers "
+                             "to the library first.", is_error=True)
             return
-        self._run_bursts()
-        self._run_frontiers()
-        self._run_forecast()
-        self._run_recommendations()
-        self._run_collaborations()
-        self._run_novelties()
-        self._run_directions()
-        # Update the top stat cards.
-        self._refresh_stat_cards()
-        self._on_tab_changed(self.tab_list.currentRow())
+        self._set_status("Running 7 innovation analyses…")
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        failures: List[str] = []
+        try:
+            self._run_bursts(failures)
+            self._run_frontiers(failures)
+            self._run_forecast(failures)
+            self._run_recommendations(failures)
+            self._run_collaborations(failures)
+            self._run_novelties(failures)
+            self._run_directions(failures)
+            # Update the top stat cards.
+            self._refresh_stat_cards()
+            self._on_tab_changed(self.tab_list.currentRow())
+        finally:
+            QApplication.restoreOverrideCursor()
+        if failures:
+            self._set_status(
+                f"Finished with {len(failures)} failed analysis(es): "
+                + ", ".join(failures) + ".",
+                is_error=True)
+        else:
+            self._set_status(
+                f"All 7 innovation analyses finished for "
+                f"{len(self._papers)} paper(s).")
 
     def _on_export(self) -> None:
         path, _ = QFileDialog.getSaveFileName(self, "Export Insights", "innovation_insights.json",
@@ -230,12 +270,19 @@ class InnovationPanel(QWidget):
         try:
             with open(path, "w", encoding="utf-8") as fh:
                 json.dump(payload, fh, indent=2, default=str)
-            logger.info("Innovation insights saved to %s", path)
-        except OSError:
+            self._set_status(f"Insights exported to {path}")
+            QMessageBox.information(self, "Export Insights",
+                                    f"Insights exported to:\n{path}")
+        except OSError as exc:
             logger.exception("Export insights failed.")
+            self._set_status(f"Export failed: {exc}", is_error=True)
+            QMessageBox.critical(self, "Export Insights",
+                                 f"Export failed:\n{exc}")
 
     # ----------------------------------------------------------------- Analyses
-    def _run_bursts(self) -> None:
+    # Each runner appends its display name to ``failures`` (when provided)
+    # instead of failing silently — the caller surfaces the list to the user.
+    def _run_bursts(self, failures: Optional[List[str]] = None) -> None:
         try:
             from innovation.citation_bursts import CitationBurstDetector
             det = CitationBurstDetector()
@@ -243,8 +290,10 @@ class InnovationPanel(QWidget):
         except Exception as exc:
             logger.exception("Citation bursts failed: %s", exc)
             self._last_bursts = []
+            if failures is not None:
+                failures.append("Citation Bursts")
 
-    def _run_frontiers(self) -> None:
+    def _run_frontiers(self, failures: Optional[List[str]] = None) -> None:
         try:
             from innovation.frontier_mapping import KnowledgeFrontier
             kf = KnowledgeFrontier(self._papers)
@@ -252,8 +301,10 @@ class InnovationPanel(QWidget):
         except Exception as exc:
             logger.exception("Frontier mapping failed: %s", exc)
             self._last_frontiers = []
+            if failures is not None:
+                failures.append("Knowledge Frontiers")
 
-    def _run_forecast(self) -> None:
+    def _run_forecast(self, failures: Optional[List[str]] = None) -> None:
         try:
             from innovation.trend_forecasting import TrendForecaster
             tf = TrendForecaster(self._papers)
@@ -261,8 +312,10 @@ class InnovationPanel(QWidget):
         except Exception as exc:
             logger.exception("Trend forecasting failed: %s", exc)
             self._last_forecasts = []
+            if failures is not None:
+                failures.append("Trend Forecast")
 
-    def _run_recommendations(self) -> None:
+    def _run_recommendations(self, failures: Optional[List[str]] = None) -> None:
         try:
             from innovation.paper_recommendation import PaperRecommender
             rec = PaperRecommender(self._papers)
@@ -271,8 +324,10 @@ class InnovationPanel(QWidget):
         except Exception as exc:
             logger.exception("Paper recommendation failed: %s", exc)
             self._last_recommendations = []
+            if failures is not None:
+                failures.append("Paper Recommendations")
 
-    def _run_collaborations(self) -> None:
+    def _run_collaborations(self, failures: Optional[List[str]] = None) -> None:
         try:
             from innovation.collaboration_recommendation import CollaborationRecommender
             rec = CollaborationRecommender(self._papers)
@@ -284,8 +339,10 @@ class InnovationPanel(QWidget):
         except Exception as exc:
             logger.exception("Collaboration recommendation failed: %s", exc)
             self._last_collabs = []
+            if failures is not None:
+                failures.append("Collaboration Recommendations")
 
-    def _run_novelties(self) -> None:
+    def _run_novelties(self, failures: Optional[List[str]] = None) -> None:
         try:
             from innovation.novelty_scoring import NoveltyScorer
             scorer = NoveltyScorer(self._papers)
@@ -293,8 +350,10 @@ class InnovationPanel(QWidget):
         except Exception as exc:
             logger.exception("Novelty scoring failed: %s", exc)
             self._last_novelties = []
+            if failures is not None:
+                failures.append("Novelty Scores")
 
-    def _run_directions(self) -> None:
+    def _run_directions(self, failures: Optional[List[str]] = None) -> None:
         try:
             from innovation.research_directions import ResearchDirectionRecommender
             rec = ResearchDirectionRecommender(self._papers)
@@ -302,6 +361,8 @@ class InnovationPanel(QWidget):
         except Exception as exc:
             logger.exception("Research directions failed: %s", exc)
             self._last_directions = []
+            if failures is not None:
+                failures.append("Research Directions")
 
     # ----------------------------------------------------------------- Helpers
     def _refresh_center_list(self, tab: str) -> None:

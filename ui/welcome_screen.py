@@ -28,7 +28,14 @@ logger = logging.getLogger(__name__)
 
 
 class _ActionCard(QFrame):
-    """A clickable card with an icon glyph, title, and subtitle."""
+    """A clickable card with an icon glyph, title, and subtitle.
+
+    Keyboard-accessible: focusable via Tab, activated with
+    Enter/Return/Space, and exposed with a button role + accessible
+    name so screen readers announce it.
+    """
+
+    clicked = Signal()  # emitted on mouse click OR keyboard activation
 
     def __init__(
         self,
@@ -43,6 +50,10 @@ class _ActionCard(QFrame):
         self.setFrameShape(QFrame.NoFrame)
         self.setMinimumHeight(140)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        # Accessibility / keyboard support.
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.setAccessibleName(title)
+        self.setAccessibleDescription(subtitle)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(20, 20, 20, 20)
@@ -66,8 +77,23 @@ class _ActionCard(QFrame):
         sub_label = QLabel(subtitle, self)
         sub_label.setAlignment(Qt.AlignCenter)
         sub_label.setWordWrap(True)
-        sub_label.setStyleSheet("color: #94A3B8; font-size: 9pt;")
+        # Colour inherits from the global QSS so both themes stay legible.
+        sub_label.setStyleSheet("font-size: 9pt;")
         layout.addWidget(sub_label)
+
+    # --- Interaction -------------------------------------------------
+    def mousePressEvent(self, event) -> None:  # noqa: N802 — Qt API
+        if event.button() == Qt.LeftButton:
+            self.clicked.emit()
+        super().mousePressEvent(event)
+
+    def keyPressEvent(self, event) -> None:  # noqa: N802 — Qt API
+        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter,
+                           Qt.Key.Key_Space):
+            self.clicked.emit()
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
 
 class WelcomeScreen(QWidget):
@@ -125,7 +151,8 @@ class WelcomeScreen(QWidget):
         )
         tagline.setAlignment(Qt.AlignCenter)
         tagline.setWordWrap(True)
-        tagline.setStyleSheet("color: #94A3B8; font-size: 11pt;")
+        # Colour inherits from the global QSS (theme-aware).
+        tagline.setStyleSheet("font-size: 11pt;")
         root.addWidget(tagline)
 
         root.addSpacing(12)
@@ -150,10 +177,10 @@ class WelcomeScreen(QWidget):
             card.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
             cards_row.addWidget(card)
 
-        # Mouse-click handling via mousePressEvent override on each card.
-        self._card_new.mousePressEvent = self._make_click_handler(self.on_new_project_clicked)
-        self._card_open.mousePressEvent = self._make_click_handler(self.on_open_project_clicked)
-        self._card_search.mousePressEvent = self._make_click_handler(self.on_search_clicked)
+        # Cards emit a proper ``clicked`` signal (mouse + keyboard).
+        self._card_new.clicked.connect(self.on_new_project_clicked.emit)
+        self._card_open.clicked.connect(self.on_open_project_clicked.emit)
+        self._card_search.clicked.connect(self.on_search_clicked.emit)
 
         root.addLayout(cards_row)
 
@@ -197,20 +224,8 @@ class WelcomeScreen(QWidget):
     def _make_status_chip(icon: str, text: str) -> QLabel:
         """Create a small pill-style label for the status strip."""
         chip = QLabel(f"{icon}  {text}")
-        chip.setStyleSheet(
-            "background-color: #334155; color: #F1F5F9; "
-            "padding: 6px 12px; border-radius: 12px; font-size: 9pt;"
-        )
+        chip.setObjectName("StatusChip")
         return chip
-
-    def _make_click_handler(self, signal: Signal):  # type: ignore[valid-type]
-        """Return a mousePressEvent handler that emits ``signal``."""
-        def handler(event):  # noqa: ANN001 — Qt signature
-            if event.button() == Qt.LeftButton:
-                signal.emit()
-            # Allow default handling of other buttons.
-            super(_ActionCard, self).mousePressEvent(event)  # type: ignore[misc]
-        return handler
 
     def _on_recent_double_clicked(self, item: QListWidgetItem) -> None:
         """Emit ``on_open_project_clicked`` when a recent project is chosen."""
@@ -219,17 +234,40 @@ class WelcomeScreen(QWidget):
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
-    def set_recent_projects(self, projects: Sequence[dict[str, Any]]) -> None:
+    def set_recent_projects(self, projects: Sequence[Any]) -> None:
         """Populate the recent-projects list.
 
         Args:
-            projects: Iterable of dict-like records.  Each record is
-                expected to expose ``name``, ``path`` and optionally
-                ``modified`` keys.  At most five entries are shown.
+            projects: Iterable of records.  Each record may be a plain
+                dict (``name`` / ``path`` / ``modified`` keys), a
+                :class:`ProjectManager` ``Project`` dataclass, or any
+                object exposing ``name`` / ``updated_at`` attributes.
+                At most five entries are shown.
         """
-        self._recent_projects = list(projects)[:5]
+        records: List[dict[str, Any]] = []
+        for proj in list(projects)[:5]:
+            if isinstance(proj, dict):
+                records.append(dict(proj))
+                continue
+            to_dict = getattr(proj, "to_dict", None)
+            if callable(to_dict):
+                try:
+                    data = to_dict()
+                    if isinstance(data, dict):
+                        records.append(data)
+                        continue
+                except Exception:  # noqa: BLE001 — fall through to attrs
+                    logger.debug("Project.to_dict() failed.", exc_info=True)
+            name = getattr(proj, "name", None)
+            if name is not None:
+                records.append({
+                    "name": name,
+                    "modified": getattr(proj, "updated_at",
+                                        getattr(proj, "modified", None)),
+                })
+        self._recent_projects = records
         self._recent_list.clear()
-        for proj in self._recent_projects:
+        for proj in records:
             name = str(proj.get("name", "Untitled"))
             path = str(proj.get("path", ""))
             modified = proj.get("modified")

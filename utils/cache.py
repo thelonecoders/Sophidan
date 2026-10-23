@@ -2,14 +2,21 @@
 
 This module exposes two classes:
 
-* :class:`Cache` — a thread-safe pickled key/value cache backed by a single
-  SQLite database file. Values are pickled with :mod:`pickle` so arbitrary
-  Python objects (HTML, dicts, parsed paper metadata) can be stored.
+* :class:`Cache` — a thread-safe JSON-serialised key/value cache backed by a
+  single SQLite database file. Values are stored as **type-tagged JSON**
+  (never ``pickle`` — the previous pickle-based format was an unsafe
+  deserialization surface on scraped content). Non-JSON-serialisable values
+  raise a clear :class:`ValueError` on ``set()``.
 * :class:`TTLCache` — a :class:`Cache` subclass that records a creation
   timestamp on every entry and refuses to return entries older than their TTL.
 
-The default location is ``data/cache/cache.db`` under the project root, but a
+The default location is ``<settings.cache_dir>/cache.db`` (i.e.
+``data/cache/cache.db`` anchored at the project root — not the CWD); a
 custom path can be passed to the constructor.
+
+Entries written by older, pickle-based versions of this module are detected
+on read, logged, dropped and replaced by the default value — they are never
+deserialised.
 
 The module is independently importable — :mod:`sqlite3` is part of the
 standard library, so no third-party deps are required.
@@ -21,9 +28,8 @@ from __future__ import annotations
 # Copyright (c) 2026 — see /LICENSE for full text.
 #
 
+import json
 import logging
-import os
-import pickle
 import sqlite3
 import threading
 import time
@@ -33,7 +39,11 @@ from typing import Any, Optional, Union
 logger = logging.getLogger(__name__)
 
 _PROJECT_ROOT: Path = Path(__file__).resolve().parent.parent
+# Static fallback used only when the settings layer cannot be consulted.
 _DEFAULT_DB_PATH: Path = _PROJECT_ROOT / "data" / "cache" / "cache.db"
+
+# Envelope marker for type-tagged JSON payloads.
+_TYPE_TAG = "__ars_type__"
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS cache_entries (
@@ -47,14 +57,108 @@ CREATE INDEX IF NOT EXISTS idx_cache_entries_tag ON cache_entries(tag);
 """
 
 
+def _default_cache_path() -> Path:
+    """Resolve the default cache DB path from the settings layer.
+
+    Uses ``settings.resolve_path("cache_dir")`` (anchored at the project
+    root) and appends ``cache.db``; falls back to the static project-root
+    relative path when settings are unavailable.
+    """
+    try:  # pragma: no cover - settings is import-safe
+        from config.settings import get_settings
+
+        settings = get_settings()
+        base = settings.resolve_path("cache_dir")
+        return Path(base) / "cache.db"
+    except Exception:  # pragma: no cover - defensive
+        return _DEFAULT_DB_PATH
+
+
+# ---------------------------------------------------------------------------
+# JSON (de)serialisation — type-tagged, never pickle
+# ---------------------------------------------------------------------------
+def _encode_value(value: Any) -> str:
+    """Serialise ``value`` to a type-tagged JSON document.
+
+    Args:
+        value: Any JSON-serialisable object. ``tuple`` / ``set`` /
+            ``frozenset`` are tagged so their type survives a round-trip.
+
+    Raises:
+        ValueError: When ``value`` is not JSON-serialisable (with a clear
+            message naming the offending type).
+    """
+    if isinstance(value, tuple):
+        envelope: dict = {_TYPE_TAG: "tuple", "data": list(value)}
+    elif isinstance(value, set):
+        envelope = {_TYPE_TAG: "set", "data": list(value)}
+    elif isinstance(value, frozenset):
+        envelope = {_TYPE_TAG: "frozenset", "data": list(value)}
+    else:
+        envelope = {_TYPE_TAG: "raw", "data": value}
+    try:
+        return json.dumps(envelope, ensure_ascii=False)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "Cache values must be JSON-serialisable (str/int/float/bool/"
+            "None/list/dict/tuple/set); cannot serialise "
+            f"{type(value).__name__}: {exc}",
+        ) from exc
+
+
+def _decode_value(blob: Any) -> Any:
+    """Inverse of :func:`_encode_value`.
+
+    Corrupt rows and legacy (pickle-era) payloads are not deserialisable —
+    they return :data:`_CORRUPT` sentinel so the caller can return its
+    default instead of executing arbitrary bytecode.
+    """
+    if blob is None:
+        return _CORRUPT
+    try:
+        if isinstance(blob, (bytes, bytearray, memoryview)):
+            raw = bytes(blob).decode("utf-8")
+        else:
+            raw = str(blob)
+        envelope = json.loads(raw)
+    except Exception:
+        return _CORRUPT
+    if isinstance(envelope, dict) and envelope.get(_TYPE_TAG) == "raw":
+        return envelope.get("data")
+    if isinstance(envelope, dict):
+        tag = envelope.get(_TYPE_TAG)
+        data = envelope.get("data")
+        if tag == "tuple":
+            return tuple(data or ())
+        if tag == "set":
+            return set(data or ())
+        if tag == "frozenset":
+            return frozenset(data or ())
+    # Unknown envelope shape — return it verbatim rather than guessing.
+    return envelope
+
+
+class _Corrupt:
+    """Sentinel marking an unreadable cache row (never handed to callers)."""
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:  # pragma: no cover - debug aid
+        return "<corrupt-cache-entry>"
+
+
+_CORRUPT = _Corrupt()
+
+
 # ---------------------------------------------------------------------------
 # Cache
 # ---------------------------------------------------------------------------
 class Cache:
-    """A thread-safe SQLite-backed key/value cache with pickled values.
+    """A thread-safe SQLite-backed key/value cache with JSON values.
 
     The cache stores ``(key, value, created_at, ttl, tag)`` rows in a single
-    SQLite file. Values are pickled before storage; keys must be strings.
+    SQLite file. Values are JSON-serialised (type-tagged) before storage;
+    keys must be strings.
     """
 
     def __init__(
@@ -67,11 +171,11 @@ class Cache:
 
         Args:
             db_path: Path to the SQLite database file. Defaults to
-                ``data/cache/cache.db`` under the project root.
+                ``<settings.cache_dir>/cache.db`` (project-root anchored).
             table_name: Name of the table to use (allows multiple caches in
                 the same database file).
         """
-        self.db_path: Path = Path(db_path) if db_path else _DEFAULT_DB_PATH
+        self.db_path: Path = Path(db_path) if db_path else _default_cache_path()
         self.table_name: str = table_name
         self._lock = threading.RLock()
         # SQLite connections are not shareable across threads by default;
@@ -103,10 +207,12 @@ class Cache:
 
         Args:
             key: The cache key.
-            default: Value returned if the key is missing or expired.
+            default: Value returned if the key is missing, expired, or not
+                JSON-decodable (e.g. a legacy pickle row — which is dropped,
+                never unpickled).
 
         Returns:
-            The unpickled value, or ``default`` if absent / expired.
+            The decoded value, or ``default`` if absent / expired.
         """
         with self._lock:
             conn = self._connect()
@@ -125,11 +231,15 @@ class Cache:
             # Entry has expired — purge it lazily.
             self.invalidate(key)
             return default
-        try:
-            return pickle.loads(value_blob)
-        except Exception as exc:  # pragma: no cover - defensive
-            logger.warning("Failed to unpickle cache value for key=%r: %s", key, exc)
+        value = _decode_value(value_blob)
+        if isinstance(value, _Corrupt):
+            logger.warning(
+                "Dropping unreadable (legacy/corrupt) cache entry for key=%r",
+                key,
+            )
+            self.invalidate(key)
             return default
+        return value
 
     def set(
         self,
@@ -142,11 +252,16 @@ class Cache:
 
         Args:
             key: The cache key.
-            value: The Python object to cache (must be picklable).
+            value: The Python object to cache (must be JSON-serialisable;
+                otherwise a :class:`ValueError` is raised — nothing is
+                written).
             ttl: Optional time-to-live in seconds. ``None`` means never expire.
             tag: Optional grouping tag (e.g. ``"arxiv"``) for selective purge.
+
+        Raises:
+            ValueError: If ``value`` cannot be serialised to JSON.
         """
-        blob = pickle.dumps(value)
+        blob = _encode_value(value)  # may raise ValueError — write nothing
         created_at = time.time()
         with self._lock:
             conn = self._connect()
@@ -287,7 +402,7 @@ class TTLCache(Cache):
 
         Args:
             key: The cache key.
-            value: The Python object to cache.
+            value: The Python object to cache (JSON-serialisable).
             ttl: Optional override TTL in seconds; defaults to ``default_ttl``.
             tag: Optional grouping tag.
         """

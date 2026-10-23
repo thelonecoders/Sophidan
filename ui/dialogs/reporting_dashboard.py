@@ -92,6 +92,35 @@ class ReportingDashboard(QDialog):
         self._connect_signals()
         self._update_step()
 
+    # ------------------------------------------------- Template defaults
+
+    def set_preferred_config(self, report_type: Optional[str] = None,
+                             sections: Optional[List[str]] = None,
+                             title: Optional[str] = None) -> None:
+        """Pre-select wizard options (used by ReportsView templates)."""
+        if report_type:
+            rb = self.report_type_buttons.get(str(report_type).upper()) \
+                or self.report_type_buttons.get(str(report_type))
+            if rb is not None:
+                rb.setChecked(True)
+        if sections:
+            for sec, cb in self.section_checks.items():
+                cb.setChecked(sec in sections)
+        if title:
+            self._preferred_title = str(title)
+
+    # Pre-defined attributes consumed by set_preferred_config / _build_config.
+    _preferred_title: Optional[str] = None
+
+    def set_preferred_report_type(self, value: str) -> None:
+        self.set_preferred_config(report_type=value)
+
+    def set_preferred_sections(self, value: List[str]) -> None:
+        self.set_preferred_config(sections=value)
+
+    def set_preferred_title(self, value: str) -> None:
+        self.set_preferred_config(title=value)
+
     # ----------------------------------------------------------- UI
 
     def _build_ui(self) -> None:
@@ -129,7 +158,7 @@ class ReportingDashboard(QDialog):
         self.next_btn = QPushButton("Next ▶")
         self.cancel_btn = QPushButton("Cancel")
         self.generate_btn = QPushButton("Generate Report")
-        self.generate_btn.setObjectName("PrimaryButton")
+        self.generate_btn.setObjectName("PrimaryBtn")
         self.generate_btn.setVisible(False)
         btns.addWidget(self.cancel_btn)
         btns.addStretch()
@@ -285,10 +314,16 @@ class ReportingDashboard(QDialog):
         return [item.text() for item in self.manual_list.selectedItems()]
 
     def _build_config(self) -> Dict[str, Any]:
+        # Honor plain attributes set by callers (ReportsView templates)
+        # before falling back to the wizard's own selections.
+        preferred_rt = getattr(self, "preferred_report_type", None)
+        report_type = str(preferred_rt) if preferred_rt else self._selected_report_type()
+        preferred_secs = getattr(self, "preferred_sections", None)
+        sections = list(preferred_secs) if preferred_secs else self._selected_sections()
         return {
-            "report_type": self._selected_report_type(),
+            "report_type": report_type,
             "scope": self._selected_scope(),
-            "sections": self._selected_sections(),
+            "sections": sections,
             "output_path": self.filename_edit.text().strip(),
             "manual_items": self._selected_manual_items(),
             "data": self._data,
@@ -296,79 +331,132 @@ class ReportingDashboard(QDialog):
 
     def _on_generate(self) -> None:
         config = self._build_config()
+        papers = config["data"]
         if not config["output_path"]:
             QMessageBox.warning(self, "Output path required", "Please choose an output file.")
+            return
+        if not papers:
+            QMessageBox.warning(
+                self, "No data",
+                "No papers are loaded for the selected scope.\n"
+                "Run a search or load a project, then reopen the wizard.")
             return
         self.progress_bar.setVisible(True)
         self.progress_bar.setValue(0)
         self.generate_btn.setEnabled(False)
         self.cancel_btn.setEnabled(False)
 
-        try:
-            from utils.workers import Worker  # type: ignore
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("utils.workers.Worker unavailable, running sync: %s", exc)
-            Worker = None  # type: ignore
+        from utils.workers import Worker, WorkerPool
 
-        def _work() -> Any:
-            return self._invoke_generator(config)
-
-        if Worker is None:
-            try:
-                path = _work()
-                self._on_generation_finished(path)
-            except Exception as exc:  # noqa: BLE001
-                self._on_generation_error(str(exc))
-            return
+        def _work(progress_callback=None) -> str:
+            report = progress_callback or (lambda pct, msg="": None)
+            report(0, "Generating report…")
+            path = self._invoke_generator(config)
+            report(100, "Done")
+            return path
 
         self._worker = Worker(_work)
-        for sig_name, slot in (
-            ("progress", self.progress_bar.setValue),
-            ("result", self._on_generation_finished),
-            ("error", self._on_generation_error),
-        ):
-            sig = getattr(self._worker, sig_name, None)
-            if sig is not None:
-                try:
-                    sig.connect(slot)
-                except Exception as exc:  # noqa: BLE001
-                    logger.debug("Could not connect %s: %s", sig_name, exc)
-        try:
-            self._worker.start()
-        except Exception as exc:  # noqa: BLE001
-            self._on_generation_error(str(exc))
+        self._worker.signals.progress.connect(self._on_generation_progress)
+        self._worker.signals.result.connect(self._on_generation_finished)
+        self._worker.signals.error.connect(self._on_generation_error)
+        WorkerPool.instance().submit(self._worker)
+
+    def _on_generation_progress(self, percent: int, message: str = "") -> None:
+        self.progress_bar.setValue(int(percent))
+        if message:
+            self.progress_bar.setFormat(f"%p% — {message}")
 
     def _invoke_generator(self, config: Dict[str, Any]) -> str:
-        """Dispatch to the appropriate ``reporting.*`` module (lazy import)."""
+        """Dispatch to the ``reporting.*`` builder API (lazy import).
+
+        The real classes are ``PDFReport`` / ``DOCXReport`` /
+        ``PPTXReport`` / ``BibTeXExporter`` — a ``.generate()`` method
+        exists on none of them; documents are assembled with the
+        ``add_*`` builder methods and written via ``build(path)``.
+        """
         rt = config["report_type"].lower()
-        data = config["data"]
+        papers = list(config["data"] or [])
         path = config["output_path"]
-        sections = config["sections"]
-        try:
-            if rt == "pdf":
-                from reporting.pdf_report import PDFReportGenerator
-                gen = PDFReportGenerator()
-                return gen.generate(data, path, sections=sections)
-            if rt == "docx":
-                from reporting.docx_report import DocxReportGenerator
-                gen = DocxReportGenerator()
-                return gen.generate(data, path, sections=sections)
-            if rt == "pptx":
-                from reporting.pptx_report import PptxReportGenerator
-                gen = PptxReportGenerator()
-                return gen.generate(data, path, sections=sections)
-            if rt == "bibtex":
-                from reporting.bibtex_export import BibtexExporter
-                gen = BibtexExporter()
-                return gen.export(data, path)
-            if rt == "csv":
-                from reporting.csv_export import CSVExporter
-                gen = CSVExporter()
-                return gen.export(data, path)
-        except Exception as exc:  # noqa: BLE001
-            logger.error("Report generation failed: %s", exc)
-            raise
-        return path
+        sections = set(config["sections"])
+        title = (self._preferred_title
+                 or getattr(self, "preferred_title", None)
+                 or "Academic Research Report")
+
+        if rt == "pdf":
+            from reporting.pdf_report import PDFReport
+            rpt = PDFReport(title=title, author="Academic Research Suite")
+            if "cover" in sections:
+                try:
+                    rpt.add_cover_page({"title": title,
+                                        "papers": len(papers)})
+                except Exception:  # noqa: BLE001
+                    logger.debug("PDF cover page skipped.", exc_info=True)
+            if "abstract" in sections:
+                rpt.add_section("Abstract",
+                                f"This report summarises {len(papers)} papers.")
+            if "methods" in sections:
+                rpt.add_section("Methods",
+                                "Papers were collected via the multi-source "
+                                "search panel and curated in the Data view.")
+            if "results" in sections:
+                rpt.add_section("Results",
+                                f"The corpus contains {len(papers)} records.")
+            if "tables" in sections:
+                rpt.add_papers_table(papers)
+            if "bibliography" in sections:
+                try:
+                    from reporting.bibtex_export import BibTeXExporter
+                    bib = BibTeXExporter().to_string(papers)
+                    rpt.add_section("Bibliography", bib)
+                except Exception:  # noqa: BLE001
+                    logger.debug("PDF bibliography skipped.", exc_info=True)
+            return rpt.build(path)
+
+        if rt == "docx":
+            from reporting.docx_report import DOCXReport
+            rpt = DOCXReport(title=title, author="Academic Research Suite")
+            if "cover" in sections:
+                rpt.add_heading(title, level=0)
+            if "abstract" in sections:
+                rpt.add_heading("Abstract", level=1)
+                rpt.add_paragraph(f"This report summarises {len(papers)} papers.")
+            if "methods" in sections:
+                rpt.add_heading("Methods", level=1)
+                rpt.add_paragraph(
+                    "Papers were collected via the multi-source search panel.")
+            if "results" in sections:
+                rpt.add_heading("Results", level=1)
+                rpt.add_paragraph(f"The corpus contains {len(papers)} records.")
+            if "tables" in sections:
+                rpt.add_papers_table(papers)
+            if "bibliography" in sections:
+                rpt.add_bibliography(papers)
+            return rpt.build(path)
+
+        if rt == "pptx":
+            from reporting.pptx_report import PPTXReport
+            rpt = PPTXReport(title=title,
+                             subtitle=f"Corpus of {len(papers)} papers")
+            if "cover" in sections:
+                rpt.add_title_slide(title,
+                                    f"Corpus of {len(papers)} papers",
+                                    author="Academic Research Suite")
+            if "tables" in sections:
+                try:
+                    rpt.add_papers_slides(papers)
+                except Exception:  # noqa: BLE001
+                    logger.debug("PPTX paper slides skipped.", exc_info=True)
+            return rpt.build(path)
+
+        if rt == "bibtex":
+            from reporting.bibtex_export import BibTeXExporter
+            return BibTeXExporter().export(papers, path)
+
+        if rt == "csv":
+            from reporting.csv_export import CSVExporter
+            return CSVExporter().export(papers, path)
+
+        raise ValueError(f"Unsupported report type: {config['report_type']!r}")
 
     def _on_generation_finished(self, path: Any) -> None:
         self.progress_bar.setValue(100)

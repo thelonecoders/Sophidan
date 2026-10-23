@@ -15,6 +15,8 @@ import logging
 import os
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
+from ._paper_utils import get_authors, get_str, get_year
+
 logger = logging.getLogger(__name__)
 
 
@@ -267,6 +269,71 @@ class PPTXReport:
                 p.space_after = self._Pt(8)
             except Exception:  # pragma: no cover
                 pass
+
+    def add_papers_slides(
+        self,
+        papers: Optional[Sequence[Any]] = None,
+        per_slide: int = 4,
+        max_slides: int = 40,
+    ) -> None:
+        """Add slides listing the corpus: title + authors + abstract snippet.
+
+        Each slide shows up to ``per_slide`` papers as bullets of the form
+        ``Title — Authors (Year). Abstract snippet…``.  For very large
+        corpora the deck is capped at ``max_slides`` paper slides followed
+        by a "…and N more" note so a 5 000-paper project cannot produce a
+        5 000-slide deck.  An empty corpus is a guarded no-op (previously
+        this method did not exist at all — audit 4-i "empty PPTX deck").
+
+        Args:
+            papers: Sequence of Paper-like objects (dicts / dataclasses /
+                ORM models).
+            per_slide: Bullet items per slide (1–8, clamped).
+            max_slides: Hard cap on the number of paper slides.
+        """
+        entries: List[str] = []
+        for p in list(papers or []):
+            title = get_str(p, "title") or "(untitled)"
+            if len(title) > 110:
+                title = title[:107] + "..."
+            authors = get_authors(p)
+            if not authors:
+                author_str = "Unknown"
+            elif len(authors) <= 2:
+                author_str = "; ".join(authors)
+            else:
+                author_str = f"{authors[0]} et al."
+            year = get_year(p)
+            abstract = get_str(p, "abstract")
+            snippet = ""
+            if abstract:
+                snippet = " " + (abstract[:140].rstrip() + "…"
+                                 if len(abstract) > 140 else abstract)
+            entries.append(f"{title} — {author_str}"
+                           + (f" ({year})" if year else "") + snippet)
+
+        if not entries:
+            logger.debug("add_papers_slides: no papers — skipping.")
+            return
+
+        per_slide = max(1, min(8, int(per_slide)))
+        max_slides = max(1, int(max_slides))
+        shown = entries[: per_slide * max_slides]
+        for start in range(0, len(shown), per_slide):
+            chunk = shown[start:start + per_slide]
+            first = start + 1
+            last = start + len(chunk)
+            self.add_bullet_slide(
+                f"Corpus Papers ({first}–{last} of {len(entries)})",
+                chunk,
+            )
+        overflow = len(entries) - len(shown)
+        if overflow > 0:
+            self.add_bullet_slide(
+                "Corpus Papers (continued)",
+                [f"…and {overflow} more papers not shown "
+                 f"(deck capped at {max_slides} slides)."],
+            )
 
     def add_chart_slide(
         self,

@@ -37,7 +37,15 @@ from urllib.parse import urlparse
 
 from .proxy_manager import Proxy
 
+# Align with the canonical exception hierarchy (audit 4-i): ProxyChainError
+# lives in ``utils.exceptions`` (ProxyError(ARSError) → ProxyChainError);
+# re-exported here so ``from proxy.proxy_chain import ProxyChainError`` keeps
+# working AND ``except ProxyChainError`` also catches the utils type.
+from utils.exceptions import ProxyChainError  # noqa: F401  (re-export)
+
 logger = logging.getLogger(__name__)
+
+__all__ = ["ProxyChain", "ProxyChainError", "chain_from_addresses"]
 
 # Map our protocol strings to PySocks' proxy type constants.
 _PROXY_TYPE_MAP = {
@@ -46,10 +54,6 @@ _PROXY_TYPE_MAP = {
     "http": 3,     # socks.PROXY_TYPE_HTTP
     "https": 3,    # treat https-upstream as HTTP CONNECT (TLS is end-to-end)
 }
-
-
-class ProxyChainError(RuntimeError):
-    """Raised when a chained request cannot be completed."""
 
 
 class ProxyChain:
@@ -197,7 +201,8 @@ class ProxyChain:
         # 3) Issue the HTTP request over the tunnel.
         try:
             return self._http_request(
-                chain_socket, method, dst_host, dst_port, path, headers or {}, body, url
+                chain_socket, method, dst_host, dst_port, path, headers or {},
+                body, url, timeout=timeout,
             )
         finally:
             try:
@@ -416,8 +421,13 @@ class ProxyChain:
         headers: Dict[str, str],
         body: Optional[bytes],
         url: str,
+        timeout: float = 30.0,
     ):
         """Issue an HTTP request over a pre-connected (and possibly TLS) socket.
+
+        The ``timeout`` from :meth:`send_request` is honoured for the socket
+        and the read (previously hardcoded to 30s regardless of the caller's
+        ``timeout=`` argument).
 
         Returns a ``requests.Response``.
         """
@@ -433,14 +443,18 @@ class ProxyChain:
         class _TunneledConnection(conn_cls):  # type: ignore[misc, valid-type]
             """``http.client`` connection that uses a pre-made socket."""
 
-            def __init__(self, host: str, port: int, sock: socket.socket) -> None:
-                super().__init__(host, port, timeout=30.0)
+            def __init__(
+                self, host: str, port: int, sock: socket.socket,
+                timeout: float = 30.0,
+            ) -> None:
+                super().__init__(host, port, timeout=timeout)
                 self._presock = sock
 
             def connect(self) -> None:  # noqa: D401
+                self._presock.settimeout(self.timeout)
                 self.sock = self._presock
 
-        conn = _TunneledConnection(host, port, sock)
+        conn = _TunneledConnection(host, port, sock, timeout=timeout)
         h = {"Host": host if (port in (80, 443)) else f"{host}:{port}"}
         h.update(headers or {})
         if body is not None and "Content-Length" not in {k.title() for k in h}:
@@ -468,11 +482,64 @@ class ProxyChain:
         return out
 
 
-# Convenience: build a chain from a list of ``host:port`` strings.
-def chain_from_addresses(addresses: List[str], protocol: str = "socks5") -> ProxyChain:
-    """Build a :class:`ProxyChain` from ``["host:port", ...]`` strings."""
+# Default ports used when an address carries no ``:port`` component.
+_DEFAULT_CHAIN_PORTS: Dict[str, int] = {
+    "http": 8080,
+    "https": 8080,
+    "socks4": 1080,
+    "socks5": 1080,
+}
+
+
+def chain_from_addresses(
+    addresses: List[Any], protocol: str = "socks5"
+) -> ProxyChain:
+    """Build a :class:`ProxyChain` from ``["host:port", ...]`` strings.
+
+    Robustness (audit 4-i):
+      * ``Proxy`` instances are passed through untouched;
+      * an optional ``proto://`` prefix on each address overrides ``protocol``;
+      * a missing ``:port`` falls back to the protocol's default
+        (socks4/socks5 → 1080, http/https → 8080) instead of raising
+        ``ValueError: invalid literal for int()`` on the empty string;
+      * blank entries are skipped; malformed entries raise a descriptive
+        ``ValueError`` (the web layer maps it to HTTP 400).
+    """
     proxies: List[Proxy] = []
-    for addr in addresses:
-        host, _, port = addr.partition(":")
-        proxies.append(Proxy(host=host.strip(), port=int(port), protocol=protocol))
+    for addr in addresses or []:
+        if isinstance(addr, Proxy):
+            proxies.append(addr)
+            continue
+        s = str(addr).strip()
+        if not s or s.startswith("#"):
+            continue
+        proto = protocol.lower()
+        if "://" in s:
+            prefix, s = s.split("://", 1)
+            if prefix.lower() in _DEFAULT_CHAIN_PORTS:
+                proto = prefix.lower()
+        if "@" in s:
+            creds, _, s = s.rpartition("@")
+        else:
+            creds = ""
+        host, _, port_s = s.partition(":")
+        host = host.strip()
+        if not host:
+            raise ValueError(f"chain address missing host: {addr!r}")
+        if port_s.strip():
+            if not port_s.strip().isdigit():
+                raise ValueError(f"chain address has invalid port: {addr!r}")
+            port = int(port_s)
+        else:
+            port = _DEFAULT_CHAIN_PORTS.get(proto, 8080)
+        username = password = None
+        if creds:
+            username, _, password = creds.partition(":")
+        try:
+            proxies.append(
+                Proxy(host=host, port=port, protocol=proto,
+                      username=username or None, password=password or None)
+            )
+        except ValueError as exc:
+            raise ValueError(f"invalid chain address {addr!r}: {exc}") from exc
     return ProxyChain(proxies)

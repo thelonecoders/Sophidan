@@ -39,23 +39,26 @@ from qtpy.QtWidgets import (
 logger = logging.getLogger(__name__)
 
 # (action, shortcut) tuples for the shortcuts table.
+# NOTE: kept in sync with MainWindow._apply_shortcuts — every entry here
+# is implemented in the running application.
 SHORTCUTS: List[Tuple[str, str]] = [
     ("New Project", "Ctrl+N"),
     ("Open Project…", "Ctrl+O"),
     ("Save Project", "Ctrl+S"),
-    ("Search", "Ctrl+F"),
-    ("Advanced Search…", "Ctrl+Shift+F"),
+    ("Export…", "Ctrl+E"),
+    ("Open Settings", "Ctrl+,"),
+    ("Quit", "Ctrl+Q"),
+    ("Search Page (focus query)", "Ctrl+K"),
+    ("Focus Global Search", "Ctrl+Shift+F"),
     ("Run Analysis", "F5"),
     ("Cancel Running Task", "Esc"),
     ("Send Chat Message", "Ctrl+Enter"),
     ("Clear Chat History", "Ctrl+Shift+K"),
     ("Refresh Proxy Pool", "Ctrl+R"),
-    ("Export…", "Ctrl+E"),
-    ("Open Settings", "Ctrl+,"),
-    ("Toggle Sidebar", "Ctrl+B"),
+    ("Toggle Sidebar", "Ctrl+B / F9"),
+    ("Toggle Theme", "Ctrl+Shift+T"),
     ("Toggle Log Viewer", "Ctrl+L"),
     ("Open Help", "F1"),
-    ("Quit", "Ctrl+Q"),
 ]
 
 # (question, answer) tuples for the FAQ accordion.
@@ -235,7 +238,6 @@ class HelpDialog(QDialog):
         layout = QVBoxLayout(page)
         layout.setContentsMargins(12, 12, 12, 12)
         hint = QLabel("Click a question to expand its answer.")
-        hint.setStyleSheet("color:#888;")
         layout.addWidget(hint)
         self._faq_items: List[FaqItem] = []
         for q, a in FAQ:
@@ -259,8 +261,12 @@ class HelpDialog(QDialog):
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(title)
 
-        version = QLabel("Version 0.1.0")
-        version.setStyleSheet("color:#888;")
+        try:
+            from config.settings import get_settings
+            _app_version = get_settings().version
+        except Exception:  # noqa: BLE001 - never break the About tab
+            _app_version = "2.0.0"
+        version = QLabel(f"Version {_app_version}")
         version.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(version)
 

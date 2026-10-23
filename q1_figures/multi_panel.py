@@ -282,9 +282,12 @@ class MultiPanelFigure:
         to the layout engine as hints; matplotlib may still adjust them.
         """
         try:
-            self.figure.set_constrained_layout_pads(
-                hspace=hspace, wspace=wspace,
-            )
+            # set_constrained_layout_pads() is deprecated (mpl >= 3.6) —
+            # set the pads on the constrained layout engine instead.
+            engine = self.figure.get_layout_engine()
+            if engine is not None and hasattr(engine, "set"):
+                engine.set(w_pad=None, h_pad=None,
+                           wspace=wspace, hspace=hspace)
         except Exception as exc:
             logger.debug("constrained_layout pads skipped: %s", exc)
         # Also set the gridspec spacing as a fallback hint.

@@ -24,9 +24,15 @@ from .proxy_manager import Proxy
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_TEST_URL = "https://httpbin.org/ip"
+_DEFAULT_TEST_URL = "https://httpbin.org/get"  # echoes request headers + origin
 _GEOIP_URL = "http://ip-api.com/json/{ip}?fields=status,country,countryCode,regionName,city,isp,query"
 _GEOIP_CACHE_TTL = 6 * 3600  # 6 hours
+
+# Request headers whose presence indicates the proxy announced itself.
+_FORWARDING_HEADERS = (
+    "via", "x-forwarded-for", "x-forwarded-host", "x-forwarded-proto",
+    "forwarded", "proxy-connection", "x-real-ip",
+)
 
 
 @dataclass
@@ -81,6 +87,9 @@ class ProxyHealthChecker:
         self._geoip_lock = threading.Lock()
         self._monitor_thread: Optional[threading.Thread] = None
         self._monitor_stop = threading.Event()
+        # Learned public IP of *this* machine (for transparency detection).
+        self._client_ip: Optional[str] = None
+        self._client_ip_ts: float = 0.0
 
     # -- single check --------------------------------------------------------
     def check_proxy(
@@ -116,15 +125,31 @@ class ProxyHealthChecker:
             return ProxyCheckResult(proxy=p, alive=False, error=str(exc))
 
         exit_ip = None
+        header_echo: Optional[Dict[str, Any]] = None
         anonymity = "anonymous"
         try:
             body = resp.json()
-            origin = body.get("origin", "") if isinstance(body, dict) else ""
-            exit_ip = origin.split(",")[0].strip() if origin else None
-            anonymity = self._detect_anonymity(p, exit_ip)
+            if isinstance(body, dict):
+                origin = body.get("origin", "") or ""
+                exit_ip = origin.split(",")[0].strip() if origin else None
+                # Header-echo endpoints (/get, /headers) show what the
+                # target actually received — the basis of the anonymity
+                # classification below.
+                echo = body.get("headers")
+                if isinstance(echo, dict) and echo:
+                    header_echo = echo
         except Exception:
             # Non-JSON endpoint -> still alive.
             pass
+
+        try:
+            anonymity = self._detect_anonymity(
+                p, exit_ip,
+                headers=header_echo,
+                client_ip=self._client_public_ip(),
+            )
+        except Exception:  # pragma: no cover - defensive
+            anonymity = self._detect_anonymity(p, exit_ip)
 
         geo = self.geoip_lookup(exit_ip) if exit_ip else {}
         return ProxyCheckResult(
@@ -137,6 +162,37 @@ class ProxyHealthChecker:
             isp=geo.get("isp"),
             exit_ip=exit_ip,
         )
+
+    def _client_public_ip(self, ttl: float = 3600.0) -> Optional[str]:
+        """Best-effort public IP of this machine (cached for ``ttl``).
+
+        Used to detect *transparent* proxies: if the target's echoed headers
+        or origin contain this IP, the proxy is leaking the client address.
+        """
+        now = time.time()
+        if self._client_ip and now - self._client_ip_ts < ttl:
+            return self._client_ip
+        try:
+            import requests  # type: ignore
+        except Exception:  # pragma: no cover
+            return None
+        for url in ("https://api.ipify.org", "https://httpbin.org/ip"):
+            try:
+                r = requests.get(url, timeout=5.0)
+                r.raise_for_status()
+                if "json" in (r.headers.get("Content-Type") or ""):
+                    data = r.json()
+                    ip = (data.get("origin") or data.get("ip") or "")
+                    ip = str(ip).split(",")[0].strip()
+                else:
+                    ip = r.text.strip()
+                if ip:
+                    self._client_ip = ip
+                    self._client_ip_ts = now
+                    return ip
+            except Exception:  # pragma: no cover - network optional
+                continue
+        return None
 
     # -- batch ---------------------------------------------------------------
     def check_batch(
@@ -269,18 +325,46 @@ class ProxyHealthChecker:
         return {"http": url, "https": url}
 
     @staticmethod
-    def _detect_anonymity(p: Proxy, exit_ip: Optional[str]) -> str:
-        """Best-effort anonymity detection.
+    def _detect_anonymity(
+        p: Proxy,
+        exit_ip: Optional[str] = None,
+        headers: Optional[Dict[str, Any]] = None,
+        client_ip: Optional[str] = None,
+    ) -> str:
+        """Header-echo anonymity classification (audit 4-i).
 
-        - transparent: exit IP == client's public IP (we can't know that
-          without an extra request, so we treat empty/None as transparent).
-        - elite: target did not see ``X-Forwarded-For`` (we approximate by
-          checking that the proxy protocol hides the client IP).
-        - anonymous: default fallback.
+        Priority:
+          1. *transparent* — the target saw the client's real public IP,
+             either as the request origin (``exit_ip == client_ip``) or
+             echoed inside ``X-Forwarded-For`` / ``Forwarded`` /
+             ``X-Real-IP``;
+          2. *anonymous* — forwarding headers (``Via`` / ``X-Forwarded-*``)
+             are present but the client IP is NOT leaked;
+          3. *elite* — no forwarding headers at all (SOCKS hops always
+             fall here; they never inject HTTP headers).
+
+        Falls back to the legacy heuristic when no header echo is available
+        (non-JSON test endpoints): ``socks`` → elite, unknown origin →
+        anonymous, missing origin → transparent.
         """
         if not exit_ip:
             return "transparent"
-        # SOCKS proxies are by design elite (no forwarded headers).
+        if headers:
+            hdrs = {str(k).lower(): str(v) for k, v in headers.items()}
+            # 1) client IP leak?
+            if client_ip:
+                if exit_ip == client_ip:
+                    return "transparent"
+                for key in ("x-forwarded-for", "forwarded", "x-real-ip"):
+                    value = hdrs.get(key, "")
+                    if value and client_ip in value:
+                        return "transparent"
+            # 2) proxy announced itself without leaking the client IP?
+            if any(hdrs.get(key) for key in _FORWARDING_HEADERS):
+                return "anonymous"
+            # 3) nothing forwarded at all.
+            return "elite"
+        # Legacy heuristic (no header echo available).
         if p.protocol.startswith("socks"):
             return "elite"
         return "anonymous"

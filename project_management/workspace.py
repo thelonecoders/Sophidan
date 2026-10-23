@@ -37,6 +37,16 @@ class Workspace:
     DEFAULT_PATH = Path("data/workspace.json")
     EXPORT_MARKER = "ars_workspace.json"
 
+    @staticmethod
+    def _default_state_path() -> Path:
+        """Resolve the workspace JSON path via settings (project-root anchored)."""
+        try:  # pragma: no cover - settings is import-safe
+            from config.settings import get_settings
+
+            return get_settings().resolve_path("data_dir") / "workspace.json"
+        except Exception:  # pragma: no cover - defensive
+            return Workspace.DEFAULT_PATH
+
     def __init__(self, db: Optional[DatabaseConnection] = None,
                  path: Optional[Path] = None) -> None:
         """Initialise the workspace, loading any persisted state.
@@ -48,7 +58,7 @@ class Workspace:
                 :attr:`DEFAULT_PATH`.
         """
         self.db: DatabaseConnection = db or DatabaseConnection()
-        self.path: Path = Path(path) if path else self.DEFAULT_PATH
+        self.path: Path = Path(path) if path else self._default_state_path()
         self.open_project_ids: List[int] = []
         self.active_project_id: Optional[int] = None
         self.recent_project_ids: List[int] = []
@@ -100,7 +110,7 @@ class Workspace:
             if model is None:
                 raise KeyError(f"Project id={project_id} not found.")
         finally:
-            self.db._session_factory.remove()
+            self.db.remove_session()
         if project_id not in self.open_project_ids:
             self.open_project_ids.append(project_id)
         # Update recents.
@@ -151,7 +161,7 @@ class Workspace:
                 out.append(Project.from_model(model))
             return out
         finally:
-            self.db._session_factory.remove()
+            self.db.remove_session()
 
     # ------------------------------------------------------------------
     # Properties
@@ -171,7 +181,7 @@ class Workspace:
                 out.append(Project.from_model(model))
             return out
         finally:
-            self.db._session_factory.remove()
+            self.db.remove_session()
 
     # ------------------------------------------------------------------
     # Zip export / import
@@ -225,7 +235,7 @@ class Workspace:
                                     json.dumps(paper.to_dict(), indent=2,
                                                default=str))
         finally:
-            self.db._session_factory.remove()
+            self.db.remove_session()
         logger.info("Exported workspace to %s (%d papers).",
                     dest, len(paper_ids_seen))
         return dest
@@ -235,7 +245,10 @@ class Workspace:
 
         Re-creates the projects and papers in the current DB (upserts by
         ``doi`` for papers, by ``name`` for projects). Open projects are
-        replaced with the imported set.
+        replaced with the imported set. Imported papers are indexed into
+        the FTS5 full-text index, and ``active_project_id`` /
+        ``recent_project_ids`` are remapped through the imported project id
+        map (stale ids that no longer exist are dropped with a warning).
 
         Args:
             path: Source zip file path.
@@ -246,6 +259,7 @@ class Workspace:
         src = Path(path)
         if not src.exists():
             raise FileNotFoundError(f"Workspace zip not found: {src}")
+        papers_to_index: List[Any] = []
         with zipfile.ZipFile(src, "r") as zf:
             names = zf.namelist()
             if self.EXPORT_MARKER not in names:
@@ -267,6 +281,7 @@ class Workspace:
                     paper = None
                     if doi:
                         paper = session.query(PaperModel).filter_by(doi=doi).first()
+                    is_new = paper is None
                     if paper is None:
                         paper = PaperModel()
                         session.add(paper)
@@ -306,7 +321,10 @@ class Workspace:
                     session.flush()
                     if old_id is not None:
                         paper_id_map[old_id] = paper.id
-                # Upsert projects (by name).
+                    if is_new:
+                        papers_to_index.append(paper)
+                # Upsert projects (by name), building the old→new id map.
+                project_id_map: Dict[int, int] = {}
                 new_open_ids: List[int] = []
                 for fn in project_files:
                     data = json.loads(zf.read(fn))
@@ -320,25 +338,69 @@ class Workspace:
                     project.description = data.get("description") or ""
                     project.color = data.get("color") or "#3B82F6"
                     project.settings = data.get("settings") or {}
-                    # Resolve paper ids via the map.
-                    target_paper_ids = [
-                        paper_id_map.get(pid, pid)
-                        for pid in data.get("paper_ids", [])
-                    ]
+                    # Resolve paper ids via the map; skip unmapped ids.
+                    target_paper_ids: List[int] = []
+                    for pid in data.get("paper_ids", []):
+                        mapped = paper_id_map.get(pid)
+                        if mapped is None:
+                            logger.warning(
+                                "import_workspace: paper id=%s referenced by "
+                                "project %r not found in bundle — skipped.",
+                                pid, name,
+                            )
+                            continue
+                        target_paper_ids.append(mapped)
                     target_papers = session.query(PaperModel).filter(
                         PaperModel.id.in_(target_paper_ids),
                     ).all() if target_paper_ids else []
                     project.papers = target_papers
                     session.flush()
+                    if data.get("id") is not None:
+                        project_id_map[data["id"]] = project.id
                     new_open_ids.append(project.id)
+
+                # Remap active / recent project ids through the imported map.
+                old_active = ws_payload.get("active_project_id")
+                remapped_active = project_id_map.get(old_active) if old_active is not None else None
+                self.active_project_id = (
+                    remapped_active if remapped_active in new_open_ids else None
+                )
+                remapped_recent: List[int] = []
+                for rid in ws_payload.get("recent_project_ids", []):
+                    new_id = project_id_map.get(rid)
+                    if new_id is None:
+                        logger.warning(
+                            "import_workspace: recent project id=%s not in "
+                            "bundle — skipped.", rid,
+                        )
+                        continue
+                    if new_id not in remapped_recent:
+                        remapped_recent.append(new_id)
+                for pid in new_open_ids:
+                    if pid not in remapped_recent:
+                        remapped_recent.append(pid)
                 self.open_project_ids = new_open_ids
-                self.active_project_id = ws_payload.get("active_project_id")
-                self.recent_project_ids = list(
-                    ws_payload.get("recent_project_ids", []),
-                ) + new_open_ids
+                self.recent_project_ids = remapped_recent[:50]
         self.save()
-        logger.info("Imported workspace from %s (%d projects).",
-                    src, len(new_open_ids))
+
+        # Index the imported papers into FTS AFTER the transaction committed
+        # (best-effort — a missing FTS5 build must not fail the import).
+        if papers_to_index:
+            try:
+                from database.search import FullTextSearch
+
+                fts = FullTextSearch(self.db)
+                for paper in papers_to_index:
+                    try:
+                        fts.index_paper(paper)
+                    except Exception as exc:  # pragma: no cover - per-paper
+                        logger.warning("FTS indexing skipped for imported "
+                                       "paper id=%s: %s", paper.id, exc)
+            except Exception as exc:  # pragma: no cover - FTS optional
+                logger.warning("FTS indexing unavailable after workspace "
+                               "import: %s", exc)
+        logger.info("Imported workspace from %s (%d projects, %d papers indexed).",
+                    src, len(new_open_ids), len(papers_to_index))
 
 
 __all__ = ["Workspace"]

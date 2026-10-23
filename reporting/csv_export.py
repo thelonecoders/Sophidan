@@ -17,12 +17,14 @@ from __future__ import annotations
 import csv
 import logging
 import os
+from datetime import datetime
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 from ._paper_utils import (
     calculate_h_index,
     get_authors,
     get_citation_count,
+    get_cited_dois,
     get_doi,
     get_field,
     get_keywords,
@@ -31,6 +33,41 @@ from ._paper_utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Excel formula-injection guard (audit 4-i): cells beginning with ``=``,
+# ``+``, ``-``, ``@``, TAB or CR would be executed/interpreted by Excel &
+# friends when the CSV is opened.  Neutralise with a leading apostrophe and
+# strip control characters that break row structure.
+# ---------------------------------------------------------------------------
+_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
+
+
+def sanitize_csv_value(value: Any) -> Any:
+    """Return a CSV/Excel-safe version of ``value``.
+
+    Rules:
+      * ``None`` → ``""``; ints/floats are passed through untouched
+        (numeric cells are never formula-interpreted);
+      * CR / LF / TAB characters are replaced with spaces (they corrupt
+        rows and can smuggle formula payloads onto continuation lines);
+      * a remaining leading ``=`` / ``+`` / ``-`` / ``@`` is neutralised by
+        prefixing an apostrophe (Excel renders the text verbatim without
+        evaluating it).
+    """
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return str(value)
+    if isinstance(value, (int, float)):
+        return value
+    s = str(value)
+    if any(ch in s for ch in ("\r", "\n", "\t")):
+        s = s.replace("\r", " ").replace("\n", " ").replace("\t", " ")
+    if s[:1] in _FORMULA_PREFIXES:
+        s = "'" + s
+    return s
 
 
 # Default paper-level columns (ordered).
@@ -73,6 +110,7 @@ class CSVExporter:
         quoting: int = csv.QUOTE_MINIMAL,
         escapechar: Optional[str] = "\\",
         lineterminator: str = "\n",
+        delimiter: str = ",",
     ) -> None:
         """Initialise the exporter.
 
@@ -82,11 +120,13 @@ class CSVExporter:
             escapechar: Character used to escape the quote char when doubling
                 is disabled; ``None`` to rely on quote doubling.
             lineterminator: Line terminator to use in the output.
+            delimiter: Field separator (``,`` default; ``\t`` for TSV).
         """
         self.encoding = encoding
         self.quoting = quoting
         self.escapechar = escapechar
         self.lineterminator = lineterminator
+        self.delimiter = delimiter
 
     # ------------------------------------------------------------------
     # Paper-level export
@@ -181,8 +221,13 @@ class CSVExporter:
     def export_citations(self, papers: Sequence[Any], path: str) -> str:
         """Export citation edges as a CSV (columns: citing_doi, cited_doi).
 
-        Each paper's ``cited_by`` / ``references_doi`` attribute is iterated;
-        only edges with both ends resolvable to a DOI are emitted.
+        Each paper's cited references are resolved via
+        :func:`._paper_utils.get_cited_dois`, which understands the raw
+        ``cited_by`` / ``cited_dois`` string/list forms *and* the ORM's
+        ``PaperModel.references`` (a list of ``ReferenceModel`` objects
+        exposing ``.cited_doi``) — previously the canonical ORM shape
+        produced a header-only file (audit 4-i A13).  Only edges with both
+        ends resolvable to a DOI are emitted.
         """
         citing_by_doi: Dict[str, str] = {}
         for p in papers:
@@ -196,26 +241,7 @@ class CSVExporter:
             citing_doi = get_doi(p)
             if not citing_doi:
                 continue
-            cited_refs = get_field(p, "cited_by", default=[]) or []
-            if isinstance(cited_refs, str):
-                cited_refs = [c.strip() for c in cited_refs.replace(",", ";").split(";") if c.strip()]
-            elif not isinstance(cited_refs, (list, tuple)):
-                cited_refs = []
-            for ref in cited_refs:
-                if isinstance(ref, dict):
-                    ref_doi = ref.get("doi") or ref.get("cited_doi") or ref.get("DOI")
-                else:
-                    ref_doi = str(ref).strip()
-                if not ref_doi:
-                    continue
-                # Strip URL prefix.
-                for prefix in ("https://doi.org/", "http://doi.org/", "doi.org/", "doi:"):
-                    if ref_doi.lower().startswith(prefix.lower()):
-                        ref_doi = ref_doi[len(prefix):]
-                        break
-                ref_doi = ref_doi.lower().strip()
-                if not ref_doi:
-                    continue
+            for ref_doi in get_cited_dois(p):
                 edge = (citing_doi, ref_doi)
                 if edge in seen:
                     continue
@@ -262,14 +288,16 @@ class CSVExporter:
                 writer = csv.DictWriter(
                     fh,
                     fieldnames=columns,
+                    delimiter=self.delimiter,
                     quoting=self.quoting,
                     escapechar=self.escapechar,
                     lineterminator=self.lineterminator,
                 )
                 writer.writeheader()
                 for row in rows:
-                    # Coerce all values to strings; None -> "".
-                    out = {k: ("" if row.get(k) is None else row.get(k)) for k in columns}
+                    # Coerce all values to strings, neutralise Excel formula
+                    # injection and strip row-breaking control characters.
+                    out = {k: sanitize_csv_value(row.get(k)) for k in columns}
                     writer.writerow(out)
         except Exception as exc:
             logger.error("CSV write failed -> %s: %s", abs_path, exc, exc_info=True)
@@ -278,4 +306,75 @@ class CSVExporter:
         return abs_path
 
 
-__all__ = ["CSVExporter", "DEFAULT_PAPER_COLUMNS", "DEFAULT_AUTHOR_COLUMNS"]
+# ---------------------------------------------------------------------------
+# Module-level contract wrappers (PATCH CONTRACT #6).
+# ``web/routes/export.py`` and ``ui/dialogs/export_wizard.py`` import these
+# from either the ``reporting`` package or ``reporting.csv_export``.
+# ---------------------------------------------------------------------------
+def _default_export_path(extension: str) -> str:
+    """Timestamped default output path in the CWD when ``path=None``."""
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return os.path.abspath(f"papers_export_{stamp}.{extension}")
+
+
+def export_csv(
+    papers: Sequence[Any],
+    path: Optional[str] = None,
+    columns: Optional[List[str]] = None,
+) -> str:
+    """Contract #6: export ``papers`` to CSV and return the written path.
+
+    A ``.tsv`` target switches the field delimiter to a tab (the web layer
+    hands the same function a ``.tsv`` path for TSV exports).
+    """
+    target = path or _default_export_path("csv")
+    delimiter = "\t" if str(target).lower().endswith(".tsv") else ","
+    exporter = CSVExporter(delimiter=delimiter)
+    return exporter.export(papers, target, columns=columns)
+
+
+def export_xlsx(
+    papers: Sequence[Any],
+    path: Optional[str] = None,
+    columns: Optional[List[str]] = None,
+) -> str:
+    """Contract #6: export ``papers`` to a real ``.xlsx`` workbook.
+
+    Uses ``openpyxl`` (already a declared dependency); every cell goes
+    through the same formula-injection guard as the CSV writer.  Raises
+    ``ImportError`` when openpyxl is unavailable.
+    """
+    try:
+        from openpyxl import Workbook  # noqa: WPS433
+    except ImportError as exc:  # pragma: no cover - optional dep
+        logger.error("openpyxl not installed: %s", exc)
+        raise
+    target = path or _default_export_path("xlsx")
+    cols = list(columns) if columns else list(DEFAULT_PAPER_COLUMNS)
+    exporter = CSVExporter()
+    os.makedirs(os.path.dirname(os.path.abspath(target)) or ".", exist_ok=True)
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "papers"
+    ws.append([c.replace("_", " ").title() for c in cols])
+    for p in papers:
+        row = exporter._paper_to_row(p, cols)
+        ws.append([sanitize_csv_value(row.get(c)) for c in cols])
+    abs_path = os.path.abspath(target)
+    try:
+        wb.save(abs_path)
+    except Exception as exc:
+        logger.error("XLSX write failed -> %s: %s", abs_path, exc, exc_info=True)
+        raise
+    logger.info("XLSX exported -> %s (%d rows)", abs_path, len(papers))
+    return abs_path
+
+
+__all__ = [
+    "CSVExporter",
+    "DEFAULT_PAPER_COLUMNS",
+    "DEFAULT_AUTHOR_COLUMNS",
+    "sanitize_csv_value",
+    "export_csv",
+    "export_xlsx",
+]

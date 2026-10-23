@@ -43,7 +43,7 @@ def _palette(name_or_list: Union[str, Sequence[str]]) -> List[str]:
     return list(name_or_list)
 
 
-def _new_fig(figsize=(6, 4), dpi: int = 120):
+def _new_fig(figsize=(6, 4), dpi: int = 300):
     import matplotlib.pyplot as plt
     return plt.subplots(figsize=figsize, constrained_layout=True, dpi=dpi)
 
@@ -339,18 +339,19 @@ class BibliometricPlots:
         years = list(range(n_years))
         fig, ax = _new_fig(figsize=(8, 4))
         colors = JournalPalettes.NATURE
-        # Streamgraph = stacked area chart, centred vertically.
-        totals = data_arr.sum(axis=0)
-        half_totals = totals / 2.0
-        pos = half_totals.copy()
-        neg = half_totals.copy()
+        # Streamgraph ("silhouette" style): a proper stacked baseline.
+        # Band i spans [baseline + Σ_{j<i} d_j, baseline + Σ_{j≤i} d_j]
+        # with baseline = −total/2, so bands tile the vertical extent
+        # exactly once (the previous formulation drew each band twice
+        # as thick and nested inside each other).
+        cum = np.cumsum(data_arr, axis=0)
+        total = cum[-1]
+        baseline = -total / 2.0
         for i, t in enumerate(topics):
-            upper = pos + data_arr[i]
-            lower = neg - data_arr[i]
-            ax.fill_between(years, lower, upper, color=colors[i % len(colors)],
+            bottom = baseline + (cum[i - 1] if i > 0 else np.zeros(n_years))
+            top = baseline + cum[i]
+            ax.fill_between(years, bottom, top, color=colors[i % len(colors)],
                             alpha=0.7, label=t, linewidth=0.0)
-            pos = upper
-            neg = lower
         ax.set_xlabel("Year")
         ax.set_ylabel("Topic prevalence (centred)")
         ax.set_title("Topic Evolution Streamgraph")

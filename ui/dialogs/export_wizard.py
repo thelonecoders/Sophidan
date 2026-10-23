@@ -127,7 +127,7 @@ class ExportWizard(QDialog):
         self.next_btn = QPushButton("Next ▶")
         self.cancel_btn = QPushButton("Cancel")
         self.export_btn = QPushButton("Export")
-        self.export_btn.setObjectName("PrimaryButton")
+        self.export_btn.setObjectName("PrimaryBtn")
         self.export_btn.setVisible(False)
         btns.addWidget(self.cancel_btn)
         btns.addStretch()
@@ -329,47 +329,55 @@ class ExportWizard(QDialog):
 
     def _on_export(self) -> None:
         config = self._build_config()
+        data = config["data"]
         if not config["output_path"]:
             QMessageBox.warning(self, "Output path required", "Please choose an output file.")
+            return
+        if not data:
+            QMessageBox.warning(
+                self, "No data",
+                "No papers are loaded for export.\n"
+                "Run a search or load a project first.")
             return
         self.progress_bar.setVisible(True)
         self.progress_bar.setValue(0)
         self.export_btn.setEnabled(False)
         self.cancel_btn.setEnabled(False)
 
-        try:
-            from utils.workers import Worker  # type: ignore
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("utils.workers.Worker unavailable, running sync: %s", exc)
-            Worker = None  # type: ignore
+        from utils.workers import Worker, WorkerPool
 
-        def _work() -> Any:
-            return self._invoke_exporter(config)
-
-        if Worker is None:
-            try:
-                path = _work()
-                self._on_export_finished(path, config)
-            except Exception as exc:  # noqa: BLE001
-                self._on_export_error(str(exc))
-            return
+        def _work(progress_callback=None) -> str:
+            report = progress_callback or (lambda pct, msg="": None)
+            report(0, "Exporting…")
+            path = self._invoke_exporter(config)
+            report(100, "Done")
+            return path
 
         self._worker = Worker(_work)
-        for sig_name, slot in (
-            ("progress", self.progress_bar.setValue),
-            ("result", lambda p: self._on_export_finished(p, config)),
-            ("error", self._on_export_error),
-        ):
-            sig = getattr(self._worker, sig_name, None)
-            if sig is not None:
-                try:
-                    sig.connect(slot)
-                except Exception as exc:  # noqa: BLE001
-                    logger.debug("Could not connect %s: %s", sig_name, exc)
-        try:
-            self._worker.start()
-        except Exception as exc:  # noqa: BLE001
-            self._on_export_error(str(exc))
+        self._worker.signals.progress.connect(
+            lambda pct, _c=config: self.progress_bar.setValue(int(pct)))
+        self._worker.signals.result.connect(
+            lambda p, _c=config: self._on_export_finished(p, _c))
+        self._worker.signals.error.connect(self._on_export_error)
+        WorkerPool.instance().submit(self._worker)
+
+    @staticmethod
+    def _load_ris_exporter() -> Any:
+        """Import ``RisExporter`` from wherever the reporting package
+        exposes it (P-g adds it; the module name may vary)."""
+        errors: List[str] = []
+        for module_path in ("reporting.ris_export", "reporting.bibtex_export",
+                            "reporting"):
+            try:
+                module = __import__(module_path, fromlist=["RisExporter"])
+                cls = getattr(module, "RisExporter", None)
+                if cls is not None:
+                    return cls
+            except ImportError as exc:  # noqa: BLE001
+                errors.append(f"{module_path}: {exc}")
+        raise ImportError(
+            "RisExporter is not available in the reporting package. "
+            + "; ".join(errors))
 
     def _invoke_exporter(self, config: Dict[str, Any]) -> str:
         """Dispatch to the appropriate ``reporting.*`` exporter (lazy import)."""
@@ -377,38 +385,44 @@ class ExportWizard(QDialog):
         data = config["data"]
         path = config["output_path"]
         columns = config["columns"]
-        try:
-            if fmt == "csv":
-                from reporting.csv_export import CSVExporter
-                gen = CSVExporter()
-                return gen.export(data, path, columns=columns)
-            if fmt == "json":
-                import json as _json
-                with open(path, "w", encoding="utf-8") as fh:
-                    _json.dump(data, fh, ensure_ascii=False, indent=2)
-                return path
-            if fmt == "bibtex":
-                from reporting.bibtex_export import BibtexExporter
-                gen = BibtexExporter()
-                return gen.export(data, path)
-            if fmt == "ris":
-                from reporting.bibtex_export import RisExporter
-                gen = RisExporter()
-                return gen.export(data, path)
-            if fmt == "excel":
+        papers = list(data or [])
+        if fmt == "csv":
+            from reporting.csv_export import CSVExporter
+            try:
+                return CSVExporter().export(papers, path, columns=columns)
+            except TypeError:
+                return CSVExporter().export(papers, path)
+        if fmt == "json":
+            import json as _json
+            with open(path, "w", encoding="utf-8") as fh:
+                _json.dump(papers, fh, ensure_ascii=False, indent=2, default=str)
+            return path
+        if fmt == "bibtex":
+            from reporting.bibtex_export import BibTeXExporter
+            return BibTeXExporter().export(papers, path)
+        if fmt == "ris":
+            RisExporter = self._load_ris_exporter()
+            exporter = RisExporter()
+            try:
+                return exporter.export(papers, path)
+            except TypeError:
+                return exporter.export(papers, path=path)
+        if fmt == "excel":
+            # Prefer the reporting helper added by the reporting patch.
+            try:
+                from reporting.csv_export import export_xlsx
+                return export_xlsx(papers, path)
+            except Exception:  # noqa: BLE001 — fall back to pandas
                 import pandas as pd
-                df = pd.DataFrame(data) if data is not None else pd.DataFrame()
+                df = pd.DataFrame(papers)
                 df.to_excel(path, index=False)
                 return path
-            if fmt == "parquet":
-                import pandas as pd
-                df = pd.DataFrame(data) if data is not None else pd.DataFrame()
-                df.to_parquet(path, index=False)
-                return path
-        except Exception as exc:  # noqa: BLE001
-            logger.error("Export failed: %s", exc)
-            raise
-        return path
+        if fmt == "parquet":
+            import pandas as pd
+            df = pd.DataFrame(papers)
+            df.to_parquet(path, index=False)
+            return path
+        raise ValueError(f"Unsupported export format: {config['format']!r}")
 
     def _on_export_finished(self, path: Any, config: Dict[str, Any]) -> None:
         self.progress_bar.setValue(100)

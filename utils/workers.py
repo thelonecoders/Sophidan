@@ -25,9 +25,13 @@ from __future__ import annotations
 # Copyright (c) 2026 — see /LICENSE for full text.
 #
 
+import inspect
 import logging
+import threading
 import traceback
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Union
+
+PROGRESS_CALLBACK_PARAMS = ("progress_callback", "progress")
 
 logger = logging.getLogger(__name__)
 
@@ -86,6 +90,46 @@ def _signal(*types: object) -> Any:
     return _StubSignal(*types)
 
 
+def accepts_progress_callback(
+    fn: Callable[..., Any],
+    *names: str,
+) -> bool:
+    """Return ``True`` if ``fn`` can accept a progress-callback keyword.
+
+    This is the SIGNATURE-AWARE check used by :class:`Worker` (and reusable
+    by :mod:`core.task_queue` / :mod:`core.orchestrator`) before injecting a
+    ``progress_callback`` keyword argument. A callable "accepts" it when
+    its signature declares a parameter named ``progress_callback`` (or one
+    of the extra ``names``) as a normal or keyword-only parameter, or when
+    it accepts ``**kwargs``.
+
+    Builtins and C extensions without introspectable signatures return
+    ``False`` (never inject — injection would raise ``TypeError``).
+
+    Args:
+        fn: The callable to inspect.
+        *names: Additional parameter names to accept (defaults to
+            ``progress_callback`` and ``progress``).
+
+    Returns:
+        ``True`` only when injection is safe.
+    """
+    names = names or PROGRESS_CALLBACK_PARAMS
+    try:
+        sig = inspect.signature(fn)
+    except (TypeError, ValueError):  # pragma: no cover - C builtins
+        return False
+    for name, param in sig.parameters.items():
+        if name in names and param.kind in (
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.KEYWORD_ONLY,
+        ):
+            return True
+        if param.kind is inspect.Parameter.VAR_KEYWORD:
+            return True
+    return False
+
+
 # ---------------------------------------------------------------------------
 # WorkerSignals
 # ---------------------------------------------------------------------------
@@ -108,6 +152,15 @@ class WorkerSignals(_QObjectBase):  # type: ignore[misc]
 
     def __init__(self) -> None:
         super().__init__()
+        if not _HAS_QT:
+            # Per-instance stub signals so separate WorkerSignals objects
+            # never share connection state (class-level stubs would be
+            # shared across every instance when Qt is absent).
+            self.started = _signal()
+            self.finished = _signal()
+            self.progress = _signal(int, str)
+            self.error = _signal(str)
+            self.result = _signal(object)
 
 
 # ---------------------------------------------------------------------------
@@ -128,6 +181,20 @@ class Worker(_QRunnableBase):  # type: ignore[misc]
         >>> worker = Worker(long_task)
         >>> worker.signals.result.connect(lambda r: print("result:", r))
         >>> WorkerPool.instance().submit(worker)
+
+    CONTRACT (see worklog "PATCH CONTRACTS" #1):
+
+    * Signals live on ``worker.signals`` (``result`` / ``error`` /
+      ``progress`` / ``finished`` / ``started``). Convenience read-only
+      properties on the worker itself forward to ``worker.signals`` so
+      legacy call sites using ``worker.result.connect(...)`` keep working.
+    * Run workers via ``WorkerPool.instance().submit(worker)`` (or the
+      ``worker.start()`` convenience, which does exactly that). A plain
+      ``QRunnable`` has no Qt ``start()``; this class provides one.
+    * ``progress_callback`` is injected ONLY when the wrapped callable's
+      signature accepts it (see :func:`accepts_progress_callback`) —
+      zero-argument callables are invoked verbatim, never with an
+      unexpected keyword.
     """
 
     def __init__(
@@ -149,10 +216,67 @@ class Worker(_QRunnableBase):  # type: ignore[misc]
         self.args: tuple = args
         self.kwargs: dict = kwargs
         self.signals: WorkerSignals = WorkerSignals()
+        self._cancel_requested: bool = False
 
-        # Inject the progress callback only if the caller did not supply one.
-        if "progress_callback" not in self.kwargs:
+        # SIGNATURE-AWARE injection: only add the kwarg when ``fn`` can
+        # actually accept it, otherwise zero-arg callables would raise
+        # TypeError. An explicit ``progress_callback=`` passed by the caller
+        # is always honoured and never overwritten.
+        if (
+            "progress_callback" not in self.kwargs
+            and "progress" not in self.kwargs
+            and accepts_progress_callback(fn)
+        ):
             self.kwargs["progress_callback"] = self._emit_progress
+
+    # ------------------------------------------------- convenience proxies
+    @property
+    def started(self) -> Any:
+        """Forward to ``self.signals.started`` (legacy call-site shim)."""
+        return self.signals.started
+
+    @property
+    def finished(self) -> Any:
+        """Forward to ``self.signals.finished`` (legacy call-site shim)."""
+        return self.signals.finished
+
+    @property
+    def progress(self) -> Any:
+        """Forward to ``self.signals.progress`` (legacy call-site shim)."""
+        return self.signals.progress
+
+    @property
+    def error(self) -> Any:
+        """Forward to ``self.signals.error`` (legacy call-site shim)."""
+        return self.signals.error
+
+    @property
+    def result(self) -> Any:
+        """Forward to ``self.signals.result`` (legacy call-site shim)."""
+        return self.signals.result
+
+    # ------------------------------------------------------ lifecycle API
+    def start(self) -> None:
+        """Submit this worker to the shared :class:`WorkerPool`.
+
+        ``QRunnable`` has no ``start()``; this convenience submits via
+        ``WorkerPool.instance().submit(self)`` so legacy call sites that
+        call ``worker.start()`` run on the pool instead of raising
+        ``AttributeError``.
+        """
+        WorkerPool.instance().submit(self)
+
+    def cancel(self) -> None:
+        """Request cooperative cancellation (best-effort).
+
+        The wrapped callable is never interrupted; long-running functions
+        can poll :meth:`is_cancelled` between chunks to exit early.
+        """
+        self._cancel_requested = True
+
+    def is_cancelled(self) -> bool:
+        """Return ``True`` after :meth:`cancel` has been requested."""
+        return self._cancel_requested
 
     # ------------------------------------------------------------------ helpers
     def _emit_progress(self, percent: int, message: str = "") -> None:
@@ -213,35 +337,50 @@ class WorkerPool:
     """
 
     _instance: Optional["WorkerPool"] = None
+    _instance_lock = threading.Lock()
 
     def __new__(cls) -> "WorkerPool":
-        if cls._instance is None:
-            cls._instance = super().__new__(cls)
-        return cls._instance
+        with cls._instance_lock:
+            if cls._instance is None:
+                cls._instance = super().__new__(cls)
+            return cls._instance
 
     def __init__(self) -> None:
         if getattr(self, "_initialized", False):
             return
-        if _HAS_QT:
-            try:
-                self._real = QThreadPool.globalInstance()
-            except Exception:  # pragma: no cover - defensive
+        with self._instance_lock:
+            if getattr(self, "_initialized", False):
+                return
+            if _HAS_QT:
+                try:
+                    self._real = QThreadPool.globalInstance()
+                except Exception:  # pragma: no cover - defensive
+                    self._real = None
+            else:
                 self._real = None
-        else:
-            self._real = None
-        self._initialized: bool = True
+            self._initialized: bool = True
 
     @classmethod
     def instance(cls) -> "WorkerPool":
-        """Return the singleton :class:`WorkerPool`."""
+        """Return the singleton :class:`WorkerPool` (thread-safe)."""
         return cls()
 
-    def submit(self, worker: Worker) -> None:
+    def submit(self, worker: Union[Worker, Callable[..., Any]]) -> Optional[Worker]:
         """Submit a :class:`Worker` for asynchronous execution.
 
+        This is the canonical way to run background work (see PATCH
+        CONTRACT #1). A bare callable may also be passed for convenience —
+        it is wrapped in a :class:`Worker` first.
+
         Args:
-            worker: The worker to run.
+            worker: The :class:`Worker` to run, or any callable (wrapped
+                automatically).
+
+        Returns:
+            The :class:`Worker` instance that was scheduled.
         """
+        if not isinstance(worker, Worker):
+            worker = Worker(worker)
         if self._real is not None:
             self._real.start(worker)
         else:
@@ -250,6 +389,7 @@ class WorkerPool:
                 worker.run()
             except Exception as exc:  # pragma: no cover - defensive
                 logger.error("WorkerPool stub caught: %s", exc)
+        return worker
 
     def wait_all(self, timeout_ms: int = -1) -> bool:
         """Block until all queued workers complete.
@@ -327,4 +467,5 @@ __all__ = [
     "Worker",
     "WorkerPool",
     "run_in_background",
+    "accepts_progress_callback",
 ]

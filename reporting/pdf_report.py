@@ -90,6 +90,18 @@ _FONT_CANDIDATES: Dict[str, List[str]] = {
 _FONTS_REGISTERED = False
 _AVAILABLE_FONTS: Dict[str, str] = {}
 
+# ReportLab's 14 core PDF fonts are ALWAYS available (built into every PDF
+# viewer) — they are the bundle-less fallback that keeps builds working on
+# machines without Noto/DejaVu (audit 4-i: the previous _pick_font returned
+# the first *candidate* even when unregistered, crashing every build with
+# "Can't map determine family/bold/italic for notosanssc").
+_BUILTIN_FONTS = {
+    "Helvetica", "Helvetica-Bold", "Helvetica-Oblique", "Helvetica-BoldOblique",
+    "Times-Roman", "Times-Bold", "Times-Italic", "Times-BoldItalic",
+    "Courier", "Courier-Bold", "Courier-Oblique", "Courier-BoldOblique",
+    "Symbol", "ZapfDingbats",
+}
+
 
 def _register_fonts() -> None:
     """Register CJK + symbol fonts with ReportLab (idempotent).
@@ -158,11 +170,21 @@ def _register_fonts() -> None:
 
 
 def _pick_font(*candidates: str) -> str:
-    """Return the first candidate font that was successfully registered."""
+    """Return the first *usable* font name from ``candidates``.
+
+    A name is usable when it was successfully registered by
+    :func:`_register_fonts` OR when it is one of ReportLab's built-in core
+    fonts (always present, bundle-less).  Never returns an unregistered
+    TTF name — that used to crash ``build()`` on machines without the
+    Noto fonts (audit 4-i).
+    """
     for c in candidates:
         if c in _AVAILABLE_FONTS:
             return c
-    return candidates[0]  # fall back to the first name even if not registered.
+        if c in _BUILTIN_FONTS:
+            return c
+    # Absolute fallback: ReportLab core fonts always exist.
+    return "Helvetica"
 
 
 # ---------------------------------------------------------------------------
@@ -212,6 +234,43 @@ def _xml_escape(text: str) -> str:
     s = s.replace("<", "&lt;")
     s = s.replace(">", "&gt;")
     return s
+
+
+def _one_by_one_png_bytes() -> bytes:
+    """Return a valid 1×1 white PNG (PIL when available, stdlib otherwise).
+
+    Used as the add_chart fallback so a broken figure degrades to a
+    blank image instead of crashing the whole PDF build.
+    """
+    try:  # PIL is a declared dependency; prefer it when present.
+        from PIL import Image as PILImage  # noqa: WPS433
+
+        buf = io.BytesIO()
+        img = PILImage.new("RGB", (1, 1), (255, 255, 255))
+        img.save(buf, format="PNG")
+        data = buf.getvalue()
+        if data.startswith(b"\x89PNG"):
+            return data
+    except Exception:  # noqa: BLE001 - fall through to the stdlib builder
+        pass
+    # Hand-rolled minimal PNG: 1×1, 8-bit RGB, single white pixel.
+    import struct
+    import zlib
+
+    def _chunk(tag: bytes, payload: bytes) -> bytes:
+        return (
+            struct.pack(">I", len(payload)) + tag + payload
+            + struct.pack(">I", zlib.crc32(tag + payload) & 0xFFFFFFFF)
+        )
+
+    ihdr = struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0)  # w, h, depth, RGB
+    idat = zlib.compress(b"\x00\xff\xff\xff")  # filter-0 + white RGB pixel
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + _chunk(b"IHDR", ihdr)
+        + _chunk(b"IDAT", idat)
+        + _chunk(b"IEND", b"")
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -619,7 +678,7 @@ class PDFReport:
         self,
         figure: Any,
         caption: Optional[str] = None,
-        width: float = 6 * 1.0,  # 6 * inch passed at call time
+        width: Optional[float] = None,
     ) -> None:
         """Embed a matplotlib Figure as a PNG image.
 
@@ -627,10 +686,16 @@ class PDFReport:
             figure: A ``matplotlib.figure.Figure`` object.
             caption: Optional caption text (italic, centred).
             width: Width in points (use ``reportlab.lib.units.inch``).
+                Defaults to 6 inches (432 pt) — previously the default was
+                ``6 * 1.0`` = 6 POINTS (2.1 mm), rendering charts as a
+                sliver (audit 4-i).
         """
         Image = self._rl["Image"]
         Paragraph = self._rl["Paragraph"]
         Spacer = self._rl["Spacer"]
+
+        if width is None:
+            width = 6.0 * self._rl["inch"]
 
         png_bytes = self._figure_to_png_bytes(figure)
         from io import BytesIO  # local import keeps top-level clean
@@ -655,19 +720,24 @@ class PDFReport:
 
     @staticmethod
     def _figure_to_png_bytes(figure: Any) -> bytes:
-        """Render a matplotlib Figure to PNG bytes."""
+        """Render a matplotlib Figure to PNG bytes.
+
+        On rendering failure a VALID 1×1 white PNG is returned (PIL first,
+        stdlib-crafted otherwise) — the previous fallback wrote an 8-byte
+        PNG *signature* which reportlab rejects with
+        ``UnidentifiedImageError`` at build time (audit 4-i).
+        """
         bio = io.BytesIO()
         try:
             # constrained_layout=True is set by ChartGenerator; never call
             # bbox_inches='tight' on top of it.
             figure.savefig(bio, format="png", dpi=150)
+            if bio.getvalue():
+                return bio.getvalue()
+            logger.warning("figure.savefig produced empty output; using placeholder")
         except Exception as exc:
             logger.warning("figure.savefig failed: %s", exc, exc_info=True)
-            # Fall back to an empty 1x1 PNG so build() doesn't crash.
-            from reportlab.lib.utils import ImageReader  # noqa: WPS433
-            del ImageReader
-            bio.write(b"\x89PNG\r\n\x1a\n")
-        return bio.getvalue()
+        return _one_by_one_png_bytes()
 
     # ------------------------------------------------------------------
     # Citation graph image

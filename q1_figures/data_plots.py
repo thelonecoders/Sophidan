@@ -391,6 +391,22 @@ class Q1DataPlots:
             max_abs = np.nanmax(np.abs(mat)) or 1.0
             vmin = vmin if vmin is not None else -max_abs
             vmax = vmax if vmax is not None else max_abs
+        # Guard: derive missing colour limits from the data so the
+        # annotation contrast computation below can never see ``None``.
+        if vmin is None or vmax is None:
+            try:
+                mfloat = mat.astype(float)
+                finite = mfloat[np.isfinite(mfloat)]
+            except (TypeError, ValueError):  # pragma: no cover - non-numeric
+                finite = np.asarray([])
+            lo = float(finite.min()) if finite.size else 0.0
+            hi = float(finite.max()) if finite.size else 1.0
+            if vmin is None:
+                vmin = lo
+            if vmax is None:
+                vmax = hi
+            if vmax <= vmin:
+                vmax = vmin + (abs(vmin) or 1.0)
         im = ax.imshow(mat, cmap=cmap, vmin=vmin, vmax=vmax, aspect="auto")
         n_rows, n_cols = mat.shape
         if row_labels is not None:
@@ -400,10 +416,11 @@ class Q1DataPlots:
             ax.set_xticks(range(n_cols))
             ax.set_xticklabels(col_labels, fontsize=7, rotation=45, ha="right")
         if annotate_cells:
+            span = (vmax - vmin) or 1.0
             for i in range(n_rows):
                 for j in range(n_cols):
                     v = mat[i, j]
-                    color = "white" if abs(v - (vmin or 0)) > abs(vmax - vmin or 1) * 0.6 else "#222222"
+                    color = "white" if abs(v - vmin) > span * 0.6 else "#222222"
                     ax.text(j, i, format(v, fmt), ha="center", va="center",
                             fontsize=6, color=color)
         if show_colorbar:

@@ -29,10 +29,13 @@ from typing import Any, List, Optional
 
 from qtpy.QtCore import Qt, Signal
 from qtpy.QtWidgets import (
-    QButtonGroup, QComboBox, QFileDialog, QFrame, QGridLayout, QGroupBox,
-    QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QPushButton,
+    QApplication, QButtonGroup, QComboBox, QFileDialog, QFrame, QGridLayout,
+    QGroupBox, QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QPushButton,
     QSizePolicy, QSplitter, QVBoxLayout, QWidget,
 )
+
+
+from ui.modern_theme import ModernTheme
 
 logger = logging.getLogger(__name__)
 
@@ -189,6 +192,15 @@ class BibliometricDashboard(QWidget):
         self._build_timeline(bottom_lay)
         outer.addWidget(bottom, stretch=0)
 
+        # --- Status line ---------------------------------------------
+        # Surfaces empty-corpus hints and analysis errors that were
+        # previously only logged.
+        self.status_label = QLabel("Ready — bind papers via set_papers().", self)
+        self.status_label.setWordWrap(True)
+        self.status_label.setStyleSheet(
+            f"color:{ModernTheme.DARK_TEXT_MUTED}; font-size:8pt;")
+        outer.addWidget(self.status_label)
+
         # --- Connect signals ---------------------------------------
         self.btn_compute_indices.clicked.connect(self._on_compute_indices)
         self.btn_vos_map.clicked.connect(self._on_vos_map)
@@ -209,7 +221,7 @@ class BibliometricDashboard(QWidget):
                 self,
             )
             placeholder.setAlignment(Qt.AlignCenter)
-            placeholder.setStyleSheet("color:#94A3B8;")
+            placeholder.setStyleSheet(f"color:{ModernTheme.DARK_TEXT_MUTED};")
             layout.addWidget(placeholder)
 
     def _build_timeline(self, layout: QVBoxLayout) -> None:
@@ -238,80 +250,124 @@ class BibliometricDashboard(QWidget):
         self._refresh_metric_cards()
         self._refresh_timeline()
         self._refresh_top_list()
+        self._set_status(f"{len(self._papers)} paper(s) bound.")
 
     def papers(self) -> List[Any]:
         """Return the currently bound paper corpus."""
         return list(self._papers)
 
+    # ----------------------------------------------------------------- Helpers
+    def _set_status(self, message: str, is_error: bool = False) -> None:
+        """Show a user-visible status/error line at the bottom of the page."""
+        if hasattr(self, "status_label") and self.status_label is not None:
+            self.status_label.setStyleSheet(
+                f"color:{ModernTheme.DANGER if is_error else ModernTheme.DARK_TEXT_MUTED}; "
+                "font-size:8pt;")
+            self.status_label.setText(message)
+        if is_error:
+            logger.error("%s", message)
+        else:
+            logger.info("%s", message)
+
+    @staticmethod
+    def _busy() -> Any:
+        """Context manager applying a wait cursor for the wrapped block."""
+        from contextlib import contextmanager
+
+        @contextmanager
+        def _ctx():
+            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+            try:
+                yield
+            finally:
+                QApplication.restoreOverrideCursor()
+        return _ctx()
+
     # ----------------------------------------------------------------- Slots
     def _on_compute_indices(self) -> None:
         """Run ``PoPIndices.compute_all`` on the bound paper corpus."""
         if not self._papers:
-            logger.info("No papers bound — cannot compute indices.")
+            self._set_status("No papers loaded — run a search and add papers "
+                             "to the library first.", is_error=True)
             return
         self.analysis_started.emit("indices")
         try:
-            from bibliometrics.pop_indices import PoPIndices
-            citations = [
-                int(getattr(p, "citations_count", 0) or 0)
-                for p in self._papers
-            ]
-            years = [getattr(p, "year", None) for p in self._papers]
-            years = [int(y) for y in years if y] or None
-            result = PoPIndices().compute_all(citations, years=years)
+            with self._busy():
+                from bibliometrics.pop_indices import PoPIndices
+                citations = [
+                    int(getattr(p, "citations_count", 0) or 0)
+                    for p in self._papers
+                ]
+                years = [getattr(p, "year", None) for p in self._papers]
+                years = [int(y) for y in years if y] or None
+                result = PoPIndices().compute_all(citations, years=years)
             self._last_result = {"indices": result}
             self._refresh_metric_cards(result)
             self.analysis_completed.emit(result)
+            self._set_status("Indices computed for "
+                             f"{len(self._papers)} papers.")
         except Exception as exc:
             logger.exception("Compute indices failed: %s", exc)
             self.analysis_completed.emit({})
+            self._set_status(f"Compute indices failed: {exc}", is_error=True)
 
     def _on_vos_map(self) -> None:
         """Build a VOSviewer-style network for the selected analysis type."""
         if not self._papers:
-            logger.info("No papers bound — cannot build VOS map.")
+            self._set_status("No papers loaded — run a search and add papers "
+                             "to the library first.", is_error=True)
             return
         kind = self.analysis_combo.currentText()
         self.analysis_started.emit(f"vos:{kind}")
         try:
-            from bibliometrics.vosviewer import VOSAnalyzer
-            analyzer = VOSAnalyzer()
-            graph = None
-            if kind == "Bibliographic Coupling":
-                graph = analyzer.bibliographic_coupling(self._papers)
-            elif kind == "Co-citation":
-                graph = analyzer.co_citation_analysis(self._papers)
-            elif kind == "Co-authorship":
-                graph = analyzer.co_authorship_analysis(self._papers)
-            elif kind == "Term Co-occurrence":
-                graph = analyzer.term_co_occurrence(self._papers)
-            elif kind == "Citation Bursts":
-                # Bursts tab — delegate to the bursts button.
-                self._on_detect_bursts()
-                return
-            if graph is not None and self._canvas is not None:
-                self._canvas.set_graph(graph)
+            with self._busy():
+                from bibliometrics.vosviewer import VOSAnalyzer
+                analyzer = VOSAnalyzer()
+                graph = None
+                if kind == "Bibliographic Coupling":
+                    graph = analyzer.bibliographic_coupling(self._papers)
+                elif kind == "Co-citation":
+                    graph = analyzer.co_citation_analysis(self._papers)
+                elif kind == "Co-authorship":
+                    graph = analyzer.co_authorship_analysis(self._papers)
+                elif kind == "Term Co-occurrence":
+                    graph = analyzer.term_co_occurrence(self._papers)
+                elif kind == "Citation Bursts":
+                    # Bursts tab — delegate to the bursts button.
+                    self._on_detect_bursts()
+                    return
+                if graph is not None and self._canvas is not None:
+                    self._canvas.set_graph(graph)
             self._last_result["vos_graph"] = kind
-            self.analysis_completed.emit({"vos": kind, "nodes": graph.number_of_nodes() if graph else 0})
+            self.analysis_completed.emit(
+                {"vos": kind,
+                 "nodes": graph.number_of_nodes() if graph else 0})
+            nodes = graph.number_of_nodes() if graph is not None else 0
+            self._set_status(f"{kind} map built — {nodes} nodes.")
         except Exception as exc:
             logger.exception("VOS map failed: %s", exc)
             self.analysis_completed.emit({})
+            self._set_status(f"VOS map failed: {exc}", is_error=True)
 
     def _on_detect_bursts(self) -> None:
         """Run CiteSpace citation-burst detection over the corpus."""
         if not self._papers:
-            logger.info("No papers bound — cannot detect bursts.")
+            self._set_status("No papers loaded — run a search and add papers "
+                             "to the library first.", is_error=True)
             return
         self.analysis_started.emit("bursts")
         try:
-            from bibliometrics.citespace import CiteSpaceAnalyzer
-            analyzer = CiteSpaceAnalyzer()
-            bursts = analyzer.detect_citation_bursts(self._papers)
-            bursts_dicts = []
-            try:
-                bursts_dicts = [b.to_dict() if hasattr(b, "to_dict") else dict(b) for b in bursts]
-            except Exception:
+            with self._busy():
+                from bibliometrics.citespace import CiteSpaceAnalyzer
+                analyzer = CiteSpaceAnalyzer()
+                bursts = analyzer.detect_citation_bursts(self._papers)
                 bursts_dicts = []
+                try:
+                    bursts_dicts = [
+                        b.to_dict() if hasattr(b, "to_dict") else dict(b)
+                        for b in bursts]
+                except Exception:
+                    bursts_dicts = []
             self._last_result["bursts"] = bursts_dicts
             self.burst_detected.emit(bursts_dicts)
             self.analysis_completed.emit({"bursts": len(bursts_dicts)})
@@ -322,10 +378,13 @@ class BibliometricDashboard(QWidget):
                 f"strength={b.get('strength', 0):.2f})"
                 for b in bursts_dicts[:10]
             ])
+            self._set_status(
+                f"Burst detection finished — {len(bursts_dicts)} burst(s).")
         except Exception as exc:
             logger.exception("Burst detection failed: %s", exc)
             self.burst_detected.emit([])
             self.analysis_completed.emit({})
+            self._set_status(f"Burst detection failed: {exc}", is_error=True)
 
     def _on_export_report(self) -> None:
         """Export the latest analysis result as a JSON file."""

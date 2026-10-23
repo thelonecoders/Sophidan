@@ -215,7 +215,7 @@ class AdvancedSearchDialog(QDialog):
         bottom.addStretch()
         self.cancel_button = QPushButton("Cancel")
         self.start_button = QPushButton("Start Advanced Search")
-        self.start_button.setObjectName("PrimaryButton")
+        self.start_button.setObjectName("PrimaryBtn")
         bottom.addWidget(self.cancel_button)
         bottom.addWidget(self.start_button)
         layout.addLayout(bottom)

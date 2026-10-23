@@ -71,36 +71,41 @@ class PRISMAItem:
 
 
 # ---------------------------------------------------------------------------
-# The official PRISMA 2020 27 items.
+# The official PRISMA 2020 27 items (Page MJ et al., BMJ 2021;372:n71).
+#
+# Numbering follows the official checklist exactly: 27 numbered items,
+# several of which carry lettered sub-items (10a-b, 13a-f, 16a-b, 20a-d,
+# 23a-d, 24a-c, 27a-c). Sub-items are folded into ``item_text`` so the
+# 27-item numbered structure is preserved one-to-one.
 # ---------------------------------------------------------------------------
 _DEFAULT_2020_ITEMS: List[PRISMAItem] = [
-    PRISMAItem(1,  "Title",        "Identify the report as a systematic review."),
-    PRISMAItem(2,  "Abstract",     "See PRISMA 2020 for Abstracts checklist."),
-    PRISMAItem(3,  "Introduction", "Describe the rationale for the review in the context of existing knowledge."),
-    PRISMAItem(4,  "Introduction", "Provide an explicit statement of the objective(s) or question(s) the review addresses."),
-    PRISMAItem(5,  "Methods",      "Indicate whether a review protocol exists and where it can be accessed (registration number, URL)."),
-    PRISMAItem(6,  "Methods",      "Specify the inclusion and exclusion criteria with justification."),
-    PRISMAItem(7,  "Methods",      "Specify all information sources (e.g. databases, registers) and the date of last search."),
-    PRISMAItem(8,  "Methods",      "Present the full search strategies for all databases, registers, and websites, including any filters and limits."),
-    PRISMAItem(9,  "Methods",      "Specify the methods used to decide whether a study was eligible for inclusion, including how many reviewers screened each record and whether processes were completed independently."),
-    PRISMAItem(10, "Methods",      "Specify the methods used to collect data from reports, including how many reviewers collected data from each report and whether processes were completed independently."),
-    PRISMAItem(11, "Methods",      "List and define all outcomes for which data were sought. Specify whether and how data were sought for individual studies or for summary data."),
-    PRISMAItem(12, "Methods",      "Specify the methods used to assess risk of bias in the included studies, including the tool(s) used and how the tool(s) were implemented."),
-    PRISMAItem(13, "Methods",      "Specify for each outcome the effect measure(s) (e.g. risk ratio, mean difference) used in the synthesis."),
-    PRISMAItem(14, "Methods",      "Describe the processes used to decide which studies were eligible for each synthesis, the order of data presentation, and any methods used to combine results of studies."),
-    PRISMAItem(15, "Methods",      "Describe any methods used to assess risk of bias due to missing results in a synthesis (arising from reporting biases)."),
-    PRISMAItem(16, "Methods",      "Describe any methods used to assess certainty (or confidence) in the body of evidence for an outcome."),
-    PRISMAItem(17, "Results",      "Describe the results of the search and selection process, ideally with a flow diagram."),
-    PRISMAItem(18, "Results",      "Cite studies that provided data. Present the key characteristics of the included studies (e.g. study design, participants, exposure/intervention, outcomes)."),
-    PRISMAItem(19, "Results",      "Present assessments of risk of bias for each included study."),
-    PRISMAItem(20, "Results",      "For all outcomes, present for each study: summary statistics for each group and an effect estimate with its precision."),
-    PRISMAItem(21, "Results",      "For each synthesis, briefly summarise the characteristics and risk of bias among the studies contributing to that synthesis."),
-    PRISMAItem(22, "Results",      "Present assessments of risk of bias due to missing results in a synthesis."),
-    PRISMAItem(23, "Results",      "Present assessments of certainty (or confidence) in the body of evidence for each outcome assessed."),
-    PRISMAItem(24, "Discussion",   "Provide a general interpretation of the results in the context of other evidence."),
-    PRISMAItem(25, "Discussion",   "Discuss any limitations of the evidence included in the review."),
-    PRISMAItem(26, "Discussion",   "Discuss any limitations of the review processes used."),
-    PRISMAItem(27, "Discussion",   "Provide a general interpretation of the results and important implications for future research and practice. Note registration and protocol availability."),
+    PRISMAItem(1, "Title", "Title: Identify the report as a systematic review."),
+    PRISMAItem(2, "Abstract", "Abstract: See the PRISMA 2020 for Abstracts checklist."),
+    PRISMAItem(3, "Introduction", "Rationale: Describe the rationale for the review in the context of existing knowledge."),
+    PRISMAItem(4, "Introduction", "Objectives: Provide an explicit statement of the objective(s) or question(s) the review addresses."),
+    PRISMAItem(5, "Methods", "Eligibility criteria: Specify the inclusion and exclusion criteria for the review and how studies were grouped for the syntheses."),
+    PRISMAItem(6, "Methods", "Information sources: Specify all databases, registers, websites, reference lists, citation searching and other sources searched or consulted to identify studies. Specify the date when each source was last searched or consulted."),
+    PRISMAItem(7, "Methods", "Search strategy: Present the full search strategies for all databases, registers and websites, including any filters and limits used."),
+    PRISMAItem(8, "Methods", "Selection process: Specify the methods used to decide whether a study met the inclusion criteria of the review, including how many reviewers screened each record and each report retrieved, whether they worked independently, and if applicable, details of automation tools used in the process."),
+    PRISMAItem(9, "Methods", "Data collection process: Specify the methods used to collect data from reports, including how many reviewers collected data from each report, whether they worked independently, any processes for obtaining or confirming data from study investigators, and if applicable, details of automation tools used in the process."),
+    PRISMAItem(10, "Methods", "Data items: 10a. List and define all outcomes for which data were sought. Specify whether all results that were compatible with each outcome domain in each study were sought (e.g. for all measures, time points, analyses), and if not, the methods used to decide which results would be collected. 10b. List and define all other variables for which data were sought (e.g. participant and intervention characteristics, funding sources). Describe any assumptions made about any missing or unclear values."),
+    PRISMAItem(11, "Methods", "Study risk of bias assessment: Specify the methods used to assess risk of bias in the included studies, including details of the tools used, how many reviewers were involved, whether they worked independently, and if applicable, details of automation tools used in the process."),
+    PRISMAItem(12, "Methods", "Effect measures: Specify for each outcome the effect measure(s) (e.g. risk ratio, mean difference) used in the synthesis or presentation of results."),
+    PRISMAItem(13, "Methods", "Synthesis methods: 13a. Describe the processes used to decide which studies were eligible for each synthesis or meta-analysis. 13b. Describe any methods required to prepare the data for presentation or synthesis, such as handling of missing summary statistics, data transformations, or calculations. 13c. Describe any methods used to tabulate or visually display results of individual studies and syntheses. 13d. Describe any methods used to synthesize results and provide a rationale for the choice(s). If meta-analysis was performed, describe the model(s), method(s) to identify the presence and extent of statistical heterogeneity, and software package(s) used. 13e. Describe any methods used to explore possible causes of heterogeneity among study results (e.g. subgroup analysis, meta-regression). 13f. Describe any sensitivity analyses conducted to assess robustness of the synthesized results."),
+    PRISMAItem(14, "Methods", "Reporting bias assessment: Describe methods used to assess risk of bias due to missing results in a synthesis (arising from reporting biases)."),
+    PRISMAItem(15, "Methods", "Certainty assessment: Describe any methods used to assess certainty (or confidence) in the body of evidence for an outcome."),
+    PRISMAItem(16, "Results", "Study selection: 16a. Describe the results of the search and selection process, from the number of records identified in the search to the number of studies included in the review, ideally using a flow diagram. 16b. Cite studies that might appear to meet the inclusion criteria but that were excluded, and explain why they were excluded."),
+    PRISMAItem(17, "Results", "Study characteristics: Cite each study included in the review and present its characteristics."),
+    PRISMAItem(18, "Results", "Risk of bias in studies: Present assessments of risk of bias for each included study."),
+    PRISMAItem(19, "Results", "Results of individual studies: For all outcomes, present, for each study: (a) simple summary data for each intervention group and (b) effect estimates and a measure of precision (e.g. confidence interval)."),
+    PRISMAItem(20, "Results", "Results of syntheses: 20a. For each synthesis, briefly summarise the characteristics and risk of bias among contributing studies. 20b. Present results of all statistical analyses performed for each synthesis. If meta-analysis was done, present for each synthesis: the consistency effect estimate and its precision (e.g. confidence/credible interval); statistical heterogeneity measures such as I²; and results of any assessments of the statistical assumptions underpinning the synthesis method. 20c. Present results of all investigations of possible causes of heterogeneity among study results (e.g. subgroup analyses, meta-regression). 20d. Present results of all sensitivity analyses conducted to assess the robustness of the synthesized results."),
+    PRISMAItem(21, "Results", "Reporting biases: Present assessments of risk of bias due to missing results (arising from reporting biases) for each synthesis assessed."),
+    PRISMAItem(22, "Results", "Certainty of evidence: Present, for each outcome assessed, the certainty of evidence for that outcome."),
+    PRISMAItem(23, "Discussion", "Discussion: 23a. Provide a general interpretation of the results in the context of other evidence. 23b. Discuss any limitations of the evidence included in the review. 23c. Discuss any limitations of the review processes used. 23d. Discuss implications of the results for practice, policy, and future research."),
+    PRISMAItem(24, "Other", "Registration and protocol: 24a. Provide registration information for the review, including register name and registration number, or state that the review was not registered. 24b. Indicate where the review protocol can be accessed, or state that a protocol was not prepared. 24c. Describe and explain any amendments to information provided at registration or in the protocol."),
+    PRISMAItem(25, "Other", "Support: Describe sources of financial or non-financial support for the review, and the role of the funders or sponsors in the review."),
+    PRISMAItem(26, "Other", "Competing interests: Declare any competing interests of review authors."),
+    PRISMAItem(27, "Other", "Availability of data, code and other materials: 27a. Indicate which of the following are publicly available and where they can be found: template data collection forms; data extracted from included studies; data used for all analyses; analytic code; any other materials used in the review. 27b. Indicate which of the following, if any, are available on request and how they can be obtained: template data collection forms; data extracted from included studies; data used for all analyses; analytic code; any other materials used in the review. 27c. Indicate whether the review data or code are available and how they can be accessed (e.g. repository, supplementary appendix)."),
 ]
 
 

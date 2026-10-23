@@ -31,6 +31,7 @@ from qtpy.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QHeaderView,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QListWidget,
@@ -47,6 +48,9 @@ from qtpy.QtWidgets import (
     QWidget,
 )
 
+
+from ui.modern_theme import ModernTheme
+
 logger = logging.getLogger(__name__)
 
 
@@ -55,6 +59,48 @@ def _configure_matplotlib() -> None:
     import matplotlib.pyplot as plt  # lazy
     plt.rcParams["font.sans-serif"] = ["Noto Sans SC", "DejaVu Sans"]
     plt.rcParams["axes.unicode_minus"] = False
+
+
+def _as_record(obj: Any) -> Dict[str, Any]:
+    """Coerce a ProjectManager/SnapshotManager record into a plain dict.
+
+    ``ProjectManager`` returns :class:`Project` dataclasses and raw
+    ``PaperModel`` rows (not dicts), and ``SnapshotManager`` returns
+    :class:`Snapshot` dataclasses — all of which lack ``.get()``.  This
+    helper normalises every shape (dict / dataclass with ``to_dict`` /
+    attribute-bearing object) so the UI code can use dict access safely.
+    """
+    if obj is None:
+        return {}
+    if isinstance(obj, dict):
+        return dict(obj)
+    to_dict = getattr(obj, "to_dict", None)
+    if callable(to_dict):
+        try:
+            data = to_dict()
+            if isinstance(data, dict):
+                return dict(data)
+        except Exception:  # noqa: BLE001 — fall through to attrs
+            logger.debug("%s.to_dict() failed", type(obj).__name__,
+                         exc_info=True)
+    keys = ("id", "name", "description", "color", "created", "created_at",
+            "updated", "updated_at", "label", "year", "title", "doi",
+            "journal", "source", "abstract", "paper_count", "paper_ids",
+            "citations_count", "entry_type", "url")
+    out: Dict[str, Any] = {}
+    for key in keys:
+        try:
+            val = getattr(obj, key, None)
+        except Exception:  # noqa: BLE001 — detached SQLA instances etc.
+            val = None
+        if val is not None and not key in out:
+            out[key] = val
+    # Tolerate aliases the managers use.
+    if "created" not in out and out.get("created_at") is not None:
+        out["created"] = out["created_at"]
+    if "label" not in out and out.get("name") is not None:
+        out["label"] = out["name"]
+    return out
 
 
 class ProjectExplorer(QWidget):
@@ -171,7 +217,7 @@ class ProjectExplorer(QWidget):
         self.snapshot_button = QPushButton("Create Snapshot")
         self.compare_button = QPushButton("Compare With…")
         self.delete_button = QPushButton("Delete Project")
-        self.delete_button.setStyleSheet("color:#d62728;")
+        self.delete_button.setObjectName("DangerBtn")
         for btn in (self.rename_apply, self.save_desc, self.set_color,
                     self.snapshot_button, self.compare_button, self.delete_button):
             right_layout.addWidget(btn)
@@ -203,7 +249,7 @@ class ProjectExplorer(QWidget):
         self._comp_ax.set_axis_off()
         self._comp_ax.text(0.5, 0.5, "Select two projects to compare",
                            ha="center", va="center",
-                           transform=self._comp_ax.transAxes, color="#888")
+                           transform=self._comp_ax.transAxes, color=ModernTheme.DARK_TEXT_MUTED)
         self._comp_canvas = FigureCanvasQTAgg(self._comp_figure)
         layout.addWidget(self._comp_canvas)
 
@@ -228,7 +274,9 @@ class ProjectExplorer(QWidget):
         if self._manager is None:
             try:
                 from project_management.project_manager import ProjectManager
-                self._manager = ProjectManager()
+                from database.connection import DatabaseConnection
+                # ProjectManager requires a database handle.
+                self._manager = ProjectManager(DatabaseConnection())
             except Exception as exc:  # noqa: BLE001
                 logger.warning("ProjectManager not available: %s", exc)
                 self._manager = None
@@ -246,13 +294,17 @@ class ProjectExplorer(QWidget):
         except Exception as exc:  # noqa: BLE001
             logger.warning("list_projects failed: %s", exc)
             projects = []
+        # list_projects() returns Project dataclasses — normalise to dicts.
+        records = [_as_record(p) for p in (projects or [])]
         self.tree.clear()
         self.compare_combo.clear()
         self.compare_combo.addItem("—")
-        for p in projects:
+        for p in records:
             name = str(p.get("name", p.get("id", "?")))
-            count = str(p.get("paper_count", p.get("papers", 0)))
-            modified = str(p.get("last_modified", p.get("modified", "")))
+            count = str(len(p.get("paper_ids", [])) or
+                        p.get("paper_count", 0))
+            modified = str(p.get("updated_at", p.get("updated", "")))
+            modified = modified[:10] if modified and modified != "None" else "—"
             item = QTreeWidgetItem([name, count, modified])
             item.setData(0, Qt.ItemDataRole.UserRole, p)
             color = p.get("color")
@@ -279,22 +331,30 @@ class ProjectExplorer(QWidget):
         if manager is None:
             return
         try:
-            papers = manager.list_papers(project.get("id") or project.get("name"))
+            # The real API is ``get_papers(project_id)`` (``list_papers``
+            # does not exist on ProjectManager); it returns raw PaperModel
+            # rows, which are normalised to dicts for the table.
+            papers = manager.get_papers(project.get("id") or project.get("name"))
         except Exception as exc:  # noqa: BLE001
-            logger.warning("list_papers failed: %s", exc)
+            logger.warning("get_papers failed: %s", exc)
             papers = []
-        if not papers:
+        records = [_as_record(p) for p in (papers or [])]
+        if not records:
             self.papers_table.setRowCount(0)
             self.papers_table.setColumnCount(0)
             return
-        headers = list(papers[0].keys()) if papers else []
-        self.papers_table.setRowCount(len(papers))
+        headers = [k for k in ("title", "authors", "year", "journal",
+                               "doi", "source", "citations_count")
+                   if any(k in rec for rec in records[:20])]
+        if not headers:
+            headers = sorted({k for rec in records[:10] for k in rec})[:8]
+        self.papers_table.setRowCount(len(records))
         self.papers_table.setColumnCount(len(headers))
         self.papers_table.setHorizontalHeaderLabels(headers)
-        for r, paper in enumerate(papers):
+        for r, paper in enumerate(records):
             for c, key in enumerate(headers):
                 self.papers_table.setItem(
-                    r, c, QTableWidgetItem(str(paper.get(key, "")))
+                    r, c, QTableWidgetItem(str(paper.get(key, "") or ""))
                 )
 
     def _load_snapshots(self, project: Dict[str, Any]) -> None:
@@ -306,10 +366,12 @@ class ProjectExplorer(QWidget):
         except Exception as exc:  # noqa: BLE001
             logger.warning("list_snapshots failed: %s", exc)
             snapshots = []
-        self._snapshots = list(snapshots) if snapshots else []
+        # list_snapshots() returns Snapshot dataclasses — normalise to dicts.
+        self._snapshots = [_as_record(s) for s in (snapshots or [])]
         self.snapshots_list.clear()
         for snap in self._snapshots:
-            label = f"{snap.get('created', '')} — {snap.get('label', 'snapshot')}"
+            created = str(snap.get("created", "") or "")
+            label = f"{created[:16]} — {snap.get('label', 'snapshot')}"
             item = QListWidgetItem(label)
             item.setData(Qt.ItemDataRole.UserRole, snap)
             self.snapshots_list.addItem(item)
@@ -319,13 +381,24 @@ class ProjectExplorer(QWidget):
     def _on_new_project(self) -> None:
         manager = self._get_manager()
         if manager is None:
+            QMessageBox.warning(
+                self, "New Project",
+                "The project manager is unavailable in this build.")
+            return
+        name, ok = QInputDialog.getText(
+            self, "New Project", "Project name:")
+        if not ok or not name.strip():
             return
         try:
-            new = manager.create_project()
+            # ``create_project`` requires a name (real API); it returns a
+            # Project dataclass — normalise to a dict for the id lookup.
+            new = manager.create_project(name.strip())
             self.refresh()
             if new:
-                self.project_selected.emit(str(new.get("id", "")))
+                new_id = _as_record(new).get("id", "")
+                self.project_selected.emit(str(new_id))
         except Exception as exc:  # noqa: BLE001
+            logger.exception("create_project failed.")
             QMessageBox.critical(self, "New Project", f"Failed: {exc}")
 
     def _on_import_project(self) -> None:
@@ -334,21 +407,19 @@ class ProjectExplorer(QWidget):
         )
         if not path:
             return
-        manager = self._get_manager()
-        if manager is None:
-            return
-        try:
-            manager.import_project(path)
-            self.refresh()
-        except Exception as exc:  # noqa: BLE001
-            QMessageBox.critical(self, "Import Project", f"Failed: {exc}")
+        # ProjectManager has no import API — surface a visible no-op.
+        QMessageBox.information(
+            self, "Import Project",
+            "Project import is not supported yet.\n"
+            f"Selected file: {path}\n\n"
+            "Tip: use “New Project” and re-run the searches instead.")
 
     def _on_export_project(self) -> None:
         if self._current_project_id is None:
             QMessageBox.information(self, "Export Project", "Select a project first.")
             return
         path, _ = QFileDialog.getSaveFileName(
-            self, "Export Project", "project.zip", "Project archive (*.zip *.json)"
+            self, "Export Project", "project.json", "Project JSON (*.json)"
         )
         if not path:
             return
@@ -356,8 +427,19 @@ class ProjectExplorer(QWidget):
         if manager is None:
             return
         try:
-            manager.export_project(self._current_project_id, path)
+            # Compose the archive manually from the real APIs (Project and
+            # PaperModel objects are normalised to JSON-safe dicts).
+            import json
+            project = _as_record(manager.get_project(self._current_project_id))
+            papers = [_as_record(p)
+                      for p in (manager.get_papers(self._current_project_id) or [])]
+            payload = {"project": project, "papers": papers}
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump(payload, fh, ensure_ascii=False, indent=2, default=str)
+            QMessageBox.information(
+                self, "Export Project", f"Exported to {path}")
         except Exception as exc:  # noqa: BLE001
+            logger.exception("Project export failed.")
             QMessageBox.critical(self, "Export Project", f"Failed: {exc}")
 
     def _on_rename(self) -> None:
@@ -383,8 +465,14 @@ class ProjectExplorer(QWidget):
         if manager is None:
             return
         try:
-            manager.set_description(self._current_project_id, self.desc_edit.toPlainText())
+            # The real API is ``update_project(id, payload)``.
+            manager.update_project(
+                self._current_project_id,
+                {"description": self.desc_edit.toPlainText()},
+            )
+            QMessageBox.information(self, "Description", "Description saved.")
         except Exception as exc:  # noqa: BLE001
+            logger.exception("update_project(description) failed.")
             QMessageBox.critical(self, "Description", f"Failed: {exc}")
 
     def _on_pick_color(self) -> None:
@@ -397,14 +485,19 @@ class ProjectExplorer(QWidget):
             return
         color = getattr(self, "_pending_color", None)
         if not color:
+            QMessageBox.information(
+                self, "Color", "Pick a color first.")
             return
         manager = self._get_manager()
         if manager is None:
             return
         try:
-            manager.set_color(self._current_project_id, color)
+            # The real API is ``update_project(id, payload)``.
+            manager.update_project(
+                self._current_project_id, {"color": color})
             self.refresh()
         except Exception as exc:  # noqa: BLE001
+            logger.exception("update_project(color) failed.")
             QMessageBox.critical(self, "Color", f"Failed: {exc}")
 
     def _on_create_snapshot(self) -> None:
@@ -414,11 +507,17 @@ class ProjectExplorer(QWidget):
         if manager is None:
             return
         try:
-            snap = manager.create_snapshot(self._current_project_id, label="manual")
+            try:
+                snap = manager.create_snapshot(
+                    self._current_project_id, {"label": "manual"})
+            except TypeError:
+                snap = manager.create_snapshot(self._current_project_id)
             if snap:
-                self._snapshots.insert(0, snap)
+                self._snapshots.insert(0, snap if isinstance(snap, dict)
+                                       else {"id": str(snap), "label": "manual"})
                 self._load_snapshots({"id": self._current_project_id})
         except Exception as exc:  # noqa: BLE001
+            logger.exception("create_snapshot failed.")
             QMessageBox.critical(self, "Snapshot", f"Failed: {exc}")
 
     def _on_compare(self) -> None:
@@ -455,19 +554,14 @@ class ProjectExplorer(QWidget):
         snap = item.data(Qt.ItemDataRole.UserRole)
         if not snap or self._current_project_id is None:
             return
-        manager = self._get_manager()
-        if manager is None:
-            return
-        try:
-            manager.restore_snapshot(
-                self._current_project_id, snap.get("id", snap.get("label", ""))
-            )
-            self.snapshot_restored.emit(
-                self._current_project_id, str(snap.get("id", ""))
-            )
-            self._on_project_selected()
-        except Exception as exc:  # noqa: BLE001
-            QMessageBox.critical(self, "Restore Snapshot", f"Failed: {exc}")
+        snap_record = _as_record(snap)
+        # ProjectManager has no restore API — surface a visible no-op.
+        QMessageBox.information(
+            self, "Restore Snapshot",
+            "Snapshot restore is not supported yet.\n"
+            f"Snapshot: {snap_record.get('label', snap_record.get('id', '?'))}")
+        self.snapshot_restored.emit(
+            self._current_project_id, str(snap_record.get("id", "")))
 
     # --------------------------------------------------------- Comparison chart
 
@@ -482,7 +576,7 @@ class ProjectExplorer(QWidget):
             self._comp_ax.set_axis_off()
             self._comp_ax.text(0.5, 0.5, "Select another project to compare",
                                ha="center", va="center",
-                               transform=self._comp_ax.transAxes, color="#888")
+                               transform=self._comp_ax.transAxes, color=ModernTheme.DARK_TEXT_MUTED)
             self._comp_canvas.draw_idle()
             return
         other = self.compare_combo.itemData(idx) or {}
@@ -490,25 +584,45 @@ class ProjectExplorer(QWidget):
         if manager is None:
             return
         try:
-            series_a = manager.yearly_counts(self._current_project_id)
-            series_b = manager.yearly_counts(other.get("id") or other.get("name"))
+            # ``yearly_counts`` does not exist on ProjectManager — compute
+            # the histograms locally from the real ``get_papers`` API.
+            series_a = self._yearly_counts(self._current_project_id, manager)
+            series_b = self._yearly_counts(
+                other.get("id") or other.get("name"), manager)
         except Exception as exc:  # noqa: BLE001
-            logger.warning("yearly_counts failed: %s", exc)
+            logger.warning("yearly comparison failed: %s", exc)
             series_a, series_b = {}, {}
         self._comp_ax.clear()
         if series_a:
             years = sorted(series_a.keys())
             self._comp_ax.bar(
                 [y - 0.2 for y in years], [series_a[y] for y in years],
-                width=0.4, color="#007acc", label=self._current_project_id,
+                width=0.4, color=ModernTheme.ACCENT, label=self._current_project_id,
             )
         if series_b:
             years = sorted(series_b.keys())
             self._comp_ax.bar(
                 [y + 0.2 for y in years], [series_b[y] for y in years],
-                width=0.4, color="#d62728", label=str(other.get("name", "")),
+                width=0.4, color=ModernTheme.DANGER, label=str(other.get("name", "")),
             )
         self._comp_ax.set_xlabel("Year")
         self._comp_ax.set_ylabel("Papers")
         self._comp_ax.legend()
         self._comp_canvas.draw_idle()
+
+    @staticmethod
+    def _yearly_counts(project_id: Any, manager: Any) -> Dict[int, int]:
+        """Compute a {year: count} histogram from the project's papers."""
+        try:
+            papers = manager.get_papers(project_id) or []
+        except Exception:  # noqa: BLE001
+            return {}
+        counts: Dict[int, int] = {}
+        for p in papers:
+            try:
+                year = int(_as_record(p).get("year") or 0)
+            except (TypeError, ValueError):
+                continue
+            if year:
+                counts[year] = counts.get(year, 0) + 1
+        return counts

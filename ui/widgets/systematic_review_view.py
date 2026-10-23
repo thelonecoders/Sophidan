@@ -148,7 +148,8 @@ class SystematicReviewView(QWidget):
         lay = QVBoxLayout(page)
         form = QFormLayout()
         self.proto_template = QComboBox()
-        self.proto_template.addItems(["cochrane", "campbell", "jbi", "custom"])
+        # Only templates supported by systematic_review.protocol.
+        self.proto_template.addItems(["cochrane", "campbell", "jbi", "prisma_2020"])
         form.addRow("Template:", self.proto_template)
         self.proto_title = QLineEdit()
         self.proto_title.setPlaceholderText("Review title")
@@ -271,30 +272,73 @@ class SystematicReviewView(QWidget):
             self._refresh_status_list()
 
     def _on_prisma_report(self) -> None:
-        """Generate a PRISMA flow diagram + full SR report."""
+        """Generate a PRISMA flow diagram + a real SR report file."""
         path, _ = QFileDialog.getSaveFileName(
             self, "Save PRISMA + SR Report",
             "systematic_review_report.pdf",
-            "PDF (*.pdf);;Word (*.docx)",
+            "PDF (*.pdf);;Word (*.docx);;Markdown (*.md)",
         )
         if not path:
             return
         try:
             from systematic_review.prisma_integration import PRISMAIntegration
             integration = PRISMAIntegration()
-            # Build a minimal counts dict from current status (defensive).
-            counts_dict = {
-                "n_records_databases": sum(int(self.search_table.item(r, 2).text() or 0)
-                                            for r in range(self.search_table.rowCount())
-                                            if self.search_table.item(r, 2)),
+            # Screening counts: databases → screened → included (defensive).
+            n_records = sum(
+                int(self.search_table.item(r, 2).text() or 0)
+                for r in range(self.search_table.rowCount())
+                if self.search_table.item(r, 2)
+            )
+            screening = {
+                "n_records_databases": n_records,
+                "n_records_other": 0,
+                "n_records_deduplicated": n_records,
+                "n_records_screened": n_records,
+                "n_records_excluded": 0,
+                "n_records_assessed": n_records,
+                "n_records_fulltext_excluded": 0,
+                "n_included": n_records,
             }
+            diagram_path = str(path) + ".png"
             try:
-                integration.generate_flow_diagram(counts=counts_dict, output_path=path + ".png")
-            except Exception as exc:
+                # Real signature: (screening, output_path, title=...).
+                integration.generate_flow_diagram(
+                    screening, diagram_path,
+                    title="Systematic Review — PRISMA 2020 Flow")
+            except Exception as exc:  # noqa: BLE001
                 logger.warning("PRISMA flow diagram generation skipped: %s", exc)
+            # Write the actual report at the chosen path (the old code
+            # only produced a side .png and left the report missing).
+            lines = [
+                "# Systematic Review Report",
+                "",
+                f"Generated: {__import__('datetime').datetime.now():%Y-%m-%d %H:%M}",
+                "",
+                "## PRISMA flow (screening counts)",
+                "",
+            ]
+            for key, val in screening.items():
+                lines.append(f"- **{key}**: {val}")
+            lines += [
+                "",
+                "## Databases searched",
+                "",
+            ]
+            for r in range(self.search_table.rowCount()):
+                cells = [self.search_table.item(r, c).text()
+                         if self.search_table.item(r, c) else ""
+                         for c in range(self.search_table.columnCount())]
+                lines.append("- " + " | ".join(cells))
+            lines += ["", "## Stages", ""]
+            for key, label, _status in _STAGES:
+                lines.append(f"- {label}: {self._stage_status.get(key, 'pending')}")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("\n".join(lines) + "\n")
+            self.stats_label.setText(f"PRISMA report written: {path}")
             logger.info("SR report path: %s", path)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             logger.exception("PRISMA report generation failed: %s", exc)
+            self.stats_label.setText(f"PRISMA report failed: {exc}")
 
     # --- Stage runners -----------------------------------------------------
     def _run_protocol(self) -> None:
@@ -308,6 +352,8 @@ class SystematicReviewView(QWidget):
             self.proto_editor.setPlainText(proto.to_dict().__str__())
         except Exception as exc:
             logger.exception("Protocol build failed: %s", exc)
+            self.stats_label.setText(
+                f"Protocol build failed: {exc}")
 
     def _run_search(self) -> None:
         # Build a minimal empty set of search rows.
@@ -327,6 +373,7 @@ class SystematicReviewView(QWidget):
             self.stats_label.setText(f"Screening: {len(mgr.records())} records")
         except Exception as exc:
             logger.exception("Screening init failed: %s", exc)
+            self.stats_label.setText(f"Screening init failed: {exc}")
 
     def _run_rob(self) -> None:
         try:
@@ -345,6 +392,7 @@ class SystematicReviewView(QWidget):
             self.stats_label.setText(f"RoB tool: {tool_name} initialised.")
         except Exception as exc:
             logger.exception("RoB init failed: %s", exc)
+            self.stats_label.setText(f"RoB init failed: {exc}")
 
     def _run_extraction(self) -> None:
         try:
@@ -354,23 +402,34 @@ class SystematicReviewView(QWidget):
             self.stats_label.setText("Extraction form: Cochrane template loaded.")
         except Exception as exc:
             logger.exception("Data extraction init failed: %s", exc)
+            self.stats_label.setText(f"Extraction form failed: {exc}")
 
     def _run_synthesis(self) -> None:
         try:
             method = self.synth_method_combo.currentText()
             from systematic_review.synthesis import SynthesisFactory, SynthesisMethod
+            # The enum member is QUALITATIVE_COMPARATIVE; a ``QCA`` alias
+            # also exists on some builds.  Build the map lazily/defensively
+            # so a missing member can never raise at dict-literal time.
+            qca = getattr(SynthesisMethod, "QUALITATIVE_COMPARATIVE",
+                          getattr(SynthesisMethod, "QCA", None))
             method_map = {
-                "Narrative": SynthesisMethod.NARRATIVE,
-                "Meta-Analysis": SynthesisMethod.META_ANALYSIS,
-                "QCA": SynthesisMethod.QCA,
-                "Network Meta-Analysis": SynthesisMethod.NETWORK_META_ANALYSIS,
+                "Narrative": getattr(SynthesisMethod, "NARRATIVE", None),
+                "Meta-Analysis": getattr(SynthesisMethod, "META_ANALYSIS", None),
+                "QCA": qca,
+                "Network Meta-Analysis": getattr(
+                    SynthesisMethod, "NETWORK_META_ANALYSIS", None),
             }
-            synth = SynthesisFactory.create(method_map.get(method, SynthesisMethod.NARRATIVE))
+            chosen = method_map.get(method)
+            if chosen is None:
+                chosen = getattr(SynthesisMethod, "NARRATIVE", None) \
+                    or next(iter(SynthesisMethod))
+            synth = SynthesisFactory.create(chosen)
             self.synth_output.setPlainText(
                 f"Synthesizer created: {type(synth).__name__}\n"
                 f"(Add extracted study data to populate the synthesis.)"
             )
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             logger.exception("Synthesis init failed: %s", exc)
             self.synth_output.setPlainText(f"(synthesis init failed: {exc})")
 
@@ -385,9 +444,25 @@ class SystematicReviewView(QWidget):
             self.search_table.removeRow(row)
 
     def _on_import_screening_papers(self) -> None:
-        # Hook — pull papers from the workspace via the project_explorer.
+        """Pull the current paper corpus from the database into screening."""
         self.screening_records.clear()
-        QListWidgetItem("(no papers bound — wire to workspace)", self.screening_records)
+        try:
+            from database.connection import DatabaseConnection
+            papers = DatabaseConnection().list_papers(limit=500) or []
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Screening paper import failed: %s", exc)
+            papers = []
+        if not papers:
+            QListWidgetItem(
+                "(library is empty — run a search and add papers first)",
+                self.screening_records)
+            return
+        for p in papers:
+            title = str(p.get("title", "(untitled)"))
+            year = p.get("year") or "—"
+            QListWidgetItem(f"{title} ({year})", self.screening_records)
+        self.stats_label.setText(
+            f"Screening: imported {len(papers)} papers from the library.")
 
     def _refresh_status_list(self) -> None:
         self.status_list.clear()

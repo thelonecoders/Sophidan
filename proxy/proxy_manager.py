@@ -17,6 +17,7 @@ import sqlite3
 import threading
 import time
 from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -189,9 +190,12 @@ def _get_db_connection() -> Optional[sqlite3.Connection]:
     """
     # 1) Try the project's shared DB connection helper.
     try:
-        from database.connection import get_connection  # type: ignore
+        from database.connection import DatabaseConnection  # type: ignore
 
-        conn = get_connection()
+        # ``database.connection`` exposes a SQLAlchemy-based singleton;
+        # ``raw_connection()`` yields the underlying sqlite3 connection.
+        engine = DatabaseConnection().get_engine()
+        conn = engine.raw_connection()
         if conn is not None:
             _ensure_table(conn)
             return conn
@@ -240,6 +244,11 @@ class ProxyManager(QObject):
     proxy_rotated = Signal(object, object)  # type: ignore
     proxy_failed = Signal(object, str)  # type: ignore
 
+    #: Coalescing window (seconds) before debounced persistence batches
+    #: are flushed to SQLite / the ORM table.  Keeps per-request feedback
+    #: (``mark_success`` / ``mark_failure``) off the DB hot path (audit A17).
+    _FLUSH_DELAY: float = 0.5
+
     def __init__(self, persist: bool = True) -> None:
         """Initialise the manager.
 
@@ -252,9 +261,77 @@ class ProxyManager(QObject):
         self._proxies: List[Proxy] = []
         self._index: Dict[str, Proxy] = {}  # key -> Proxy
         self._rr_cursor = 0
+        self._last_pick: Optional[Proxy] = None
         self._persist = persist
+        # Ban list (audit A14): ``host:port`` -> ban-until epoch.  Bans are
+        # protocol-agnostic so ``ban("1.2.3.4:8080")`` from the UI / pool
+        # facade matches regardless of how the entry was registered.
+        self._banned: Dict[str, float] = {}
+        # Debounced write-behind queue (audit A17): ``key -> Proxy`` holding
+        # the latest state that still needs persisting.
+        self._pending: Dict[str, Proxy] = {}
+        self._pending_lock = threading.Lock()
+        self._flush_event = threading.Event()
+        self._flush_thread: Optional[threading.Thread] = None
         if persist:
             self._load_from_db()
+
+    # -- ban list (A14) ------------------------------------------------------
+    @staticmethod
+    def _ban_key(addr: Any) -> str:
+        """Normalise a ``host:port`` / ``proto://host:port`` / Proxy to
+        the protocol-agnostic ban key ``host:port``."""
+        if isinstance(addr, Proxy):
+            return f"{addr.host}:{addr.port}"
+        s = str(addr).strip()
+        if "://" in s:  # strip an optional scheme
+            s = s.split("://", 1)[1]
+        # Strip any credentials component.
+        if "@" in s:
+            s = s.rsplit("@", 1)[1]
+        return s
+
+    def ban(self, addr: Any, minutes: float = 30.0) -> bool:
+        """Banlist ``addr`` (``host:port`` / ``proto://host:port`` / Proxy)
+        for ``minutes``.  Banned proxies are skipped by :meth:`get_proxy`.
+
+        Returns ``True`` if a ban was (re)applied.
+        """
+        key = self._ban_key(addr)
+        if not key:
+            return False
+        until = time.time() + max(0.0, float(minutes)) * 60.0
+        with self._lock:
+            self._banned[key] = until
+        logger.info("Banned proxy %s for %ss", key, float(minutes) * 60.0)
+        return True
+
+    def unban(self, addr: Any) -> bool:
+        """Lift any ban on ``addr``.  Returns ``True`` if a ban existed."""
+        key = self._ban_key(addr)
+        with self._lock:
+            return self._banned.pop(key, None) is not None
+
+    def _prune_banned(self) -> None:
+        """Drop expired bans (``until <= now``).  Caller holds the lock."""
+        now = time.time()
+        expired = [k for k, until in self._banned.items() if until <= now]
+        for k in expired:
+            self._banned.pop(k, None)
+
+    def is_banned(self, addr: Any) -> bool:
+        """Return ``True`` while ``addr``'s cooldown ban is still active."""
+        key = self._ban_key(addr)
+        with self._lock:
+            self._prune_banned()
+            until = self._banned.get(key)
+        return until is not None and until > time.time()
+
+    def ban_list(self) -> Dict[str, float]:
+        """Return a snapshot of active (non-expired) bans."""
+        with self._lock:
+            self._prune_banned()
+            return dict(self._banned)
 
     # -- key helpers ---------------------------------------------------------
     @staticmethod
@@ -295,6 +372,8 @@ class ProxyManager(QObject):
     def remove_proxy(self, p: Proxy) -> bool:
         """Remove ``p`` from the registry. Returns ``True`` if removed."""
         key = self._key(p)
+        with self._pending_lock:
+            self._pending.pop(key, None)
         with self._lock:
             if key not in self._index:
                 return False
@@ -311,7 +390,12 @@ class ProxyManager(QObject):
     def get_proxy(
         self, strategy: str = "round_robin"
     ) -> Optional[Proxy]:
-        """Return a proxy using ``strategy`` or ``None`` if registry empty.
+        """Return a proxy using ``strategy`` or ``None`` if none eligible.
+
+        Only proxies that are healthy (:attr:`Proxy.is_healthy`) and not on
+        the cooldown ban list are considered (audit A14); when every entry
+        is unhealthy / banned the method returns ``None`` instead of handing
+        out a known-bad proxy.
 
         Args:
             strategy: One of ``round_robin|random|best|weighted``.
@@ -319,21 +403,34 @@ class ProxyManager(QObject):
         if strategy not in VALID_STRATEGIES:
             raise ValueError(f"strategy must be one of {VALID_STRATEGIES}")
         with self._lock:
-            if not self._proxies:
+            self._prune_banned()
+            eligible = [
+                p for p in self._proxies
+                if p.is_healthy
+                and f"{p.host}:{p.port}" not in self._banned
+            ]
+            if not eligible:
+                if self._proxies:
+                    logger.debug(
+                        "get_proxy: %d proxies registered but none eligible "
+                        "(" "unhealthy or banlisted)",
+                        len(self._proxies),
+                    )
                 return None
-            old = self._proxies[self._rr_cursor % len(self._proxies)]
+            old = self._last_pick
             if strategy == "round_robin":
-                p = self._proxies[self._rr_cursor % len(self._proxies)]
+                p = eligible[self._rr_cursor % len(eligible)]
                 self._rr_cursor += 1
             elif strategy == "random":
                 import random
 
-                p = random.choice(self._proxies)
+                p = random.choice(eligible)
             elif strategy == "best":
-                p = max(self._proxies, key=lambda x: x.score)
+                p = max(eligible, key=lambda x: x.score)
             else:  # weighted
-                p = self._weighted_pick()
-        if strategy in {"round_robin"} and old is not p:
+                p = self._weighted_pick(eligible)
+            self._last_pick = p
+        if strategy == "round_robin" and old is not None and old is not p:
             try:
                 self.proxy_rotated.emit(old, p)
             except Exception:  # pragma: no cover
@@ -341,21 +438,29 @@ class ProxyManager(QObject):
         return p
 
     def mark_success(self, p: Proxy, latency_ms: float) -> None:
-        """Record a successful request through ``p``."""
+        """Record a successful request through ``p``.
+
+        In-memory state is updated under the lock; the SQLite/ORM write is
+        debounced onto a background flusher so per-request bookkeeping never
+        blocks on DB I/O inside the manager lock (audit A17).
+        """
         with self._lock:
             p.success_count += 1
             p.latency_ms = float(latency_ms)
             p.last_check = time.time()
             self._recompute_score(p)
-            self._persist_proxy(p)
+        self._persist_proxy(p)
 
     def mark_failure(self, p: Proxy, reason: str = "") -> None:
-        """Record a failed request through ``p``."""
+        """Record a failed request through ``p``.
+
+        Persistence is debounced exactly as in :meth:`mark_success`.
+        """
         with self._lock:
             p.fail_count += 1
             p.last_check = time.time()
             self._recompute_score(p)
-            self._persist_proxy(p)
+        self._persist_proxy(p)
         try:
             self.proxy_failed.emit(p, reason or "unknown")
         except Exception:  # pragma: no cover
@@ -405,6 +510,8 @@ class ProxyManager(QObject):
 
     def clear(self) -> None:
         """Remove every proxy (also clears the DB cache)."""
+        with self._pending_lock:
+            self._pending.clear()
         with self._lock:
             removed = list(self._proxies)
             self._proxies.clear()
@@ -425,12 +532,13 @@ class ProxyManager(QObject):
                 logger.exception("proxy_removed slot raised")
 
     # -- internals -----------------------------------------------------------
-    def _weighted_pick(self) -> Proxy:
-        """Pick a proxy weighted by ``max(1, score)``."""
+    def _weighted_pick(self, eligible: Optional[List[Proxy]] = None) -> Proxy:
+        """Pick a proxy weighted by ``max(1, score)`` from ``eligible``."""
         import random
 
-        weights = [max(1e-6, p.score) for p in self._proxies]
-        return random.choices(self._proxies, weights=weights, k=1)[0]
+        pool = eligible if eligible is not None else self._proxies
+        weights = [max(1e-6, p.score) for p in pool]
+        return random.choices(pool, weights=weights, k=1)[0]
 
     def _recompute_score(self, p: Proxy) -> None:
         """Recompute ``p.score`` based on success rate + latency."""
@@ -443,33 +551,140 @@ class ProxyManager(QObject):
         # Higher is better. 100 * success_rate / latency scaled.
         p.score = round(success_rate * 1000.0 / latency, 4)
 
+    # -- debounced persistence (A17) -----------------------------------------
     def _persist_proxy(self, p: Proxy) -> None:
-        """Upsert a proxy row into SQLite (no-op if persistence disabled)."""
+        """Queue ``p`` for a coalesced SQLite/ORM write (no-op if disabled).
+
+        Called on the request hot path (``mark_success`` / ``mark_failure`` /
+        ``add_proxy``); the actual DB I/O happens in batch on a background
+        flusher thread, so callers never block on a commit.
+        """
         if not self._persist:
             return
+        with self._pending_lock:
+            self._pending[self._key(p)] = p
+        self._ensure_flusher()
+
+    def _ensure_flusher(self) -> None:
+        """Start the daemon flusher thread on first use."""
+        if self._flush_thread is not None and self._flush_thread.is_alive():
+            self._flush_event.set()
+            return
+        self._flush_event.set()
+        t = threading.Thread(
+            target=self._flush_loop, name="ProxyPersistFlusher", daemon=True
+        )
+        t.start()
+        self._flush_thread = t
+
+    def _flush_loop(self) -> None:  # pragma: no cover - thread body
+        """Background loop that writes pending proxies in batches."""
+        while True:
+            self._flush_event.wait()
+            self._flush_event.clear()
+            # Coalescing window: let bursts of mark_success/mark_failure
+            # collapse into a single write (debounce).
+            time.sleep(self._FLUSH_DELAY)
+            batch = self._take_pending()
+            if batch:
+                self._persist_batch(batch)
+
+    def _take_pending(self) -> List[Proxy]:
+        """Atomically drain the pending queue (latest state per proxy)."""
+        with self._pending_lock:
+            batch = list(self._pending.values())
+            self._pending.clear()
+        return batch
+
+    def flush(self) -> int:
+        """Force-write all queued proxy state to SQLite/ORM immediately.
+
+        Returns the number of rows written.  Useful in tests and at
+        shutdown; the background flusher normally handles this.
+        """
+        if not self._persist:
+            return 0
+        batch = self._take_pending()
+        if batch:
+            self._persist_batch(batch)
+        return len(batch)
+
+    def _persist_batch(self, proxies: List[Proxy]) -> None:
+        """Upsert a batch of proxies using ONE connection + ONE commit."""
         conn = _get_db_connection()
-        if conn is None:
+        if conn is not None:
+            try:
+                conn.executemany(
+                    f"INSERT OR REPLACE INTO {_DB_TABLE} "
+                    "(host, port, protocol, username, password, country, anonymity, "
+                    " source, latency_ms, last_check, success_count, fail_count, score) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    [
+                        (
+                            p.host, int(p.port), p.protocol, p.username,
+                            p.password, p.country, p.anonymity, p.source,
+                            p.latency_ms, p.last_check, int(p.success_count),
+                            int(p.fail_count), float(p.score),
+                        )
+                        for p in proxies
+                    ],
+                )
+                conn.commit()
+            except Exception:  # pragma: no cover
+                logger.exception("failed to persist %d proxies", len(proxies))
+            finally:
+                try:
+                    conn.close()
+                except Exception:  # pragma: no cover
+                    pass
+        # A18: also mirror into the canonical ORM ``ProxyModel`` table so
+        # both persistence schemas stay in sync.  Best-effort + never
+        # raised into the caller (persistence is a cache).
+        self._persist_batch_orm(proxies)
+
+    def _persist_batch_orm(self, proxies: List[Proxy]) -> None:
+        """Mirror proxies into the ORM ``ProxyModel`` table (best-effort).
+
+        TODO(A18): the proxy subsystem still persists to *two* schemas —
+        the raw ``proxy_pool_cache`` table above and the ORM ``proxies``
+        table here.  Migrating the reader (``_load_from_db``) onto the ORM
+        schema and dropping ``proxy_pool_cache`` is the follow-up;
+        until then both are kept in sync from this single flusher.
+        """
+        try:
+            from database.connection import DatabaseConnection  # noqa: WPS433
+            from database.models import ProxyModel  # noqa: WPS433
+        except Exception:  # pragma: no cover - SQLAlchemy-less environments
+            logger.debug("ORM mirror skipped: database models unavailable")
+            return
+        db = DatabaseConnection.get_existing()
+        if db is None:  # never create a DB just to mirror a cache
             return
         try:
-            conn.execute(
-                f"INSERT OR REPLACE INTO {_DB_TABLE} "
-                "(host, port, protocol, username, password, country, anonymity, "
-                " source, latency_ms, last_check, success_count, fail_count, score) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (
-                    p.host, int(p.port), p.protocol, p.username, p.password,
-                    p.country, p.anonymity, p.source, p.latency_ms, p.last_check,
-                    int(p.success_count), int(p.fail_count), float(p.score),
-                ),
-            )
-            conn.commit()
+            with db.get_db() as session:
+                for p in proxies:
+                    row = (
+                        session.query(ProxyModel)
+                        .filter_by(host=p.host, port=int(p.port),
+                                   protocol=p.protocol)
+                        .one_or_none()
+                    )
+                    if row is None:
+                        row = ProxyModel(host=p.host, port=int(p.port),
+                                         protocol=p.protocol)
+                        session.add(row)
+                    row.country = p.country
+                    row.anonymity = p.anonymity
+                    row.score = int(round(float(p.score)))
+                    row.success_count = int(p.success_count)
+                    row.fail_count = int(p.fail_count)
+                    if p.last_check:
+                        row.last_check = datetime.fromtimestamp(
+                            float(p.last_check), tz=timezone.utc
+                        ).replace(tzinfo=None)
+                # single commit for the whole batch (get_db commits on exit)
         except Exception:  # pragma: no cover
-            logger.exception("failed to persist proxy %s", p.address)
-        finally:
-            try:
-                conn.close()
-            except Exception:  # pragma: no cover
-                pass
+            logger.debug("ORM proxy mirror failed", exc_info=True)
 
     def _delete_proxy(self, p: Proxy) -> None:
         if not self._persist:

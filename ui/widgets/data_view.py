@@ -27,12 +27,15 @@ from typing import Any, Iterable, List, Optional, Sequence
 from qtpy.QtCore import (
     QAbstractTableModel, QModelIndex, Qt, Signal,
 )
+
 from qtpy.QtWidgets import (
     QAbstractItemView, QAction, QComboBox, QFileDialog, QFrame, QGridLayout,
     QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMenu, QPushButton,
     QSlider, QSpinBox, QStyle, QTableView, QVBoxLayout, QWidget,
     QWidgetAction,
 )
+
+from ui.modern_theme import ModernTheme
 
 logger = logging.getLogger(__name__)
 
@@ -163,9 +166,17 @@ class DataViewWidget(QWidget):
         paper_selected: Emitted with the ``paper_id`` of the row the
             user double-clicked.  ``paper_id`` is read from the paper
             dict's ``id`` (or ``paper_id``) field.
+        add_to_project_requested: Emitted with the selected paper dicts
+            when the user picks "Add to Project…" in the context menu;
+            the main window persists them via ``DatabaseConnection
+            .add_paper``.
+        status_message: User-facing status text (clipboard actions,
+            export outcomes) for the application status bar.
     """
 
     paper_selected = Signal(int)
+    add_to_project_requested = Signal(list)
+    status_message = Signal(str)
 
     #: Page size used for lazy chunked loading.
     PAGE_SIZE: int = 100
@@ -277,13 +288,13 @@ class DataViewWidget(QWidget):
         bottom = QHBoxLayout()
         bottom.setContentsMargins(0, 0, 0, 0)
         self._selection_label = QLabel("0 selected", self)
-        self._selection_label.setStyleSheet("color: #94A3B8;")
+        self._selection_label.setStyleSheet(f"color: {ModernTheme.DARK_TEXT_MUTED};")
         bottom.addWidget(self._selection_label)
 
         bottom.addStretch(1)
 
         self._page_label = QLabel("0–0 of 0", self)
-        self._page_label.setStyleSheet("color: #94A3B8;")
+        self._page_label.setStyleSheet(f"color: {ModernTheme.DARK_TEXT_MUTED};")
         bottom.addWidget(self._page_label)
 
         self._btn_prev = QPushButton("‹ Prev", self)
@@ -585,9 +596,63 @@ class DataViewWidget(QWidget):
         act_copy_doi.triggered.connect(lambda: self._copy_doi(index))
         act_open_url.triggered.connect(lambda: self._open_url(index))
         act_export_sel.triggered.connect(lambda: self._export("csv"))
-        # Add to Project / Cite are no-ops here; the parent window
-        # typically hooks into them via signal reflection.
+        act_add_proj.triggered.connect(lambda: self._add_selected_to_project())
+        act_cite.triggered.connect(lambda: self._copy_citation(index))
         menu.exec_(self._table.viewport().mapToGlobal(pos))
+
+    # ------------------------------------------------- Project / citation
+
+    def _selected_papers(self) -> List[dict[str, Any]]:
+        """Return the paper dicts for every selected row."""
+        out: List[dict[str, Any]] = []
+        selection_model = self._table.selectionModel()
+        if selection_model is None:
+            return out
+        for idx in selection_model.selectedRows():
+            paper = self._model.get_paper(idx.row())
+            if paper:
+                out.append(paper)
+        return out
+
+    def _add_selected_to_project(self) -> None:
+        """Emit the selected papers so the window can persist them.
+
+        The main window owns the ``DatabaseConnection`` and routes this
+        through ``add_paper`` (DOI-deduplicated).
+        """
+        papers = self._selected_papers()
+        if not papers:
+            self.status_message.emit(
+                "Add to Project: select at least one row first.")
+            return
+        self.add_to_project_requested.emit(papers)
+
+    def _copy_citation(self, index: QModelIndex) -> None:
+        """Copy a plain-text citation for the selected paper to the
+        clipboard and surface a visible confirmation."""
+        paper = self._model.get_paper(index.row())
+        if not paper:
+            return
+        authors = paper.get("authors") or []
+        if isinstance(authors, str):
+            authors = [a.strip() for a in authors.split(";") if a.strip()]
+        names = "; ".join(str(a) for a in authors[:3]) or "(unknown authors)"
+        if len(authors) > 3:
+            names += " et al."
+        year = paper.get("year") or "n.d."
+        title = str(paper.get("title") or "(untitled)").strip()
+        doi = str(paper.get("doi") or "").strip()
+        citation = f"{names} ({year}). {title}."
+        if doi:
+            citation += f" https://doi.org/{doi}"
+        from qtpy.QtWidgets import QApplication as _QApp
+        cb = _QApp.clipboard()
+        if cb is not None:
+            cb.setText(citation)
+            self.status_message.emit(
+                f"Citation copied to clipboard: {citation[:80]}…")
+        else:
+            self.status_message.emit("No system clipboard available.")
 
     def _on_header_context_menu(self, pos: Any) -> None:
         """Allow hiding/showing columns via right-click on the header."""

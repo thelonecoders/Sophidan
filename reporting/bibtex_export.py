@@ -19,10 +19,8 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 from ._paper_utils import (
     get_authors,
-    get_citation_count,
     get_doi,
     get_field,
-    get_keywords,
     get_str,
     get_year,
     normalise_authors_bibtex,
@@ -174,21 +172,37 @@ def _detect_entry_type(paper: Any) -> str:
     return "misc"
 
 
+def _format_page_range(rng: str) -> str:
+    """Normalise a single ``start-end`` page range to BibTeX ``start--end``."""
+    rng = rng.strip()
+    if not rng:
+        return ""
+    if "--" in rng:
+        return rng  # already BibTeX-style
+    for sep in ("–", "-", " "):
+        if sep in rng:
+            parts = [p.strip() for p in rng.split(sep) if p.strip()]
+            if len(parts) == 2:
+                return f"{parts[0]}--{parts[1]}"
+    return rng
+
+
 def _format_pages(pages: str) -> str:
-    """Normalise page ranges to BibTeX ``start--end`` form when possible."""
+    """Normalise page ranges to BibTeX ``start--end`` form.
+
+    Handles multi-range input like ``"12-34, 56-78"`` — previously the
+    comma-separated form was mangled into ``"12-34,--56-78"`` because the
+    whole string was split on spaces (audit 4-i).  Each comma-separated
+    segment is now normalised independently and the results re-joined
+    with comma separators.
+    """
     if not pages:
         return ""
     s = str(pages).strip()
-    # Already BibTeX-style?
-    if "--" in s:
+    segments = [seg.strip() for seg in s.split(",") if seg.strip()]
+    if not segments:
         return s
-    # Common separators in source data: '-', '–' (en dash), ' '.
-    for sep in ("–", "-", " "):
-        if sep in s:
-            parts = [p.strip() for p in s.split(sep) if p.strip()]
-            if len(parts) == 2:
-                return f"{parts[0]}--{parts[1]}"
-    return s
+    return ", ".join(_format_page_range(seg) for seg in segments)
 
 
 class BibTeXExporter:
@@ -317,7 +331,10 @@ class BibTeXExporter:
 
         doi = get_doi(paper)
         if doi:
-            fields.append(("doi", doi))
+            # Escaped like every other field: DOIs may carry ``_``/``&``/
+            # ``%`` characters that BibTeX treats specially (previously the
+            # doi was written raw while url was escaped — audit 4-i).
+            fields.append(("doi", _escape_latex(doi)))
 
         url = get_str(paper, "url")
         if not url and doi:
@@ -333,9 +350,9 @@ class BibTeXExporter:
         if keywords:
             fields.append(("keywords", _escape_latex("; ".join(keywords))))
 
-        cites = get_citation_count(paper)
-        if cites:
-            fields.append(("citations", str(cites)))
+        # NOTE: the non-standard ``citations`` field was dropped (audit
+        # 4-i) — bibtex/biber reject unknown numeric fields and no style
+        # consumes it.
 
         # Render.
         out = io.StringIO()
@@ -354,4 +371,35 @@ def get_keywords_local(paper: Any) -> List[str]:
     return get_keywords(paper)
 
 
-__all__ = ["BibTeXExporter"]
+# ---------------------------------------------------------------------------
+# Module-level contract wrapper (PATCH CONTRACT #6).
+# ---------------------------------------------------------------------------
+def export_bibtex(papers: Sequence[Any], path: Optional[str] = None) -> str:
+    """Contract #6: export ``papers`` to a ``.bib`` file.
+
+    Args:
+        papers: Sequence of Paper-like objects (ORM models or dicts).
+        path: Target ``.bib`` path; when ``None`` a timestamped file is
+            written to the current working directory.
+
+    Returns:
+        The absolute path written.
+    """
+    if path:
+        target = str(path)
+    else:
+        from datetime import datetime
+
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        target = os.path.abspath(f"papers_export_{stamp}.bib")
+    return BibTeXExporter().export(papers, target)
+
+
+# ``ui/dialogs/export_wizard.py`` resolves RisExporter via
+# ``reporting.ris_export`` → ``reporting.bibtex_export`` → ``reporting``;
+# re-exporting here satisfies the second candidate (and keeps a single
+# implementation in :mod:`reporting.ris_exporter`).
+from .ris_exporter import RisExporter  # noqa: E402,F401  (re-export)
+
+
+__all__ = ["BibTeXExporter", "RisExporter", "export_bibtex", "_format_pages"]

@@ -35,6 +35,9 @@ from qtpy.QtWidgets import (
     QWidget,
 )
 
+
+from ui.modern_theme import ModernTheme
+
 logger = logging.getLogger(__name__)
 
 
@@ -194,9 +197,9 @@ class AuthorDashboard(QDialog):
             value_font.setBold(True)
             lbl.setFont(value_font)
             lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            lbl.setStyleSheet("color:#007acc;")
+            lbl.setStyleSheet(f"color:{ModernTheme.ACCENT};")
             title_label = QLabel(title)
-            title_label.setStyleSheet("color:#888;")
+            title_label.setStyleSheet(f"color:{ModernTheme.DARK_TEXT_MUTED};")
             title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
             container = QWidget()
             container_layout = QVBoxLayout(container)
@@ -322,7 +325,7 @@ class AuthorDashboard(QDialog):
             return
         years = sorted(year_to_cits.keys())
         values = [year_to_cits[y] for y in years]
-        ax.bar(years, values, color="#007acc", alpha=0.85)
+        ax.bar(years, values, color=ModernTheme.ACCENT, alpha=0.85)
         ax.set_xlabel("Year")
         ax.set_ylabel("Citations")
         ax.set_title("Citations per year")
@@ -386,10 +389,10 @@ class AuthorDashboard(QDialog):
             self._canvas_collab.draw_idle()
             return
         pos = nx.spring_layout(g, seed=42)
-        node_colors = ["#007acc" if n == author_name else "#888"
+        node_colors = [ModernTheme.ACCENT if n == author_name else ModernTheme.DARK_TEXT_MUTED
                        for n in g.nodes()]
         node_sizes = [120 + 20 * g.degree(n) for n in g.nodes()]
-        nx.draw_networkx_edges(g, pos, ax=ax, alpha=0.4, edge_color="#888")
+        nx.draw_networkx_edges(g, pos, ax=ax, alpha=0.4, edge_color=ModernTheme.DARK_TEXT_MUTED)
         nx.draw_networkx_nodes(g, pos, ax=ax, node_color=node_colors,
                                node_size=node_sizes, edgecolors="white",
                                linewidths=0.5)

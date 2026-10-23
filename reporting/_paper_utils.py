@@ -37,7 +37,8 @@ _FIELD_ALIASES: dict[str, tuple[str, ...]] = {
     "citations": ("citations", "citation_count", "citation_count_by_year"),
     "entry_type": ("entry_type", "type", "publication_type", "work_type"),
     "affiliations": ("affiliations", "affiliation", "author_affiliations"),
-    "cited_by": ("cited_by", "cited_dois", "references_doi"),
+    "cited_by": ("cited_by", "cited_dois", "references_doi", "references",
+                 "outbound_references"),
     "fields_of_study": ("fields_of_study", "fos", "fields", "concepts"),
 }
 
@@ -212,6 +213,65 @@ def get_citation_count(paper: Any) -> int:
         return CITATION_FALLBACK
 
 
+def get_cited_dois(paper: Any) -> List[str]:
+    """Return the list of DOIs this paper cites (normalised, may be empty).
+
+    Tolerates every storage shape used across the suite (audit 4-i A13):
+      * ``list[str]`` / ``str`` with ``,``/``;`` separators — the raw
+        ``cited_by`` / ``cited_dois`` forms;
+      * ``list[dict]`` entries with ``doi`` / ``cited_doi`` / ``DOI`` keys;
+      * ``ReferenceModel``-style objects (``PaperModel.references`` in the
+        ORM) exposing ``.cited_doi`` / ``.doi`` / ``.target_doi`` attributes.
+
+    Returns lowercased, URL-prefix-stripped DOIs.
+    """
+    raw = get_field(paper, "cited_by", default=[]) or []
+    out: List[str] = []
+
+    def _one(ref: Any) -> Optional[str]:
+        if ref is None:
+            return None
+        if isinstance(ref, dict):
+            ref_doi = (ref.get("doi") or ref.get("cited_doi")
+                       or ref.get("DOI") or ref.get("doi_url"))
+            return str(ref_doi) if ref_doi else None
+        if isinstance(ref, str):
+            return ref
+        # Object form (ORM ReferenceModel, SimpleNamespace, scraped ref...).
+        for attr in ("cited_doi", "doi", "DOI", "target_doi", "doi_url"):
+            v = getattr(ref, attr, None)
+            if v:
+                return str(v)
+        # Rejected: anything without a DOI-shaped attribute.
+        return None
+
+    items: List[Any]
+    if isinstance(raw, str):
+        items = [c.strip() for c in raw.replace(",", ";").split(";")]
+    elif isinstance(raw, Iterable) and not isinstance(raw, (bytes, bytearray)):
+        items = list(raw)
+    else:
+        items = []
+    for item in items:
+        ref_doi = _one(item)
+        if not ref_doi:
+            continue
+        # Split possible multi-DOI strings and strip URL prefixes.
+        for part in str(ref_doi).replace(",", ";").split(";"):
+            part = part.strip()
+            if not part:
+                continue
+            for prefix in ("https://doi.org/", "http://doi.org/",
+                           "doi.org/", "doi:"):
+                if part.lower().startswith(prefix.lower()):
+                    part = part[len(prefix):]
+                    break
+            part = part.strip().lower()
+            if part:
+                out.append(part)
+    return out
+
+
 def get_year(paper: Any) -> Optional[int]:
     """Return the publication year as int, or ``None`` if missing/unparseable."""
     v = get_field(paper, "year")
@@ -357,6 +417,7 @@ __all__ = [
     "get_authors",
     "get_keywords",
     "get_citation_count",
+    "get_cited_dois",
     "get_year",
     "get_doi",
     "get_citekey",

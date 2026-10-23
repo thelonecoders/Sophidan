@@ -551,28 +551,63 @@ def test_newcastle_ottawa_max_9_stars():
 # Innovation tests (Kleinberg 2002, Wang & Hua 2015, Uzzi 2013)
 # ===========================================================================
 
-def test_citation_bursts_on_ramp():
-    """Papers with linearly increasing citations produce bursts.
+def test_citation_bursts_require_real_yearly_histories():
+    """Bursts come from *real* per-year citation histories, not fabricated ramps.
 
-    Reference: Kleinberg, J. (2002). Bursty and hierarchical structure
-    in streams.  ACM KDD '02:91–101.  The Kleinberg automaton is
-    designed to flag monotonic ramps in citation counts as bursts.
+    Kleinberg's (2002) bursty-stream automaton is legitimate only when the
+    input stream is real: papers carrying a ``citations_by_year`` history
+    (as returned by Semantic Scholar / OpenAlex) must produce bursts, while
+    papers exposing *only* a cumulative ``citations_count`` must produce
+    NONE — synthesizing a linear per-year ramp from one cumulative number
+    fabricates temporal structure that does not exist in the data and used
+    to make every paper in a corpus "burst".  The legacy behaviour remains
+    available behind an explicit ``allow_synthetic_ramp=True`` opt-in, and
+    the synthetic result is labelled ``source="synthetic-ramp"``.
     """
     from data_acquisition.base_scraper import Paper
     from innovation.citation_bursts import CitationBurstDetector
 
-    papers = []
-    for i in range(8):
-        papers.append(Paper(
-            title=f"P{i}",
+    # (a) Papers WITH real yearly citation histories → bursts detected.
+    history = {2018: 2, 2019: 3, 2020: 2, 2021: 25, 2022: 40, 2023: 18, 2024: 5}
+    papers_with_history = []
+    for i in range(6):
+        p = Paper(
+            title=f"Real-History P{i}",
+            authors=["A"],
+            year=2017,
+            citations_count=sum(history.values()),
+        )
+        p.citations_by_year = dict(history)
+        papers_with_history.append(p)
+    det = CitationBurstDetector()
+    bursts = det.detect_papers(papers_with_history)
+    assert isinstance(bursts, list)
+    assert len(bursts) >= 1, "Expected bursts from real per-year histories"
+    for b in bursts:
+        assert b.source == "data", (
+            f"real-history burst mislabelled: source={b.source!r}"
+        )
+        assert b.start_year >= 2018 and b.end_year <= 2024
+
+    # (b) Papers with only cumulative counts → NO bursts (fabrication fixed).
+    cumulative_only = [
+        Paper(
+            title=f"Cumulative C{i}",
             authors=["A"],
             year=2010 + i,
-            citations_count=5 + i * 30,  # linear ramp 5, 35, 65, …
-        ))
-    det = CitationBurstDetector()
-    bursts = det.detect_papers(papers)
-    assert isinstance(bursts, list)
-    assert len(bursts) >= 1, "Expected at least one detected burst"
+            citations_count=5 + i * 30,  # the old test's linear "ramp"
+        )
+        for i in range(8)
+    ]
+    assert det.detect_papers(cumulative_only) == [], (
+        "cumulative-only papers must not fabricate bursts"
+    )
+
+    # (c) The legacy synthetic ramp survives only behind an explicit opt-in
+    #     and is clearly labelled as synthetic.
+    legacy = det.detect_papers(cumulative_only, allow_synthetic_ramp=True)
+    assert len(legacy) >= 1
+    assert all(b.source == "synthetic-ramp" for b in legacy)
 
 
 def test_paper_recommender_returns_top_k():

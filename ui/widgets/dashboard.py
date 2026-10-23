@@ -30,7 +30,25 @@ from qtpy.QtWidgets import (
     QPushButton,
 )
 
+from ui.modern_theme import ModernTheme
+
 logger = logging.getLogger(__name__)
+
+#: String topics the dashboard listens for.  The contract bus
+#: normalises separator/spelling variants (``scrape:completed`` ≡
+#: ``scrape_completed`` ≡ ``scrape_finished``, and maps
+#: ``analysis_finished``→AnalysisCompleted / ``export_finished``→
+#: ExportCompleted), so ONE representative per canonical topic is
+#: subscribed — registering several spellings would fire the handler
+#: multiple times per event.  The handler itself still matches every
+#: variant it may receive.
+_EVENT_TOPICS: tuple = (
+    "paper_added",
+    "scrape:completed",
+    "scrape:failed",
+    "analysis_finished",
+    "export_finished",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -65,7 +83,8 @@ class _StatCard(QFrame):
         top.addWidget(icon_label)
         top.addStretch(1)
         title_label = QLabel(title, self)
-        title_label.setStyleSheet("color: #94A3B8; font-size: 9pt;")
+        title_label.setStyleSheet(
+            f"color: {ModernTheme.DARK_TEXT_MUTED}; font-size: 9pt;")
         top.addWidget(title_label)
         top.addStretch(1)
         lay.addLayout(top)
@@ -79,7 +98,8 @@ class _StatCard(QFrame):
         self._value_label = value_label
 
         trend_label = QLabel(trend, self)
-        trend_label.setStyleSheet("color: #10B981; font-size: 9pt;")
+        trend_label.setStyleSheet(
+            f"color: {ModernTheme.SUCCESS}; font-size: 9pt;")
         lay.addWidget(trend_label)
         self._trend_label = trend_label
 
@@ -87,7 +107,7 @@ class _StatCard(QFrame):
         self._value_label.setText(value)
 
     def set_trend(self, trend: str, positive: bool = True) -> None:
-        color = "#10B981" if positive else "#EF4444"
+        color = ModernTheme.SUCCESS if positive else ModernTheme.DANGER
         self._trend_label.setText(trend)
         self._trend_label.setStyleSheet(f"color: {color}; font-size: 9pt;")
 
@@ -159,7 +179,6 @@ class DashboardWidget(QWidget):
         self._activity_label = QLabel("No activity yet.", left_card)
         self._activity_label.setWordWrap(True)
         self._activity_label.setAlignment(Qt.AlignTop | Qt.AlignLeft)
-        self._activity_label.setStyleSheet("color: #94A3B8;")
         left_lay.addWidget(self._activity_label)
         left_lay.addStretch(1)
         middle.addWidget(left_card, stretch=1)
@@ -204,7 +223,6 @@ class DashboardWidget(QWidget):
         self._trending_label = QLabel("No data yet.", trending_card)
         self._trending_label.setWordWrap(True)
         self._trending_label.setAlignment(Qt.AlignTop | Qt.AlignLeft)
-        self._trending_label.setStyleSheet("color: #94A3B8;")
         trending_lay.addWidget(self._trending_label)
         trending_lay.addStretch(1)
         bottom.addWidget(trending_card, stretch=2)
@@ -232,23 +250,28 @@ class DashboardWidget(QWidget):
     # Event bus subscription
     # ------------------------------------------------------------------
     def _subscribe_events(self) -> None:
-        """Attempt to subscribe to ``core.events.EventBus`` if present."""
+        """Subscribe to the shared EventBus via ``get_event_bus()``.
+
+        Uses string topics (both ``scrape:completed`` and
+        ``scrape_completed`` spellings are registered so the dashboard
+        reacts no matter which one the engine publishes).
+        """
         try:  # pragma: no cover — depends on core module written by other agent
-            from core.events import EventBus  # type: ignore
+            from core.events import get_event_bus
         except Exception:
             logger.debug("core.events not available — dashboard will not get live updates.")
             return
         try:
-            bus = EventBus.instance() if hasattr(EventBus, "instance") else EventBus()
-            # The concrete EventBus API is not yet pinned; we use the
-            # commonly-seen ``subscribe(event, handler)`` signature.
-            if hasattr(bus, "subscribe"):
-                bus.subscribe("paper_added", self._on_paper_added)
-                bus.subscribe("scrape_finished", self._on_scrape_finished)
-                bus.subscribe("analysis_finished", self._on_analysis_finished)
-                bus.subscribe("export_finished", self._on_export_finished)
+            bus = get_event_bus()
+            for topic in _EVENT_TOPICS:
+                try:
+                    bus.subscribe(topic, self._on_event)
+                except TypeError:
+                    # Pre-contract bus expecting EventType members.
+                    continue
             self._event_subscriber = bus
-            logger.info("Subscribed dashboard to core.events.EventBus.")
+            logger.info("Subscribed dashboard to %d EventBus topics.",
+                        len(_EVENT_TOPICS))
         except Exception:  # pragma: no cover — defensive
             logger.exception("Failed to subscribe dashboard to EventBus.")
 
@@ -266,6 +289,7 @@ class DashboardWidget(QWidget):
             last_scrape: Timestamp of the last scrape operation, or
                 ``None`` if no scrape has been performed yet.
         """
+        self._paper_count = papers
         self._card_papers.set_value(f"{papers:,}")
         self._card_authors.set_value(f"{authors:,}")
         self._card_projects.set_value(f"{projects:,}")
@@ -316,7 +340,7 @@ class DashboardWidget(QWidget):
             ratio = max(0.5, weight / max_w)
             size = 10 + int(ratio * 12)
             parts.append(
-                f'<span style="font-size:{size}pt;color:#3B82F6;'
+                f'<span style="font-size:{size}pt;color:{ModernTheme.ACCENT};'
                 f'font-weight:600;">{topic}</span>'
             )
         self._trending_label.setText("   •   ".join(parts))
@@ -336,21 +360,82 @@ class DashboardWidget(QWidget):
     # ------------------------------------------------------------------
     # EventBus handlers — defensive: ignore payloads we don't understand.
     # ------------------------------------------------------------------
+    def _on_event(self, event_or_topic: Any, payload: Any = None) -> None:
+        """Single dispatch point for every subscribed topic.
+
+        Accepts either ``(Event)`` objects (pre-contract bus) or
+        ``(topic, payload)`` pairs (contract bus) and routes them to the
+        matching UI update.
+        """
+        topic = getattr(event_or_topic, "type", event_or_topic)
+        name = getattr(topic, "value", topic)
+        data = payload
+        if data is None:
+            data = getattr(event_or_topic, "payload", None)
+        try:
+            if name in ("paper_added",):
+                self._on_paper_added(data)
+            elif name in ("scrape:completed", "scrape_completed",
+                          "scrape_finished"):
+                self._on_scrape_finished(data)
+            elif name in ("scrape:failed", "scrape_failed"):
+                self._on_scrape_failed(data)
+            elif name in ("analysis_finished",):
+                self._on_analysis_finished(data)
+            elif name in ("export_finished", "export_completed"):
+                self._on_export_finished(data)
+        except Exception:  # noqa: BLE001 — handlers must never break the bus
+            logger.exception("Dashboard event handler failed for %r", name)
+
+    def _append_activity(self, text: str) -> None:
+        """Prepend a timestamped line to the Recent Activity timeline."""
+        stamp = datetime.now().strftime("%H:%M")
+        if not hasattr(self, "_activity_lines"):
+            self._activity_lines: List[str] = []
+        self._activity_lines.insert(0, f"[{stamp}] {text}")
+        del self._activity_lines[12:]
+        self.set_recent_activity(self._activity_lines)
+
+    def _payload_title(self, payload: Any) -> str:
+        """Best-effort human label from an event payload."""
+        if isinstance(payload, dict):
+            return str(payload.get("title") or payload.get("query") or "")
+        return str(payload) if payload else ""
+
     def _on_paper_added(self, *args: Any, **kwargs: Any) -> None:
-        logger.debug("Event paper_added received: %r %r", args, kwargs)
+        payload = args[0] if args else None
+        title = self._payload_title(payload) or "new paper"
+        self._append_activity(f"Paper added to library — {title[:60]}")
+        self._paper_count = getattr(self, "_paper_count", 0) + 1
+        self._card_papers.set_value(f"{self._paper_count:,}")
 
     def _on_scrape_finished(self, *args: Any, **kwargs: Any) -> None:
-        logger.debug("Event scrape_finished received: %r %r", args, kwargs)
+        payload = args[0] if args else None
+        query = self._payload_title(payload)
+        label = f"Scrape finished — {query[:40]}" if query else "Scrape finished"
+        self._append_activity(label)
+        self._card_scrape.set_value(datetime.now().strftime("%Y-%m-%d %H:%M"))
+        self._card_scrape.set_trend("latest run", positive=True)
+
+    def _on_scrape_failed(self, *args: Any, **kwargs: Any) -> None:
+        payload = args[0] if args else None
+        self._append_activity(f"Scrape failed — {self._payload_title(payload)[:60]}")
 
     def _on_analysis_finished(self, *args: Any, **kwargs: Any) -> None:
-        logger.debug("Event analysis_finished received: %r %r", args, kwargs)
+        payload = args[0] if args else None
+        self._append_activity(
+            f"Analysis finished — {self._payload_title(payload)[:60]}")
 
     def _on_export_finished(self, *args: Any, **kwargs: Any) -> None:
-        logger.debug("Event export_finished received: %r %r", args, kwargs)
+        payload = args[0] if args else None
+        self._append_activity(
+            f"Export finished — {self._payload_title(payload)[:60]}")
 
     # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------
     def _refresh_stat_cards(self) -> None:
         """Set the stat cards to a sensible zero-state on first show."""
+        self._paper_count = 0
+        self._activity_lines: List[str] = []
         self.set_stats(0, 0, 0, None)

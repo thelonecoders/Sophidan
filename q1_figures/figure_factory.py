@@ -493,9 +493,11 @@ class Q1FigureFactory:
             Q1Typography.configure_matplotlib(self.journal)
         except Exception as exc:  # pragma: no cover
             logger.warning("typography re-apply failed: %s", exc)
-        # Ensure constrained_layout is engaged (no-op if already True).
+        # Ensure constrained_layout is engaged (no-op if already active).
         try:
-            fig.set_constrained_layout(True)
+            # mpl >= 3.6: set_constrained_layout() is deprecated in favour
+            # of the layout-engine API.
+            fig.set_layout_engine("constrained")
         except Exception:
             pass
         return fig

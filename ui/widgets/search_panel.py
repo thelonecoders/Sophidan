@@ -36,6 +36,8 @@ from qtpy.QtWidgets import (
     QWidget,
 )
 
+from ui.modern_theme import ModernTheme
+
 logger = logging.getLogger(__name__)
 
 # Academic sources presented in the multi-select row.
@@ -118,7 +120,7 @@ class ResultCard(QFrame):
             authors_str = str(authors)
         year = self._result.get("year", "")
         meta_label = QLabel(f"{authors_str}  •  {year}")
-        meta_label.setStyleSheet("color:#888;")
+        meta_label.setStyleSheet(f"color:{ModernTheme.DARK_TEXT_MUTED};")
         meta_label.setWordWrap(True)
         meta_hbox.addWidget(meta_label, stretch=1)
 
@@ -126,14 +128,16 @@ class ResultCard(QFrame):
         if source:
             source_badge = QLabel(str(source))
             source_badge.setStyleSheet(
-                "background-color:#007acc;color:white;padding:2px 8px;border-radius:8px;"
+                f"background-color:{ModernTheme.ACCENT};color:white;"
+                "padding:2px 8px;border-radius:8px;"
             )
             meta_hbox.addWidget(source_badge)
 
         citations = self._result.get("citations")
         if citations not in (None, ""):
             cit_label = QLabel(f"★ {citations}")
-            cit_label.setStyleSheet("color:#ffc66d;font-weight:bold;")
+            cit_label.setStyleSheet(
+                f"color:{ModernTheme.WARNING};font-weight:bold;")
             meta_hbox.addWidget(cit_label)
         layout.addLayout(meta_hbox)
 
@@ -143,7 +147,8 @@ class ResultCard(QFrame):
             preview = (abstract[:240] + "…") if len(abstract) > 240 else abstract
             abs_label = QLabel(preview)
             abs_label.setWordWrap(True)
-            abs_label.setStyleSheet("color:#aaa;font-size:11px;")
+            abs_label.setStyleSheet(
+                f"color:{ModernTheme.DARK_TEXT_MUTED};font-size:11px;")
             layout.addWidget(abs_label)
 
         action_hbox = QHBoxLayout()
@@ -187,6 +192,7 @@ class SearchPanel(QWidget):
         self._engine: Optional[Any] = None
         self._autocomplete_timer: Optional[QTimer] = None
         self._search_task: Optional[Any] = None
+        self._search_task_done: bool = False
         self._cancel_requested: bool = False
         self._all_results: List[Dict[str, Any]] = []
 
@@ -211,7 +217,7 @@ class SearchPanel(QWidget):
         query_row.addWidget(self.query_input, stretch=1)
 
         self.search_button = QPushButton("Search")
-        self.search_button.setObjectName("PrimaryButton")
+        self.search_button.setObjectName("PrimaryBtn")
         query_row.addWidget(self.search_button)
 
         self.advanced_toggle = QPushButton("Advanced ▸")
@@ -317,7 +323,8 @@ class SearchPanel(QWidget):
         self.progress_bar.setValue(0)
         self.progress_bar.setTextVisible(False)
         self.status_label = QLabel("Idle")
-        self.status_label.setStyleSheet("color:#888;")
+        self.status_label.setStyleSheet(
+            f"color:{ModernTheme.DARK_TEXT_MUTED};")
         self.cancel_button = QPushButton("Cancel")
         self.cancel_button.setEnabled(False)
         bottom_row.addWidget(self.progress_bar, stretch=2)
@@ -331,6 +338,8 @@ class SearchPanel(QWidget):
         self.cancel_button.clicked.connect(self._on_cancel)
         self.advanced_toggle.toggled.connect(self._on_advanced_toggle)
         self.query_input.textEdited.connect(self._on_query_edited)
+        # Enter in the query field starts the search.
+        self.query_input.returnPressed.connect(self._on_search)
 
     # ----------------------------------------------------------- Autocomplete
 
@@ -422,11 +431,15 @@ class SearchPanel(QWidget):
         return self._engine
 
     def _launch_search_worker(self) -> None:
-        """Build and start a background Worker for the scraping task.
+        """Run the scrape in a background ``utils.workers.Worker``.
 
-        Falls back to a synchronous call if ``utils.workers.Worker`` is not
-        available (e.g. minimal environments used by import tests).
+        The worker is submitted through ``WorkerPool.instance().submit``;
+        its ``signals.progress / result / error / finished`` signals drive
+        the UI.  Cancellation is cooperative: the engine receives a
+        ``should_cancel`` callable it polls between sources.
         """
+        from utils.workers import Worker, WorkerPool
+
         engine = self._get_engine()
         query_dict = self._build_query()
         if engine is None:
@@ -435,65 +448,44 @@ class SearchPanel(QWidget):
             self.cancel_button.setEnabled(False)
             return
 
-        try:
-            from utils.workers import Worker  # type: ignore
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("utils.workers.Worker not available, running sync: %s", exc)
-            Worker = None  # type: ignore
-
-        def _do_search() -> Any:
-            return engine.search(
-                query=query_dict["query"],
+        def _do_search(progress_callback=None) -> Any:
+            """Blocking fan-out search — runs on a pool thread."""
+            report = progress_callback or (lambda pct, msg="": None)
+            filters: Dict[str, Any] = {}
+            if query_dict["year_from"] > 1900:
+                filters["year_from"] = query_dict["year_from"]
+            if query_dict["year_to"] < 2100:
+                filters["year_to"] = query_dict["year_to"]
+            if query_dict["open_access_only"]:
+                filters["open_access_only"] = True
+            if query_dict["advanced"]:
+                filters["advanced"] = query_dict["advanced"]
+            report(0, f"Querying {len(query_dict['sources'])} source(s)…")
+            result = engine.search_all(
+                query_dict["query"],
                 sources=query_dict["sources"],
-                year_range=(query_dict["year_from"], query_dict["year_to"]),
                 max_results=query_dict["max_results"],
-                open_access_only=query_dict["open_access_only"],
-                advanced=query_dict["advanced"],
+                should_cancel=lambda: self._cancel_requested,
+                **filters,
             )
-
-        if Worker is None:
-            try:
-                self._on_search_complete(_do_search())
-            except Exception as exc:  # noqa: BLE001
-                self._on_search_error(str(exc))
-            return
+            report(100, "Done")
+            return result
 
         self._search_task = Worker(_do_search)
-        for sig_name, slot in (
-            ("progress", self._on_progress),
-            ("finished", lambda *_: self._on_search_complete(None)),
-            ("error", self._on_search_error),
-            ("result", self._on_search_complete),
-        ):
-            sig = getattr(self._search_task, sig_name, None)
-            if sig is not None:
-                try:
-                    sig.connect(slot)
-                except Exception as exc:  # noqa: BLE001
-                    logger.debug("Could not connect %s: %s", sig_name, exc)
-        try:
-            self._search_task.start()
-        except Exception as exc:  # noqa: BLE001
-            logger.error("Failed to start search worker: %s", exc)
-            self._on_search_error(str(exc))
+        self._search_task.signals.progress.connect(self._on_progress)
+        self._search_task.signals.result.connect(self._on_search_complete)
+        self._search_task.signals.error.connect(self._on_search_error)
+        self._search_task.signals.finished.connect(
+            lambda: setattr(self, "_search_task_done", True))
+        WorkerPool.instance().submit(self._search_task)
 
     # ------------------------------------------------------ Progress / finish
 
-    def _on_progress(self, value: Any) -> None:
-        if isinstance(value, int):
-            self.progress_bar.setValue(value)
-        elif isinstance(value, (tuple, list)) and value:
-            cur = value[0]
-            total = value[1] if len(value) > 1 else 0
-            src = value[2] if len(value) > 2 else ""
-            pct = int(100 * cur / total) if total else 0
-            self.progress_bar.setValue(pct)
-            if src:
-                self.status_label.setText(f"Scraping {src} ({cur}/{total})…")
-        if self._cancel_requested and self._search_task is not None:
-            cancel_fn = getattr(self._search_task, "cancel", None)
-            if callable(cancel_fn):
-                cancel_fn()
+    def _on_progress(self, percent: int, message: str = "") -> None:
+        """Worker progress callback — ``signals.progress(int, str)``."""
+        self.progress_bar.setValue(int(percent))
+        if message:
+            self.status_label.setText(str(message))
 
     def _on_search_complete(self, result: Any) -> None:
         self.search_button.setEnabled(True)
@@ -504,17 +496,36 @@ class SearchPanel(QWidget):
         if result is None:
             pass
         elif isinstance(result, list):
-            results = result
+            results = [dict(p) for p in result if isinstance(p, dict)]
+        elif hasattr(result, "papers"):
+            # ScraperResult — convert Paper objects to plain dicts.
+            for p in (result.papers or []):
+                if isinstance(p, dict):
+                    results.append(dict(p))
+                else:
+                    to_dict = getattr(p, "to_dict", None)
+                    if callable(to_dict):
+                        try:
+                            d = to_dict()
+                            if isinstance(d, dict):
+                                results.append(d)
+                        except Exception:  # noqa: BLE001
+                            logger.debug("Paper.to_dict failed.", exc_info=True)
+            errors = getattr(result, "errors", None)
+            if errors:
+                logger.warning("Search completed with warnings: %s", errors)
         elif isinstance(result, dict) and "results" in result:
-            results = list(result.get("results", []))
+            results = [dict(p) for p in result.get("results", [])
+                       if isinstance(p, dict)]
         else:
             try:
-                results = list(result)  # type: ignore[arg-type]
+                results = [dict(p) for p in list(result)  # type: ignore[arg-type]
+                           if isinstance(p, dict)]
             except Exception:  # noqa: BLE001
                 results = []
         self._all_results = results
         self._populate_results(results)
-        self.results_ready.emit(result)
+        self.results_ready.emit(results)
         self.search_finished.emit()
 
     def _on_search_error(self, err: Any) -> None:
@@ -525,11 +536,8 @@ class SearchPanel(QWidget):
         self.status_label.setText(f"Error: {msg}")
 
     def _on_cancel(self) -> None:
+        """Request cooperative cancellation (checked between sources)."""
         self._cancel_requested = True
-        if self._search_task is not None:
-            cancel_fn = getattr(self._search_task, "cancel", None)
-            if callable(cancel_fn):
-                cancel_fn()
         self.status_label.setText("Canceling…")
 
     # ------------------------------------------------------------- Results UI
@@ -545,7 +553,8 @@ class SearchPanel(QWidget):
         self._clear_results()
         if not results:
             empty = QLabel("No results found.")
-            empty.setStyleSheet("color:#888;padding:8px;")
+            empty.setStyleSheet(
+                f"color:{ModernTheme.DARK_TEXT_MUTED};padding:8px;")
             self._results_layout.insertWidget(0, empty)
             return
         for i, res in enumerate(results):
@@ -555,6 +564,15 @@ class SearchPanel(QWidget):
         self.status_label.setText(f"{len(results)} results.")
 
     # ------------------------------------------------------------- Public API
+
+    def run_search(self, query: str) -> None:
+        """Programmatic entry point used by the global toolbar search.
+
+        Fills the query field (preserving the user's source/filter
+        choices) and immediately starts the search.
+        """
+        self.query_input.setText(str(query or ""))
+        self._on_search()
 
     def set_results(self, results: List[Dict[str, Any]]) -> None:
         """Directly populate the results panel without running a search."""

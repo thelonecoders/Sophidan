@@ -39,6 +39,8 @@ from qtpy.QtWidgets import (
     QWidget,
 )
 
+from ui.modern_theme import ModernTheme
+
 logger = logging.getLogger(__name__)
 
 # Analysis types presented in the left selector.
@@ -164,7 +166,7 @@ class AnalysisViewWidget(QWidget):
         # Run / export buttons
         actions = QHBoxLayout()
         self.run_button = QPushButton("Run Analysis")
-        self.run_button.setObjectName("PrimaryButton")
+        self.run_button.setObjectName("PrimaryBtn")
         self.export_figure_btn = QPushButton("Save Figure")
         self.export_model_btn = QPushButton("Save Model")
         self.export_csv_btn = QPushButton("Export Results CSV")
@@ -208,7 +210,8 @@ class AnalysisViewWidget(QWidget):
         self.progress_bar.setValue(0)
         self.progress_bar.setTextVisible(False)
         self.status_label = QLabel("Idle")
-        self.status_label.setStyleSheet("color:#888;")
+        self.status_label.setStyleSheet(
+            f"color:{ModernTheme.DARK_TEXT_MUTED};")
         self.cancel_button = QPushButton("Cancel")
         self.cancel_button.setEnabled(False)
         bottom.addWidget(self.progress_bar, stretch=2)
@@ -245,7 +248,7 @@ class AnalysisViewWidget(QWidget):
         self._ax.set_axis_off()
         self._ax.text(0.5, 0.5, "Run an analysis to see results.",
                       ha="center", va="center",
-                      transform=self._ax.transAxes, color="#888")
+                      transform=self._ax.transAxes, color=ModernTheme.DARK_TEXT_MUTED)
         self._canvas = FigureCanvasQTAgg(self._figure)
         layout.addWidget(self._canvas, stretch=1)
         self._toolbar = NavigationToolbar2QT(self._canvas, self)
@@ -269,6 +272,41 @@ class AnalysisViewWidget(QWidget):
     def set_data(self, data: Any) -> None:
         """Provide a DataFrame (or compatible) to be analyzed."""
         self._data = data
+
+    def set_papers(self, papers: Any) -> None:
+        """Data-bridge entry point — accept a list of paper dicts."""
+        self.set_data(papers)
+
+    def _papers_as_records(self) -> List[Dict[str, Any]]:
+        """Normalize ``self._data`` into a list of paper dicts."""
+        data = self._data
+        if data is None:
+            return []
+        # DataFrame duck-typing (avoids a hard pandas import).
+        if hasattr(data, "columns") and hasattr(data, "to_dict"):
+            try:
+                return [dict(r) for r in data.to_dict("records")]
+            except Exception:  # noqa: BLE001
+                logger.debug("DataFrame conversion failed.", exc_info=True)
+                return []
+        if isinstance(data, dict):
+            return [dict(data)]
+        if isinstance(data, (list, tuple)):
+            out: List[Dict[str, Any]] = []
+            for item in data:
+                if isinstance(item, dict):
+                    out.append(dict(item))
+                else:
+                    to_dict = getattr(item, "to_dict", None)
+                    if callable(to_dict):
+                        try:
+                            d = to_dict()
+                            if isinstance(d, dict):
+                                out.append(d)
+                        except Exception:  # noqa: BLE001
+                            logger.debug("Paper.to_dict failed.", exc_info=True)
+            return out
+        return []
 
     # ---------------------------------------------------------------- Run
 
@@ -298,101 +336,123 @@ class AnalysisViewWidget(QWidget):
             btn.setEnabled(False)
         self.analysis_started.emit(params["type"])
 
-        try:
-            from utils.workers import Worker  # type: ignore
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("utils.workers.Worker not available, running sync: %s", exc)
-            Worker = None  # type: ignore
+        from utils.workers import Worker, WorkerPool
 
-        def _work() -> Any:
-            return self._invoke_analysis(params)
-
-        if Worker is None:
-            try:
-                self._on_analysis_complete(_work())
-            except Exception as exc:  # noqa: BLE001
-                self._on_analysis_error(str(exc))
-            return
+        def _work(progress_callback=None) -> Any:
+            report = progress_callback or (lambda pct, msg="": None)
+            report(0, f"Running {params['type']} ({params['method']})…")
+            result = self._invoke_analysis(params)
+            report(100, "Done")
+            return result
 
         self._worker = Worker(_work)
-        for sig_name, slot in (
-            ("progress", self._on_progress),
-            ("finished", lambda *_: self._on_analysis_complete(None)),
-            ("error", self._on_analysis_error),
-            ("result", self._on_analysis_complete),
-        ):
-            sig = getattr(self._worker, sig_name, None)
-            if sig is not None:
-                try:
-                    sig.connect(slot)
-                except Exception as exc:  # noqa: BLE001
-                    logger.debug("Could not connect %s: %s", sig_name, exc)
-        try:
-            self._worker.start()
-        except Exception as exc:  # noqa: BLE001
-            self._on_analysis_error(str(exc))
+        self._worker.signals.progress.connect(self._on_progress)
+        self._worker.signals.result.connect(self._on_analysis_complete)
+        self._worker.signals.error.connect(self._on_analysis_error)
+        self._worker.signals.finished.connect(
+            lambda: setattr(self, "_worker_running", False))
+        self._worker_running = True
+        WorkerPool.instance().submit(self._worker)
 
     def _invoke_analysis(self, params: Dict[str, Any]) -> Any:
-        """Dispatch to the appropriate data_science module and return a result dict.
+        """Dispatch to the appropriate ``data_science`` module.
 
-        Lazy-imports the heavy ``data_science.*`` modules so the widget itself
-        remains importable without those deps installed.
+        Calls the engine-contract APIs (P-d):
+
+        * ``TopicModeler(method=…).analyze(papers, **kw) -> dict``
+        * ``Clusterer(method=…).analyze(papers, **kw) -> dict``
+        * ``TemporalAnalyzer(papers).analyze(**kw) -> dict``
+        * ``Bibliometrics(papers).summary() -> dict``
+        * ``EmbeddingsModel(…).encode(texts)``
+
+        Lazy-imports the heavy modules so the widget itself remains
+        importable without those deps installed.
         """
         a_type = params["type"]
-        try:
-            if a_type == "Topic Modeling":
-                from data_science.topic_modeler import TopicModeler
-                model = TopicModeler(
-                    num_topics=params["num_topics"],
-                    method=params["method"],
-                    random_state=params["random_state"],
-                )
-                return model.fit_transform(self._data)
-            if a_type == "Clustering":
-                from data_science.clustering import Clusterer
-                clusterer = Clusterer(
-                    n_clusters=params["num_topics"],
-                    method=params["method"],
-                    random_state=params["random_state"],
-                )
-                return clusterer.fit_predict(self._data)
-            if a_type == "Temporal":
-                from data_science.temporal_analysis import TemporalAnalyzer
-                ta = TemporalAnalyzer(
-                    year_range=(params["year_from"], params["year_to"]),
-                    method=params["method"],
-                )
-                return ta.analyze(self._data)
-            if a_type == "Bibliometrics":
-                from data_science.statistics import Bibliometrics
-                bib = Bibliometrics()
-                return bib.compute(self._data)
-            if a_type == "Embeddings":
-                from data_science.embeddings import Embedder
-                emb = Embedder(method=params["method"])
-                return emb.embed(self._data)
-        except Exception as exc:  # noqa: BLE001
-            logger.error("Analysis invocation failed: %s", exc)
-            raise
+        papers = self._papers_as_records()
+        if not papers:
+            raise ValueError(
+                "No analysable papers loaded — run a search or open a "
+                "project first.")
+        if a_type == "Topic Modeling":
+            from data_science.topic_modeler import TopicModeler
+            model = TopicModeler(method=params["method"])
+            return self._normalize_result(model.analyze(
+                papers,
+                num_topics=params["num_topics"],
+                random_state=params["random_state"],
+            ))
+        if a_type == "Clustering":
+            from data_science.clustering import Clusterer
+            clusterer = Clusterer(method=params["method"])
+            return self._normalize_result(clusterer.analyze(
+                papers,
+                n_clusters=params["num_topics"],
+                random_state=params["random_state"],
+            ))
+        if a_type == "Temporal":
+            from data_science.temporal_analysis import TemporalAnalyzer
+            ta = TemporalAnalyzer(papers)
+            return self._normalize_result(ta.analyze())
+        if a_type == "Bibliometrics":
+            from data_science.statistics import Bibliometrics
+            bib = Bibliometrics(papers)
+            return self._normalize_result(bib.summary())
+        if a_type == "Embeddings":
+            from data_science.embeddings import EmbeddingsModel
+            emb = EmbeddingsModel()
+            texts = [
+                " ".join(str(p.get(k, "")) for k in ("title", "abstract"))
+                for p in papers
+            ]
+            vectors = emb.encode(texts)
+            dim = 0
+            if vectors is not None and len(vectors):
+                try:
+                    dim = len(vectors[0])
+                except TypeError:  # pragma: no cover — scalar mock vectors
+                    dim = 1
+            return self._normalize_result({
+                "summary": {
+                    "documents": len(texts),
+                    "dimensions": dim,
+                    "method": params["method"],
+                },
+            })
         return None
+
+    @staticmethod
+    def _normalize_result(result: Any) -> Any:
+        """Coerce an analysis result into the ``{figure, table, html}``
+        shape expected by :meth:`_render_result`."""
+        if result is None:
+            return None
+        if isinstance(result, dict):
+            if any(k in result for k in ("figure", "table", "html")):
+                return result
+            # Generic dict → render as an HTML key/value table.
+            rows = "".join(
+                f"<tr><td><b>{k}</b></td><td>{v}</td></tr>"
+                for k, v in result.items()
+            )
+            return {"html": f"<table>{rows}</table>"}
+        # DataFrame duck-typing.
+        if hasattr(result, "to_html") and hasattr(result, "columns"):
+            try:
+                return {"html": result.to_html(border=0, max_rows=200)}
+            except Exception:  # noqa: BLE001
+                pass
+        if isinstance(result, (list, tuple)):
+            return {"html": "<pre>" + "\n".join(str(r) for r in result[:200]) + "</pre>"}
+        return {"html": f"<pre>{result}</pre>"}
 
     # --------------------------------------------------------- Progress/end
 
-    def _on_progress(self, value: Any) -> None:
-        if isinstance(value, int):
-            self.progress_bar.setValue(value)
-        elif isinstance(value, (tuple, list)) and value:
-            cur = value[0]
-            total = value[1] if len(value) > 1 else 0
-            stage = value[2] if len(value) > 2 else ""
-            pct = int(100 * cur / total) if total else 0
-            self.progress_bar.setValue(pct)
-            if stage:
-                self.status_label.setText(f"{stage} ({cur}/{total})…")
-        if self._cancel_requested and self._worker is not None:
-            cancel_fn = getattr(self._worker, "cancel", None)
-            if callable(cancel_fn):
-                cancel_fn()
+    def _on_progress(self, percent: int, message: str = "") -> None:
+        """Worker progress callback — ``signals.progress(int, str)``."""
+        self.progress_bar.setValue(int(percent))
+        if message:
+            self.status_label.setText(str(message))
 
     def _on_analysis_complete(self, result: Any) -> None:
         self.run_button.setEnabled(True)
@@ -411,18 +471,16 @@ class AnalysisViewWidget(QWidget):
     def _on_analysis_error(self, err: Any) -> None:
         self.run_button.setEnabled(True)
         self.cancel_button.setEnabled(False)
-        msg = str(err)
-        logger.error("Analysis failed: %s", msg)
+        msg = str(err).strip().splitlines()[-1] if str(err).strip() else "unknown error"
+        logger.error("Analysis failed: %s", err)
         self.status_label.setText(f"Error: {msg}")
-        self.analysis_error.emit(msg)
+        self.analysis_error.emit(str(err))
 
     def _on_cancel(self) -> None:
+        """Flag cooperative cancellation — the current step will finish."""
         self._cancel_requested = True
-        if self._worker is not None:
-            cancel_fn = getattr(self._worker, "cancel", None)
-            if callable(cancel_fn):
-                cancel_fn()
-        self.status_label.setText("Canceling…")
+        self.status_label.setText(
+            "Cancellation requested — waiting for the current step…")
 
     # ------------------------------------------------------------ Rendering
 
@@ -490,7 +548,7 @@ class AnalysisViewWidget(QWidget):
         self._ax.set_axis_off()
         self._ax.text(0.5, 0.5, "No figure available.",
                      ha="center", va="center",
-                     transform=self._ax.transAxes, color="#888")
+                     transform=self._ax.transAxes, color=ModernTheme.DARK_TEXT_MUTED)
         if self._canvas is not None:
             self._canvas.draw_idle()
 

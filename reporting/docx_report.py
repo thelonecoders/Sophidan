@@ -588,20 +588,27 @@ class DOCXReport:
                 surname = first.split()[-1].lower() if first else ""
             return (surname, get_year(p) or 0)
         sorted_papers = sorted(papers, key=_sort_key)
-        for paper in sorted_papers:
+        for n, paper in enumerate(sorted_papers, start=1):
             text = formatter(paper)
             try:
-                para = self._doc.add_paragraph(style="List Number" if style == "ieee" else None)
-                _add_runs_with_markup(para, text)
-                # Hanging indent for APA / MLA.
-                if style in {"apa", "mla"}:
-                    try:
-                        from docx.shared import Inches  # noqa: WPS433
-                        para_format = para.paragraph_format
-                        para_format.left_indent = Inches(0.5)
-                        para_format.first_line_indent = Inches(-0.5)
-                    except Exception as exc:  # pragma: no cover
-                        logger.debug("bib indent failed: %s", exc)
+                if style == "ieee":
+                    # IEEE uses literal [n] citation-order prefixes; Word's
+                    # auto-numbering ("List Number" style) rendered as an
+                    # uncontrolled list and could not be referenced from
+                    # text (audit 4-i).
+                    para = self._doc.add_paragraph()
+                    _add_runs_with_markup(para, f"[{n}] {text}")
+                else:
+                    para = self._doc.add_paragraph()
+                    _add_runs_with_markup(para, text)
+                # Hanging indent for every bibliography style.
+                try:
+                    from docx.shared import Inches  # noqa: WPS433
+                    para_format = para.paragraph_format
+                    para_format.left_indent = Inches(0.5)
+                    para_format.first_line_indent = Inches(-0.5)
+                except Exception as exc:  # pragma: no cover
+                    logger.debug("bib indent failed: %s", exc)
             except Exception as exc:
                 logger.error("bibliography entry failed: %s", exc, exc_info=True)
 

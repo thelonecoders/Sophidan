@@ -17,7 +17,7 @@ import logging
 import time
 from typing import Any, Dict, List, Optional
 
-from qtpy.QtCore import Qt, Signal, QTimer
+from qtpy.QtCore import Qt, Signal
 from qtpy.QtGui import QColor
 from qtpy.QtWidgets import (
     QAbstractItemView,
@@ -43,6 +43,8 @@ from qtpy.QtWidgets import (
     QWidget,
 )
 
+from ui.modern_theme import ModernTheme
+
 logger = logging.getLogger(__name__)
 
 # Table column headers.
@@ -67,7 +69,8 @@ class StatCard(QGroupBox):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(10, 6, 10, 6)
         self.value_label = QLabel(value)
-        self.value_label.setStyleSheet("font-size:18px;font-weight:bold;color:#007acc;")
+        self.value_label.setStyleSheet(
+            f"font-size:18px;font-weight:bold;color:{ModernTheme.ACCENT};")
         self.value_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(self.value_label)
 
@@ -118,7 +121,7 @@ class ProxyPanel(QWidget):
         # Actions row
         actions = QHBoxLayout()
         self.refresh_button = QPushButton("Refresh Pool")
-        self.refresh_button.setObjectName("PrimaryButton")
+        self.refresh_button.setObjectName("PrimaryBtn")
         self.import_button = QPushButton("Import…")
         self.export_button = QPushButton("Export…")
         self.test_all_button = QPushButton("Test All")
@@ -212,9 +215,71 @@ class ProxyPanel(QWidget):
                 self._pool = None
         return self._pool
 
+    @staticmethod
+    def _proxy_to_dict(proxy: Any) -> Dict[str, Any]:
+        """Normalise a ``Proxy`` object (or dict) to the table schema.
+
+        The facade's ``list_proxies()`` returns dicts; the legacy pool's
+        ``ProxyManager.all_proxies()`` returns :class:`Proxy` dataclasses,
+        so both shapes are accepted.
+        """
+        if isinstance(proxy, dict):
+            return proxy
+        success_rate = 0
+        try:
+            success = int(getattr(proxy, "success_count", 0) or 0)
+            fails = int(getattr(proxy, "fail_count", 0) or 0)
+            total = success + fails
+            success_rate = round(100.0 * success / total, 1) if total else 0
+        except Exception:  # noqa: BLE001 — display only
+            success_rate = 0
+        last_check = getattr(proxy, "last_check", None)
+        if isinstance(last_check, (int, float)) and last_check:
+            last_check = time.strftime("%Y-%m-%d %H:%M",
+                                       time.localtime(last_check))
+        return {
+            "host": getattr(proxy, "host", ""),
+            "port": getattr(proxy, "port", ""),
+            "protocol": getattr(proxy, "protocol", ""),
+            "country": getattr(proxy, "country", ""),
+            "anonymity": getattr(proxy, "anonymity", ""),
+            "latency_ms": getattr(proxy, "latency_ms", 0) or 0,
+            "success_rate": success_rate,
+            "last_check": last_check or "",
+        }
+
+    def _list_proxies(self, pool: Any) -> Optional[List[Dict[str, Any]]]:
+        """Read the pool contents via the facade, falling back to the
+        legacy ``ProxyManager.all_proxies()`` when the facade method is
+        not yet available."""
+        list_fn = getattr(pool, "list_proxies", None)
+        if callable(list_fn):
+            try:
+                proxies = list_fn() or []
+            except Exception as exc:  # noqa: BLE001
+                self._log(f"list_proxies failed: {exc}")
+                return []
+            return [self._proxy_to_dict(p) for p in proxies]
+        manager = getattr(pool, "manager", None)
+        all_fn = getattr(manager, "all_proxies", None) if manager else None
+        if callable(all_fn):
+            try:
+                proxies = all_fn() or []
+            except Exception as exc:  # noqa: BLE001
+                self._log(f"all_proxies failed: {exc}")
+                return []
+            return [self._proxy_to_dict(p) for p in proxies]
+        return None
+
     # ----------------------------------------------------- Refresh / test
 
     def _on_refresh(self) -> None:
+        """Scrape fresh proxies in a background Worker.
+
+        Uses the facade ``ProxyPool.refresh(sources, target_count,
+        progress_cb)``; the pool's ``(done, total, result)`` progress
+        tuples are adapted to the Worker's ``(int, str)`` channel.
+        """
         pool = self._get_pool()
         if pool is None:
             self._log("ProxyPool unavailable — cannot refresh.")
@@ -224,53 +289,44 @@ class ProxyPanel(QWidget):
         self.refresh_started.emit()
         self._log("Refreshing proxy pool…")
 
-        try:
-            from utils.workers import Worker  # type: ignore
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("utils.workers.Worker not available, running sync: %s", exc)
-            Worker = None  # type: ignore
+        from utils.workers import Worker, WorkerPool
 
-        def _work() -> Any:
-            return pool.refresh()
+        def _work(progress_callback=None) -> Any:
+            report = progress_callback or (lambda pct, msg="": None)
 
-        if Worker is None:
+            def _pool_progress(done: int, total: int, result: Any = None) -> None:
+                pct = int(100 * done / total) if total else 0
+                report(pct, f"Health-checking proxies ({done}/{total})…")
+
             try:
-                proxies = _work()
-                self._populate_table(proxies)
-            except Exception as exc:  # noqa: BLE001
-                self._log(f"Refresh failed: {exc}")
-            self.refresh_finished.emit()
-            return
+                # Facade: refresh(sources=None, target_count=None,
+                #                 progress_cb=None)
+                pool.refresh(progress_cb=_pool_progress)
+            except (TypeError, AttributeError):
+                try:
+                    # Legacy pool: refresh_pool(target_count=…,
+                    # progress_cb=…) → int.
+                    pool.refresh_pool(progress_cb=_pool_progress)
+                except Exception as exc:  # noqa: BLE001
+                    logger.exception("Proxy refresh failed.")
+                    raise
+            proxies = self._list_proxies(pool)
+            report(100, "Done")
+            return proxies
 
         self._worker = Worker(_work)
-        for sig_name, slot in (
-            ("progress", self._on_progress),
-            ("result", lambda r: self._populate_table(r)),
-            ("error", lambda e: self._log(f"Refresh failed: {e}")),
-            ("finished", lambda *_: self._on_refresh_done()),
-        ):
-            sig = getattr(self._worker, sig_name, None)
-            if sig is not None:
-                try:
-                    sig.connect(slot)
-                except Exception as exc:  # noqa: BLE001
-                    logger.debug("Could not connect %s: %s", sig_name, exc)
-        try:
-            self._worker.start()
-        except Exception as exc:  # noqa: BLE001
-            self._log(f"Failed to start refresh worker: {exc}")
+        self._worker.signals.progress.connect(self._on_progress)
+        self._worker.signals.result.connect(self._populate_table)
+        self._worker.signals.error.connect(
+            lambda e: self._log(f"Refresh failed: {e}"))
+        self._worker.signals.finished.connect(self._on_refresh_done)
+        WorkerPool.instance().submit(self._worker)
 
-    def _on_progress(self, value: Any) -> None:
-        if isinstance(value, int):
-            self.progress_bar.setValue(value)
-        elif isinstance(value, (tuple, list)) and value:
-            cur = value[0]
-            total = value[1] if len(value) > 1 else 0
-            stage = value[2] if len(value) > 2 else ""
-            pct = int(100 * cur / total) if total else 0
-            self.progress_bar.setValue(pct)
-            if stage:
-                self._log(f"{stage} ({cur}/{total})…")
+    def _on_progress(self, percent: int, message: str = "") -> None:
+        """Worker progress callback — ``signals.progress(int, str)``."""
+        self.progress_bar.setValue(int(percent))
+        if message:
+            self._log(str(message))
 
     def _on_refresh_done(self) -> None:
         self.progress_bar.setValue(100)
@@ -279,44 +335,28 @@ class ProxyPanel(QWidget):
         self.refresh_finished.emit()
 
     def _on_test_all(self) -> None:
+        """Health-check every proxy in a background Worker."""
         pool = self._get_pool()
         if pool is None:
             self._log("ProxyPool unavailable — cannot test.")
             return
         self._log("Testing all proxies…")
 
-        try:
-            from utils.workers import Worker  # type: ignore
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("utils.workers.Worker not available, running sync: %s", exc)
-            Worker = None  # type: ignore
+        from utils.workers import Worker, WorkerPool
 
-        def _work() -> Any:
-            return pool.health_check_all()
-
-        if Worker is None:
-            try:
-                results = _work()
-                self._apply_test_results(results)
-            except Exception as exc:  # noqa: BLE001
-                self._log(f"Test failed: {exc}")
-            return
+        def _work(progress_callback=None) -> Any:
+            report = progress_callback or (lambda pct, msg="": None)
+            report(0, "Health check started…")
+            results = pool.health_check_all()
+            report(100, "Done")
+            return results
 
         self._worker = Worker(_work)
-        for sig_name, slot in (
-            ("result", lambda r: self._apply_test_results(r)),
-            ("error", lambda e: self._log(f"Test failed: {e}")),
-        ):
-            sig = getattr(self._worker, sig_name, None)
-            if sig is not None:
-                try:
-                    sig.connect(slot)
-                except Exception as exc:  # noqa: BLE001
-                    logger.debug("Could not connect %s: %s", sig_name, exc)
-        try:
-            self._worker.start()
-        except Exception as exc:  # noqa: BLE001
-            self._log(f"Failed to start test worker: {exc}")
+        self._worker.signals.progress.connect(self._on_progress)
+        self._worker.signals.result.connect(self._apply_test_results)
+        self._worker.signals.error.connect(
+            lambda e: self._log(f"Test failed: {e}"))
+        WorkerPool.instance().submit(self._worker)
 
     # ----------------------------------------------------- Table population
 
@@ -348,11 +388,11 @@ class ProxyPanel(QWidget):
                 item = QTableWidgetItem(val)
                 if c == 5 and isinstance(latency, (int, float)):
                     if latency < 200:
-                        item.setForeground(QColor("#2ca02c"))
+                        item.setForeground(QColor(ModernTheme.SUCCESS))
                     elif latency < 800:
-                        item.setForeground(QColor("#ff7f0e"))
+                        item.setForeground(QColor(ModernTheme.WARNING))
                     else:
-                        item.setForeground(QColor("#d62728"))
+                        item.setForeground(QColor(ModernTheme.DANGER))
                 self.table.setItem(r, c, item)
             if isinstance(latency, (int, float)) and latency > 0:
                 latencies.append(float(latency))
@@ -425,24 +465,34 @@ class ProxyPanel(QWidget):
             self._log(f"Removed {host}:{port}")
 
     def _test_one(self, host: str, port: str) -> None:
+        """Test a single proxy off the UI thread (facade ``test_proxy``)."""
         pool = self._get_pool()
         if pool is None:
             self._log("ProxyPool unavailable.")
             return
-        try:
-            result = pool.health_check(f"{host}:{port}")
-            self._log(f"Tested {host}:{port} → {result}")
-            self.proxy_tested.emit(f"{host}:{port}", result or {})
-        except Exception as exc:  # noqa: BLE001
-            self._log(f"Test error: {exc}")
+        addr = f"{host}:{port}"
+        from utils.workers import Worker, WorkerPool
+
+        def _work(progress_callback=None) -> Any:
+            return pool.test_proxy(addr)
+
+        worker = Worker(_work)
+        worker.signals.result.connect(lambda res: self._on_one_tested(addr, res))
+        worker.signals.error.connect(lambda e: self._log(f"Test error: {e}"))
+        WorkerPool.instance().submit(worker)
+
+    def _on_one_tested(self, addr: str, result: Any) -> None:
+        self._log(f"Tested {addr} → {result}")
+        self.proxy_tested.emit(addr, result or {})
 
     def _ban_proxy(self, host: str, port: str) -> None:
         pool = self._get_pool()
         if pool is None:
             return
+        addr = f"{host}:{port}"
         try:
-            pool.ban(f"{host}:{port}")
-            self._log(f"Banned {host}:{port}")
+            pool.ban(addr)
+            self._log(f"Banned {addr}")
         except Exception as exc:  # noqa: BLE001
             self._log(f"Ban error: {exc}")
 
@@ -459,11 +509,23 @@ class ProxyPanel(QWidget):
             self._log("ProxyPool unavailable — cannot import.")
             return
         try:
-            proxies = pool.import_from(path)
+            # Facade: import_from(sources) → list[dict]; legacy pool:
+            # import_from_file(path) → int count.
+            proxies: Any
+            try:
+                proxies = pool.import_from(path)
+            except (TypeError, AttributeError):
+                count = pool.import_from_file(path)
+                proxies = self._list_proxies(pool)
+                if isinstance(count, int) and proxies is not None:
+                    self._log(f"Imported {count} proxies from {path}")
             self._populate_table(proxies)
-            self._log(f"Imported {len(proxies) if proxies else 0} proxies from {path}")
+            if proxies is not None:
+                self._log(f"Import finished from {path} — "
+                          f"{len(proxies) if proxies else 0} proxies listed")
         except Exception as exc:  # noqa: BLE001
             self._log(f"Import error: {exc}")
+            QMessageBox.warning(self, "Import Proxies", f"Import failed:\n{exc}")
 
     def _on_export(self) -> None:
         path, _ = QFileDialog.getSaveFileName(
@@ -502,6 +564,11 @@ class ProxyPanel(QWidget):
         if pool is not None:
             try:
                 pool.set_chain(items, strategy=strategy)
+            except TypeError:
+                try:
+                    pool.set_chain(items)
+                except Exception as exc:  # noqa: BLE001
+                    self._log(f"Chain save error: {exc}")
             except Exception as exc:  # noqa: BLE001
                 self._log(f"Chain save error: {exc}")
 

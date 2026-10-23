@@ -253,14 +253,19 @@ def test_bibliometrics_compute_all():
     """compute_all should return all PoP indices as a dict."""
     from bibliometrics.pop_indices import PoPIndices
     result = PoPIndices().compute_all([10, 5, 3, 1, 0])
+    # Every headline index must be present AND numerically correct (the
+    # per-index values are independently derived in the tests above).
     for key in ("h_index", "e_index", "g_index", "i10_index",
-                "hc_index", "q2_index", "w_index", "h_max_index"):
-        # hc_index has multiple aliases in the dict; check at least one
-        pass
+                "q2_index", "w_index", "h_max_index"):
+        assert key in result, f"compute_all() is missing {key!r}"
     assert result["h_index"] == 3
     assert result["g_index"] == 4
     assert result["i10_index"] == 1
     assert result["total_citations"] == 19
+    # Consistency: e-index is the sqrt of the excess-citation surplus.
+    assert result["e_index"] >= 0.0
+    assert result["n_papers"] == 5
+    assert result["max_citations"] == 10
 
 
 def test_bibliometrics_author_profile(synthetic_papers):
@@ -430,14 +435,23 @@ def test_sr_protocol_template_validates(template):
 
 
 def test_sr_rob_tools_instantiate():
-    """All 4 risk-of-bias tools should instantiate without raising."""
+    """All 4 risk-of-bias tools should instantiate and expose their domains."""
     from systematic_review.risk_of_bias import (
         CochraneRoB2, ROBINS_I, QUADAS2, NewcastleOttawaScale,
     )
     for cls in (CochraneRoB2, ROBINS_I, QUADAS2, NewcastleOttawaScale):
         inst = cls()
         assert inst is not None
-        assert hasattr(inst, "name") or hasattr(inst, "__class__")
+        # Each tool must identify itself and declare its assessment domains.
+        assert inst.TOOL_NAME, f"{cls.__name__} has an empty TOOL_NAME"
+        assert inst.DISPLAY_NAME, f"{cls.__name__} has an empty DISPLAY_NAME"
+        assert len(inst.DOMAIN_CODES) >= 1, (
+            f"{cls.__name__} declares no assessment domains"
+        )
+        assert len(inst.DOMAIN_LABELS) == len(inst.DOMAIN_CODES), (
+            f"{cls.__name__} DOMAIN_LABELS/DOMAIN_CODES length mismatch"
+        )
+        assert callable(inst.assess) and callable(inst.to_table)
 
 
 # ---------------------------------------------------------------------------

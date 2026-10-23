@@ -47,6 +47,10 @@ class SynthesisMethod(Enum):
     META_ANALYSIS = "meta_analysis"
     NETWORK_META_ANALYSIS = "network_meta_analysis"
     QUALITATIVE_COMPARATIVE = "qualitative_comparative"
+    #: Alias — ``SynthesisMethod.QCA`` is the SAME member as
+    #: ``QUALITATIVE_COMPARATIVE`` (web/routes/sr.py and the UI map the
+    #: short name "qca" onto it).
+    QCA = "qualitative_comparative"
 
 
 # ---------------------------------------------------------------------------
@@ -757,26 +761,151 @@ class _QCASynthesizer(Synthesizer):
 
 
 class _MetaAnalysisSynthesizer(Synthesizer):
-    """Adapter that delegates to the sibling :mod:`meta_analysis` package."""
+    """Adapter that delegates to :class:`meta_analysis.pooling.PoolingEngine`.
 
+    Converts each extraction form's ``results.effect_sizes`` entries into
+    :class:`meta_analysis.effect_sizes.EffectSize` objects (pairing the
+    intervention / control arm entries per outcome), then pools them with
+    :meth:`PoolingEngine.pool`.
+    """
+
+    #: Accepted kwargs: ``method`` (PoolingMethod or name), ``confidence``,
+    #: ``outcome`` (restrict pooling to one outcome name).
     def __init__(self, **kwargs: Any) -> None:
-        self._kwargs = kwargs
+        self._kwargs = dict(kwargs)
+
+    # -- conversion helpers -----------------------------------------
+    @staticmethod
+    def _coerce_es_type(raw: Any) -> str:
+        """Best-effort effect-measure type from an extracted entry."""
+        t = getattr(raw, "effect_measure_type", None)
+        if isinstance(raw, dict):
+            t = raw.get("effect_measure_type", t)
+        return str(t or "SMD").upper()
+
+    @classmethod
+    def _arm_fields(cls, raw: Any) -> Dict[str, Any]:
+        return raw if isinstance(raw, dict) else {
+            f: getattr(raw, f, None)
+            for f in ("outcome", "group", "n", "mean", "sd", "events",
+                      "total", "hazard_ratio", "ci_lower", "ci_upper")
+        }
+
+    @classmethod
+    def _build_effect_sizes(cls, extractions: List[Any],
+                            outcome_filter: str = "") -> List[Any]:
+        """Convert extraction forms into meta_analysis EffectSize objects."""
+        from meta_analysis.effect_sizes import (
+            ContinuousGroup, EffectSizeCalculator, EffectSizeType,
+        )
+        out: List[Any] = []
+        for form in extractions:
+            results = getattr(form, "results", None)
+            es_entries = getattr(results, "effect_sizes", None) or []
+            # group entries per outcome: intervention vs control
+            by_outcome: Dict[str, Dict[str, Dict[str, Any]]] = {}
+            for raw in es_entries:
+                f = cls._arm_fields(raw)
+                name = str(f.get("outcome") or "")
+                if outcome_filter and name != outcome_filter:
+                    continue
+                group = str(f.get("group") or "intervention").lower()
+                if group not in ("intervention", "control"):
+                    group = "intervention"
+                by_outcome.setdefault(name, {}).setdefault(group, f)
+            for name, arms in by_outcome.items():
+                iv = arms.get("intervention")
+                ct = arms.get("control")
+                if not iv or not ct:
+                    continue
+                study_label = (
+                    getattr(form, "study_id", "")
+                    or getattr(form, "study_title", "")
+                    or name
+                )
+                try:
+                    es = None
+                    if iv.get("hazard_ratio") is not None:
+                        es = EffectSizeCalculator.from_hazard_ratio(
+                            hr=float(iv["hazard_ratio"]),
+                            ci_lower=float(iv.get("ci_lower") or 0) or 0.01,
+                            ci_upper=float(iv.get("ci_upper") or 0) or 0.01,
+                        )
+                        es.type = EffectSizeType.HR
+                    elif (iv.get("events") is not None
+                          and ct.get("events") is not None):
+                        es = EffectSizeCalculator.from_dichotomous(
+                            events_intervention=int(iv["events"]),
+                            total_intervention=int(iv.get("total") or 0),
+                            events_control=int(ct["events"]),
+                            total_control=int(ct.get("total") or 0),
+                            type="OR",
+                        )
+                    else:
+                        n_i, n_c = int(iv.get("n") or 0), int(ct.get("n") or 0)
+                        if n_i <= 0 or n_c <= 0:
+                            continue
+                        measure = cls._coerce_es_type(iv)
+                        es_type = (
+                            EffectSizeType.MD if measure == "MD" else EffectSizeType.SMD
+                        )
+                        g_i = ContinuousGroup(
+                            n=n_i, mean=float(iv.get("mean") or 0.0),
+                            sd=float(iv.get("sd") or 0.0))
+                        g_c = ContinuousGroup(
+                            n=n_c, mean=float(ct.get("mean") or 0.0),
+                            sd=float(ct.get("sd") or 0.0))
+                        es = EffectSizeCalculator.from_continuous(
+                            g_i, g_c, type=es_type.value)
+                    if es is not None:
+                        # Patch study metadata (the factory constructors
+                        # don't accept study_id / study_name kwargs).
+                        es.study_id = str(study_label)
+                        es.study_name = str(study_label)
+                        es.n_total = int(
+                            (iv.get("total") or iv.get("n") or 0)
+                            + (ct.get("total") or ct.get("n") or 0)
+                        ) or None
+                        out.append(es)
+                except (TypeError, ValueError) as exc:
+                    logger.warning(
+                        "Skipping study %s outcome %r: %s", study_label, name, exc
+                    )
+        return out
 
     def synthesize(self, extractions: List[Any]) -> Any:
         try:
-            from meta_analysis import MetaAnalysis  # type: ignore
+            from meta_analysis.pooling import PoolingEngine, PoolingMethod
         except ImportError as exc:
             raise NotImplementedError(
                 "Meta-analysis synthesis requires the `meta_analysis` "
                 "package, which is not yet installed in this environment. "
                 "Falling back to narrative synthesis is recommended."
             ) from exc
-        ma = MetaAnalysis(**self._kwargs)  # pragma: no cover - sibling API
-        return ma.run(extractions)  # pragma: no cover
+        effect_sizes = self._build_effect_sizes(
+            extractions, str(self._kwargs.get("outcome") or "")
+        )
+        if len(effect_sizes) < 2:
+            raise ValueError(
+                "Meta-analysis synthesis needs ≥ 2 usable intervention/"
+                "control arm pairs in the extraction forms; got "
+                f"{len(effect_sizes)}."
+            )
+        method = self._kwargs.get("method", PoolingMethod.DL)
+        if isinstance(method, str):
+            method = PoolingMethod(method.lower().replace("-", "_"))
+        confidence = float(self._kwargs.get("confidence", 0.95))
+        return PoolingEngine.pool(effect_sizes, method=method, confidence=confidence)
 
 
 class _NetworkMetaAnalysisSynthesizer(Synthesizer):
-    """Adapter that delegates to a sibling NMA implementation."""
+    """Adapter that delegates to :class:`meta_analysis.NetworkMetaAnalysis`.
+
+    ``NetworkMetaAnalysis`` takes a list of
+    :class:`~meta_analysis.network_meta.TreatmentComparison` objects, so
+    they must be supplied through the ``comparisons`` kwarg of
+    :meth:`SynthesisFactory.create`.
+    """
 
     def __init__(self, **kwargs: Any) -> None:
         self._kwargs = kwargs
@@ -789,8 +918,14 @@ class _NetworkMetaAnalysisSynthesizer(Synthesizer):
                 "Network meta-analysis requires the `meta_analysis` "
                 "package, which is not yet installed."
             ) from exc
-        nma = NetworkMetaAnalysis(**self._kwargs)  # pragma: no cover
-        return nma.run(extractions)  # pragma: no cover
+        comparisons = self._kwargs.get("comparisons")
+        if not comparisons:
+            raise ValueError(
+                "Network meta-analysis synthesis requires `comparisons` — "
+                "a list of meta_analysis.network_meta.TreatmentComparison "
+                "objects passed to SynthesisFactory.create()."
+            )
+        return NetworkMetaAnalysis(comparisons)
 
 
 class SynthesisFactory:

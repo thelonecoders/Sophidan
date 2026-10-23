@@ -474,13 +474,23 @@ class StatisticalPlots:
         show_at_risk_table: bool = True,
         show_p_value: bool = True,
     ):
-        """Kaplan-Meier survival curve with CI, at-risk table, log-rank p."""
+        """Kaplan-Meier survival curve with CI, at-risk table, log-rank p.
+
+        The log-rank statistic is the proper Mantel–Cox test: at each
+        event time the expected events in group 0 are ``E0 = d·n0/n``
+        and the hypergeometric variance is
+        ``V = d·(n0/n)·(n1/n)·(n−d)/(n−1)``; the statistic is
+        ``(Σ(O0−E0))² / ΣV`` with 1 degree of freedom. The at-risk
+        table shows the true number of subjects still under
+        observation (not survival percentages).
+        """
         import numpy as np
         colors = _palette(palette)
         time = np.asarray(time, dtype=float)
         event = np.asarray(event)
         if groups is None:
             groups_arr = np.zeros_like(time, dtype=int)
+            unique_groups: List[Any] = ["Group 1"]
         else:
             unique_groups = sorted(set(groups))
             group_to_idx = {g: i for i, g in enumerate(unique_groups)}
@@ -488,6 +498,7 @@ class StatisticalPlots:
 
         unique_g = sorted(set(groups_arr.tolist()))
         survival_curves: List[Tuple[np.ndarray, np.ndarray, str]] = []
+        group_times: List[np.ndarray] = []
         for i, g in enumerate(unique_g):
             mask = groups_arr == g
             t = time[mask]
@@ -502,13 +513,21 @@ class StatisticalPlots:
             surv = np.cumprod(1.0 - n_events / np.maximum(n_at_risk, 1))
             surv = np.concatenate([[1.0], surv])
             x = np.concatenate([[0], uniq_t])
+            # Curve ``g`` (a 0-based index into ``unique_groups``) maps to
+            # the group name ``unique_groups[g]`` — NOT ``groups[i]``
+            # (which follows the caller's input order, not the sorted
+            # curve order).
             label = (
-                groups[i] if groups is not None and i < len(set(groups))
+                str(unique_groups[g])
+                if groups is not None and g < len(unique_groups)
                 else f"Group {g + 1}"
             )
             ax.step(x, surv, where="post", color=colors[i % len(colors)],
                     linewidth=1.0, label=str(label))
             survival_curves.append((x, surv, str(label)))
+            # Keep the raw (sorted) times so the at-risk table can count
+            # the subjects actually still under observation.
+            group_times.append(t)
             # CI band (rough Greenwood)
             if show_ci and len(uniq_t) > 0:
                 with np.errstate(divide="ignore", invalid="ignore"):
@@ -531,44 +550,61 @@ class StatisticalPlots:
         ax.set_ylim(0, 1.05)
         if show_p_value and len(unique_g) == 2:
             try:
-                # Log-rank test (chi2 approximation)
+                # Log-rank (Mantel–Cox) test with the hypergeometric
+                # variance term. At each distinct event time t_j:
+                #   d  = total events, n = total at risk,
+                #   E0 = d·n0/n,  E1 = d·n1/n,
+                #   V  = d·(n0/n)·(n1/n)·(n−d)/(n−1)
+                # chi2 = (Σ(O0−E0))² / ΣV, df = 1.
                 from scipy.stats import chi2
                 mask0 = groups_arr == unique_g[0]
                 mask1 = groups_arr == unique_g[1]
-                t0, e0 = time[mask0], event[mask0]
-                t1, e1 = time[mask1], event[mask1]
+                t0, e0 = time[mask0], np.asarray(event[mask0], dtype=float)
+                t1, e1 = time[mask1], np.asarray(event[mask1], dtype=float)
                 uniq_times = np.unique(np.concatenate([t0, t1]))
                 obs0 = np.array([np.sum((t0 == ut) & (e0 == 1)) for ut in uniq_times])
                 obs1 = np.array([np.sum((t1 == ut) & (e1 == 1)) for ut in uniq_times])
-                n0 = np.array([np.sum(t0 >= ut) for ut in uniq_times])
-                n1 = np.array([np.sum(t1 >= ut) for ut in uniq_times])
-                total = obs0 + obs1
-                n_total = n0 + n1
-                expected0 = np.where(n_total > 0, total * n0 / np.maximum(n_total, 1), 0)
-                chi2_stat = np.sum(
-                    (obs0 - expected0) ** 2 / np.maximum(expected0, 1e-10)
-                )
-                p_val = 1 - chi2.cdf(chi2_stat, df=1)
-                ax.text(
-                    0.95, 0.95, f"log-rank\np = {p_val:.3g}",
-                    transform=ax.transAxes, ha="right", va="top",
-                    fontsize=7,
-                )
+                n0 = np.array([np.sum(t0 >= ut) for ut in uniq_times], dtype=float)
+                n1 = np.array([np.sum(t1 >= ut) for ut in uniq_times], dtype=float)
+                # Only times with at least one event contribute.
+                d = obs0 + obs1
+                ev_mask = d > 0
+                if np.any(ev_mask):
+                    d = d[ev_mask].astype(float)
+                    o0 = obs0[ev_mask].astype(float)
+                    nn0 = n0[ev_mask]
+                    nn1 = n1[ev_mask]
+                    nn = nn0 + nn1
+                    valid = nn > 0
+                    d, o0, nn0, nn1, nn = d[valid], o0[valid], nn0[valid], nn1[valid], nn[valid]
+                    with np.errstate(divide="ignore", invalid="ignore"):
+                        expected0 = d * nn0 / nn
+                        var = d * (nn0 / nn) * (nn1 / nn) * (nn - d) / np.maximum(nn - 1, 1)
+                    var = np.nan_to_num(var, nan=0.0, posinf=0.0, neginf=0.0)
+                    total_var = float(var.sum())
+                    if total_var > 0:
+                        chi2_stat = float((o0 - expected0).sum()) ** 2 / total_var
+                        p_val = float(chi2.sf(chi2_stat, df=1))
+                        ax.text(
+                            0.95, 0.95, f"log-rank\np = {p_val:.3g}",
+                            transform=ax.transAxes, ha="right", va="top",
+                            fontsize=7,
+                        )
             except Exception as exc:
                 logger.debug("log-rank computation skipped: %s", exc)
         if show_at_risk_table:
-            # We don't render a separate table here (would require
-            # dividing the axes); we annotate at the bottom of the axes.
-            for x_vals, surv, label in survival_curves:
-                # Place at-risk counts at the final 5 timepoints.
-                if len(x_vals) >= 5:
-                    sample_x = x_vals[::max(1, len(x_vals) // 5)][:5]
-                    for sx in sample_x:
-                        idx = np.searchsorted(x_vals, sx)
-                        n_risk = max(0, int(surv[min(idx, len(surv) - 1)] * 100))
-                        ax.text(sx, -0.08, str(n_risk),
-                                ha="center", va="top", fontsize=6,
-                                transform=ax.get_xaxis_transform())
+            # Annotate the true number at risk (subjects with time >= sx)
+            # beneath the axis at ~5 sampled timepoints per curve.
+            for ci_, (x_vals, _surv, _label) in enumerate(survival_curves):
+                t_g = group_times[ci_] if ci_ < len(group_times) else None
+                if t_g is None or len(x_vals) < 2:
+                    continue
+                sample_x = x_vals[::max(1, len(x_vals) // 5)][:5]
+                for sx in sample_x:
+                    n_risk = int(np.sum(t_g >= sx))
+                    ax.text(sx, -0.08, str(n_risk),
+                            ha="center", va="top", fontsize=6,
+                            transform=ax.get_xaxis_transform())
         if groups is not None:
             ax.legend(loc="best", frameon=False, fontsize=7)
         return ax
@@ -582,15 +618,25 @@ class StatisticalPlots:
         ci: Optional[Tuple[float, float]] = None,
         palette: Union[str, Sequence[str]] = "nature",
     ):
-        """ROC curve with optional AUC annotation."""
+        """ROC curve with optional AUC annotation.
+
+        ``ci`` is a ``(lower, upper)`` tuple for the AUC confidence
+        interval (rendered in the legend label). No shaded "CI band" is
+        drawn around the curve itself — a per-threshold TPR band would
+        be fabricated unless actually computed.
+        """
         colors = _palette(palette)
-        ax.plot(fpr, tpr, color=colors[0], linewidth=1.0,
-                label=f"AUC = {auc:.3f}" if auc is not None else "ROC")
+        label = "ROC"
+        if auc is not None:
+            label = f"AUC = {auc:.3f}"
+            if ci is not None:
+                try:
+                    lo, hi = float(ci[0]), float(ci[1])
+                    label += f" (95% CI {lo:.3f}\u2013{hi:.3f})"
+                except (TypeError, ValueError, IndexError):
+                    pass
+        ax.plot(fpr, tpr, color=colors[0], linewidth=1.0, label=label)
         ax.plot([0, 1], [0, 1], color="gray", linestyle="--", linewidth=0.5)
-        if ci is not None:
-            ax.fill_between(fpr, [max(0, t - 0.05) for t in tpr],
-                             [min(1, t + 0.05) for t in tpr],
-                             color=colors[0], alpha=0.15)
         ax.set_xlabel("False positive rate")
         ax.set_ylabel("True positive rate")
         ax.set_xlim(0, 1)

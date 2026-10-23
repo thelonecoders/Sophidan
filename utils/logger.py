@@ -78,6 +78,15 @@ _CONFIGURED_ROOTS: set = set()
 _MAX_VIEWER_LINES = 10_000
 
 
+def get_log_path() -> Path:
+    """Return the path of the rotating log file (``logs/ars.log``).
+
+    Added for UI consumers (e.g. the log viewer) that need to display or
+    open the current log file.
+    """
+    return _LOG_FILE
+
+
 # ---------------------------------------------------------------------------
 # Qt log handler — emits a signal per record (used by LogViewer)
 # ---------------------------------------------------------------------------
@@ -327,4 +336,4 @@ class LogViewer(_QtTextBase):  # type: ignore[misc]
         return handler
 
 
-__all__ = ["get_logger", "LogViewer", "QtLogHandler"]
+__all__ = ["get_logger", "LogViewer", "QtLogHandler", "get_log_path"]

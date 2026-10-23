@@ -160,6 +160,10 @@ class ModernTheme(QObject):
     QPushButton:hover { background-color: #475569; }
     QPushButton:pressed { background-color: #1E293B; }
     QPushButton:disabled { background-color: #1E293B; color: #64748B; }
+    QPushButton:focus {
+        border: 1px solid #3B82F6;
+        outline: none;
+    }
     QPushButton#PrimaryBtn {
         background-color: #3B82F6;
         border: 1px solid #2563EB;
@@ -168,18 +172,30 @@ class ModernTheme(QObject):
     }
     QPushButton#PrimaryBtn:hover { background-color: #2563EB; }
     QPushButton#PrimaryBtn:pressed { background-color: #1D4ED8; }
+    QPushButton#PrimaryBtn:focus {
+        border: 2px solid #F1F5F9;
+        outline: none;
+    }
     QPushButton#DangerBtn {
         background-color: #EF4444;
         border: 1px solid #DC2626;
         color: #FFFFFF;
     }
     QPushButton#DangerBtn:hover { background-color: #DC2626; }
+    QPushButton#DangerBtn:focus {
+        border: 2px solid #F1F5F9;
+        outline: none;
+    }
     QPushButton#GhostBtn {
         background-color: transparent;
         border: 1px solid #475569;
         color: #F1F5F9;
     }
     QPushButton#GhostBtn:hover { background-color: #334155; }
+    QPushButton#GhostBtn:focus {
+        border: 1px solid #3B82F6;
+        outline: none;
+    }
 
     /* ===== Inputs ===== */
     QLineEdit, QTextEdit, QPlainTextEdit, QSpinBox, QDoubleSpinBox,
@@ -193,6 +209,10 @@ class ModernTheme(QObject):
     }
     QLineEdit:focus, QTextEdit:focus, QComboBox:focus, QSpinBox:focus {
         border: 1px solid #3B82F6;
+    }
+    QLineEdit:focus, QTextEdit:focus, QPlainTextEdit:focus,
+    QSpinBox:focus, QDoubleSpinBox:focus, QDateEdit:focus {
+        border: 2px solid #3B82F6;
     }
     QComboBox::drop-down { border: none; width: 22px; }
     QComboBox QAbstractItemView {
@@ -354,6 +374,17 @@ class ModernTheme(QObject):
         border: 1px solid #3B82F6;
         background-color: #3B4658;
     }
+    QFrame#ActionCard:focus {
+        border: 2px solid #3B82F6;
+        outline: none;
+    }
+    QLabel#StatusChip {
+        background-color: #334155;
+        color: #F1F5F9;
+        padding: 6px 12px;
+        border-radius: 12px;
+        font-size: 9pt;
+    }
     """
 
     LIGHT_QSS: str = """
@@ -425,6 +456,10 @@ class ModernTheme(QObject):
     QPushButton:hover { background-color: #E2E8F0; }
     QPushButton:pressed { background-color: #CBD5E1; }
     QPushButton:disabled { background-color: #F8FAFC; color: #94A3B8; }
+    QPushButton:focus {
+        border: 1px solid #3B82F6;
+        outline: none;
+    }
     QPushButton#PrimaryBtn {
         background-color: #3B82F6;
         border: 1px solid #2563EB;
@@ -433,18 +468,30 @@ class ModernTheme(QObject):
     }
     QPushButton#PrimaryBtn:hover { background-color: #2563EB; }
     QPushButton#PrimaryBtn:pressed { background-color: #1D4ED8; }
+    QPushButton#PrimaryBtn:focus {
+        border: 2px solid #0F172A;
+        outline: none;
+    }
     QPushButton#DangerBtn {
         background-color: #EF4444;
         border: 1px solid #DC2626;
         color: #FFFFFF;
     }
     QPushButton#DangerBtn:hover { background-color: #DC2626; }
+    QPushButton#DangerBtn:focus {
+        border: 2px solid #0F172A;
+        outline: none;
+    }
     QPushButton#GhostBtn {
         background-color: transparent;
         border: 1px solid #CBD5E1;
         color: #0F172A;
     }
     QPushButton#GhostBtn:hover { background-color: #F1F5F9; }
+    QPushButton#GhostBtn:focus {
+        border: 1px solid #3B82F6;
+        outline: none;
+    }
 
     /* ===== Inputs ===== */
     QLineEdit, QTextEdit, QPlainTextEdit, QSpinBox, QDoubleSpinBox,
@@ -459,6 +506,10 @@ class ModernTheme(QObject):
     }
     QLineEdit:focus, QTextEdit:focus, QComboBox:focus, QSpinBox:focus {
         border: 1px solid #3B82F6;
+    }
+    QLineEdit:focus, QTextEdit:focus, QPlainTextEdit:focus,
+    QSpinBox:focus, QDoubleSpinBox:focus, QDateEdit:focus {
+        border: 2px solid #3B82F6;
     }
     QComboBox::drop-down { border: none; width: 22px; }
     QComboBox QAbstractItemView {
@@ -606,6 +657,17 @@ class ModernTheme(QObject):
         border: 1px solid #3B82F6;
         background-color: #EFF6FF;
     }
+    QFrame#ActionCard:focus {
+        border: 2px solid #3B82F6;
+        outline: none;
+    }
+    QLabel#StatusChip {
+        background-color: #E2E8F0;
+        color: #0F172A;
+        padding: 6px 12px;
+        border-radius: 12px;
+        font-size: 9pt;
+    }
     """
 
     @classmethod
@@ -614,10 +676,13 @@ class ModernTheme(QObject):
 
         Args:
             app: The active :class:`QApplication` instance.
-            theme: Either ``"dark"`` or ``"light"``.  Any other value
-                falls back to ``"dark"`` with a warning log.
+            theme: ``"dark"``, ``"light"`` or ``"system"`` (``system``
+                resolves to dark/light from the platform palette).  Any
+                other value falls back to ``"dark"`` with a warning log.
         """
         theme = (theme or "dark").lower()
+        if theme == "system":
+            theme = cls.detect_system_theme(app)
         if theme not in ("dark", "light"):
             logger.warning("Unknown theme %r — falling back to dark.", theme)
             theme = "dark"
@@ -632,6 +697,18 @@ class ModernTheme(QObject):
             _instance().theme_changed.emit(theme)
         except Exception:  # pragma: no cover — defensive
             logger.exception("Failed to apply theme %r", theme)
+
+    @classmethod
+    def detect_system_theme(cls, app: Optional[QApplication]) -> str:
+        """Resolve the ``system`` theme name to ``dark`` or ``light``.
+
+        Uses the lightness of the platform palette's window colour.
+        """
+        try:
+            color = app.palette().color(QPalette.Window)
+            return "dark" if color.lightness() < 128 else "light"
+        except Exception:  # pragma: no cover — defensive
+            return "dark"
 
     @classmethod
     def get_palette(cls, theme: str) -> Optional[QPalette]:
