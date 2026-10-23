@@ -22,7 +22,7 @@ upgrade to the latest minor release.
 
 Instead, please report vulnerabilities privately:
 
-1. Email **<security@academic-research-suite.org>** with:
+1. Email **<academicresearchsuite@proton.me>** with:
    - A description of the issue and its impact.
    - The minimum reproduction steps (commands, config, payload).
    - The version of ARS you tested against (`python main.py
