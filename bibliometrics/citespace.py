@@ -114,6 +114,71 @@ def _current_year() -> int:
     return datetime.now().year
 
 
+def _citation_history(
+    d: Dict[str, Any],
+    first_year: int,
+    last_year: int,
+    time_window: int = 1,
+) -> Optional[Tuple[List[float], List[int]]]:
+    """Extract a *real* per-year citation history from a paper dict.
+
+    Papers may carry their measured yearly citation counts under
+    ``citation_history`` (a ``{year: count}`` mapping or a list of
+    counts ordered from the publication year onward). This is the only
+    honest input for per-paper burst detection — total citation counts
+    alone cannot yield a per-year trajectory.
+
+    Args:
+        d: Paper dict.
+        first_year: Publication year (start of the series).
+        last_year: End year (inclusive) for the series.
+        time_window: Bin size (years) — values outside a 1-year window
+            are aggregated.
+
+    Returns:
+        ``(counts, years)`` when a usable history exists (at least two
+        bins, at least one non-zero count), else ``None``.
+    """
+    raw = d.get("citation_history")
+    if raw is None:
+        return None
+    series: Dict[int, float] = {}
+    if isinstance(raw, dict):
+        for k, v in raw.items():
+            try:
+                yk = int(k)
+                yv = float(v)
+            except (TypeError, ValueError):
+                continue
+            series[yk] = yv
+    elif isinstance(raw, (list, tuple)):
+        for offset, v in enumerate(raw):
+            try:
+                yv = float(v)
+            except (TypeError, ValueError):
+                continue
+            series[first_year + offset] = yv
+    else:
+        return None
+    if not series:
+        return None
+    if time_window <= 1:
+        years = list(range(first_year, last_year + 1))
+        counts = [float(series.get(y, 0.0)) for y in years]
+    else:
+        years = list(range(first_year, last_year + 1, time_window))
+        counts = [
+            float(sum(
+                series.get(yy, 0.0)
+                for yy in range(ystart, min(ystart + time_window, last_year + 1))
+            ))
+            for ystart in years
+        ]
+    if len(years) < 2 or not any(c > 0 for c in counts):
+        return None
+    return counts, years
+
+
 # ---------------------------------------------------------------------------
 # Burst dataclass
 # ---------------------------------------------------------------------------
@@ -132,6 +197,11 @@ class Burst:
         strength: Kleinberg burst strength (cumulative log-likelihood
             improvement vs the baseline state).
         duration: ``end_year - start_year + 1`` (years).
+        synthetic: ``True`` when the underlying per-year citation
+            trajectory was *synthesised* (uniform spread + an injected
+            peak at the publication year) rather than measured. Only
+            produced when ``detect_citation_bursts(synthetic=True)`` is
+            requested explicitly.
     """
 
     paper_id: str = ""
@@ -140,6 +210,7 @@ class Burst:
     end_year: int = 0
     strength: float = 0.0
     duration: int = 0
+    synthetic: bool = False
 
     def __post_init__(self) -> None:
         self.duration = max(self.end_year - self.start_year + 1, 1)
@@ -366,20 +437,28 @@ class CiteSpaceAnalyzer:
         s: float = 2.0,
         gamma: float = 1.0,
         current_year: Optional[int] = None,
+        synthetic: bool = False,
     ) -> List[Burst]:
         """Detect citation bursts using Kleinberg's algorithm.
 
-        The implementation runs burst detection twice:
+        The implementation runs burst detection on:
 
-        1. **Corpus-level**: aggregates the corpus into a per-year
-           publication-count time series (papers published per year)
-           and detects bursts on it. Corpus-level bursts are emitted
-           with ``paper_id = "CORPUS"``.
-        2. **Per-paper**: for each paper whose total citation count is
-           above the corpus median, synthesises a per-year citation
-           trajectory by distributing the total citations uniformly
-           across the years since publication, and detects bursts on
-           that trajectory.
+        1. **Corpus-level** (always): aggregates the corpus into a
+           per-year publication-count time series (papers published per
+           year) and detects bursts on it. Corpus-level bursts are
+           emitted with ``paper_id = "CORPUS"``.
+        2. **Per-paper** (only with *real* data or explicit opt-in): a
+           per-paper burst requires a per-year citation history, which
+           the base Paper schema does not expose. When a paper carries a
+           ``citation_history`` field (a ``{year: count}`` dict or a
+           list of counts starting at its publication year), Kleinberg
+           is run on that *real* series. Otherwise, per-paper bursts are
+           produced only when ``synthetic=True`` — and even then the
+           returned :class:`Burst` objects are flagged with
+           ``synthetic=True`` because the trajectory is fabricated
+           (uniform citation spread + an injected peak at the
+           publication year). The default ``synthetic=False`` prevents
+           fabricated per-paper bursts from masquerading as findings.
 
         Args:
             papers: Sequence of Paper objects.
@@ -387,9 +466,14 @@ class CiteSpaceAnalyzer:
             s: Kleinberg burst-strength multiplier.
             gamma: Kleinberg transition penalty.
             current_year: Override for the current calendar year.
+            synthetic: Allow *synthesised* per-paper trajectories when
+                no real per-year citation history is available. Default
+                ``False`` (only corpus-level + real-history bursts).
 
         Returns:
             List of :class:`Burst` objects (corpus-level + per-paper).
+            Per-paper bursts built from synthesised data carry
+            ``synthetic=True``.
         """
         if not _HAVE_NX:
             raise ImportError("networkx is required for CiteSpaceAnalyzer")
@@ -445,18 +529,29 @@ class CiteSpaceAnalyzer:
                 if y is None or y <= 0:
                     continue
                 end_y = max(cy, y)
-                years = list(range(y, end_y + 1, time_window))
-                if len(years) < 2:
+                history = _citation_history(d, y, end_y, time_window)
+                if history is not None:
+                    # Real per-year citation history supplied on the
+                    # paper — burst detection on measured data.
+                    counts, years = history
+                    is_synthetic = False
+                elif synthetic:
+                    # Explicitly requested fallback: synthesise a
+                    # per-year trajectory (uniform citation spread plus
+                    # an injected peak at the publication year). The
+                    # resulting bursts are approximations only.
+                    years = list(range(y, end_y + 1, time_window))
+                    if len(years) < 2:
+                        continue
+                    per_year = cites / len(years)
+                    counts = [per_year] * len(years)
+                    counts[0] = max(counts[0] * 2, 1.0)
+                    is_synthetic = True
+                else:
+                    # No real history and synthesis not allowed — skip
+                    # this paper (fabricated per-paper bursts are
+                    # disabled by default).
                     continue
-                # Uniform distribution of citations across the
-                # paper's lifetime (a coarse approximation; real
-                # burst detection requires yearly citation history
-                # which the Paper schema does not expose).
-                per_year = cites / len(years)
-                counts = [per_year] * len(years)
-                # Inject a single high-citation "burst" bin at the
-                # publication year (a common pattern).
-                counts[0] = max(counts[0] * 2, 1.0)
                 for sy, ey, strength in self._kleinberg_bursts(
                     counts, years, s=s, gamma=gamma,
                 ):
@@ -468,6 +563,7 @@ class CiteSpaceAnalyzer:
                         start_year=sy,
                         end_year=ey,
                         strength=strength,
+                        synthetic=is_synthetic,
                     ))
         return bursts
 

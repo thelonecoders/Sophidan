@@ -583,7 +583,6 @@ class VOSAnalyzer:
         """
         try:
             import matplotlib.pyplot as plt
-            import matplotlib.cm as cm
         except ImportError as exc:  # pragma: no cover
             raise ImportError(
                 "matplotlib is required for overlay_visualization"
@@ -626,7 +625,12 @@ class VOSAnalyzer:
         vmax = max(present) if present else 1
         if vmin == vmax:
             vmax = vmin + 1
-        cmap = cm.get_cmap(cmap_name)
+        import matplotlib
+        try:
+            cmap = matplotlib.colormaps[cmap_name]
+        except KeyError:
+            logger.warning("Unknown cmap %r — falling back to 'viridis'.", cmap_name)
+            cmap = matplotlib.colormaps["viridis"]
         colours = []
         for v in values:
             if v is None:

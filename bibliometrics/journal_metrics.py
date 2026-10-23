@@ -691,13 +691,15 @@ class JournalMetrics:
     ) -> float:
         """Compute the Elsevier CiteScore.
 
-        ``CiteScore(Y) = citations_in_(Y-1..Y-window) to journal's
-        articles_published_in_(Y-1..Y-window)
-        / number_of_journal_articles_published_in_(Y-1..Y-window)``
+        ``CiteScore(Y) = citations_received_in_[Y-window+1 .. Y] to the
+        journal's documents_published_in_[Y-window+1 .. Y] /
+        number_of_documents_published_in_[Y-window+1 .. Y]``
 
         Note the alignment: both numerator and denominator use the
-        *same* 4-year window (unlike the Impact Factor which uses a
-        2-year lag).
+        *same* window which is inclusive of the reporting year ``Y``
+        (per Elsevier's definition, ``CiteScore 2023`` counts citations
+        received in 2020–2023 to documents published 2020–2023). This
+        differs from the Impact Factor, which uses a 2-year lag.
 
         Args:
             papers: The full corpus.
@@ -709,7 +711,10 @@ class JournalMetrics:
             The CiteScore (float).
         """
         idx = self._build_index(papers)
-        window_years = list(range(year - window, year))
+        # Official window: [Y-(window-1) .. Y] — inclusive of the
+        # reporting year (the previous range(Y-window, year) started one
+        # year too early and excluded Y entirely).
+        window_years = list(range(year - window + 1, year + 1))
         # Citations received in any window-year by any paper of the
         # journal published in any window-year.
         target_ids: set = set()
@@ -931,15 +936,12 @@ class JournalMetrics:
             # With <4 journals, top = Q1, next = Q2, etc.
             q = min(pos, 4)
         else:
-            # Quartile boundaries.
-            if pos <= n // 4 + (1 if n % 4 else 0):
-                q = 1
-            elif pos <= n // 2 + (1 if n % 4 >= 2 else 0):
-                q = 2
-            elif pos <= 3 * n // 4 + (1 if n % 4 >= 3 else 0):
-                q = 3
-            else:
-                q = 4
+            # Quartile boundaries via ceil(4·pos/n): rank-1 of n journals
+            # with pos ≤ n/4 → Q1, pos ≤ n/2 → Q2, pos ≤ 3n/4 → Q3,
+            # else Q4. Unlike the previous hand-rolled boundaries this
+            # always yields every quartile band (n=5 → a Q2 exists,
+            # n=6 → a Q3 exists).
+            q = min(4, max(1, math.ceil(4 * pos / n)))
         return f"Q{q}"
 
     # ------------------------------------------------------------------
