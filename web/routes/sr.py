@@ -11,11 +11,15 @@ generation. All heavy deps are lazy-imported inside the handlers.
 #
 from __future__ import annotations
 
+import base64
 import logging
+import threading
 import uuid
 from typing import Any
 
 from flask import Blueprint, jsonify, request
+
+from web.routes._common import error_response, safe_remove, temp_file_path
 
 logger = logging.getLogger(__name__)
 
@@ -29,9 +33,34 @@ def _bad_request(msg: str):
 # In-memory registries (single-process dev server only; the production
 # path should persist to the canonical SQLite DB via the project_manager).
 _PROTOCOLS: dict = {}
-_SCREENING: dict = {}
 _ROB: dict = {}
 _EXTRACTIONS: dict = {}
+
+# ONE module-level ScreeningManager shared across all requests (per
+# audit 4-g: a per-request manager meant import/decide/progress never
+# saw each other's state).
+_SCREENING_MANAGER = None
+_SCREENING_LOCK = threading.Lock()
+
+# Whitelist for the protocol PUT handler — mass-assignment via setattr
+# is limited to known review-plan fields (never ``created_at``/``id``/
+# dunder attributes).
+_PROTOCOL_FIELDS = frozenset({
+    "title", "research_question", "objectives", "information_sources",
+    "search_strategy", "search_date_range", "data_extraction_template",
+    "risk_of_bias_tool", "synthesis_method", "registration", "authors",
+    "version",
+})
+
+
+def _screening_manager():
+    """Return the shared :class:`ScreeningManager` (created lazily)."""
+    global _SCREENING_MANAGER
+    with _SCREENING_LOCK:
+        if _SCREENING_MANAGER is None:
+            from systematic_review.screening import ScreeningManager
+            _SCREENING_MANAGER = ScreeningManager()
+        return _SCREENING_MANAGER
 
 
 # ----------------------------------------------------------------- Protocol
@@ -53,8 +82,8 @@ def create_protocol():
         _PROTOCOLS[pid] = proto
         return jsonify({"id": pid, "protocol": proto.to_dict() if hasattr(proto, "to_dict") else str(proto)})
     except Exception as exc:
-        logger.exception("/api/sr/protocol (create) failed: %s", exc)
-        return jsonify({"error": "analysis_failed", "message": str(exc)}), 502
+        return error_response(logger, "/api/sr/protocol (create) failed", exc,
+                              status=502, error="analysis_failed")
 
 
 @sr_bp.route("/protocol/<protocol_id>", methods=["GET"])
@@ -78,13 +107,22 @@ def update_protocol(protocol_id: str):
     if proto is None:
         return jsonify({"error": "not_found", "message": f"protocol {protocol_id} not found"}), 404
     try:
+        applied, ignored = [], []
         for k, v in payload.items():
-            if hasattr(proto, k):
+            # Mass-assignment guard: only whitelisted protocol fields
+            # are settable from HTTP payloads.
+            if k in _PROTOCOL_FIELDS:
                 setattr(proto, k, v)
-        return jsonify({"id": protocol_id, "protocol": proto.to_dict() if hasattr(proto, "to_dict") else str(proto)})
+                applied.append(k)
+            else:
+                ignored.append(k)
+        if ignored:
+            logger.debug("protocol update ignored fields: %s", ignored)
+        return jsonify({"id": protocol_id, "protocol": proto.to_dict() if hasattr(proto, "to_dict") else str(proto),
+                        "updated": applied})
     except Exception as exc:
-        logger.exception("/api/sr/protocol (update) failed: %s", exc)
-        return jsonify({"error": "analysis_failed", "message": str(exc)}), 502
+        return error_response(logger, "/api/sr/protocol (update) failed", exc,
+                              status=502, error="analysis_failed")
 
 
 # ----------------------------------------------------------------- Screening
@@ -100,13 +138,20 @@ def screening_import():
     payload = request.get_json(silent=True) or {}
     papers = payload.get("papers") or []
     try:
-        from systematic_review.screening import ScreeningManager
-        mgr = ScreeningManager()
+        mgr = _screening_manager()
         n = mgr.load_from_search(papers)
-        return jsonify({"imported": n, "record_ids": [r.record_id for r in mgr.records()]})
+        # ``records`` is a @property (list) on the current engine; call
+        # it defensively in case it reverts to a method upstream.
+        records = mgr.records
+        if callable(records):
+            records = records()
+        return jsonify({"imported": n,
+                        "record_ids": [getattr(r, "paper_id",
+                                              getattr(r, "record_id", ""))
+                                       for r in records]})
     except Exception as exc:
-        logger.exception("/api/sr/screening/import failed: %s", exc)
-        return jsonify({"error": "analysis_failed", "message": str(exc)}), 502
+        return error_response(logger, "/api/sr/screening/import failed", exc,
+                              status=502, error="analysis_failed")
 
 
 @sr_bp.route("/screening/<record_id>/decide", methods=["POST"])
@@ -126,36 +171,51 @@ def screening_decide(record_id: str):
     if not decision:
         return _bad_request("decision is required")
     try:
-        from systematic_review.screening import ScreeningManager, ScreeningStage
-        mgr = ScreeningManager()
+        from systematic_review.screening import ExclusionReasons, ScreeningStage
+        mgr = _screening_manager()
+        is_exclude = str(decision).strip().lower() == "exclude"
+        # Real kwargs: screen_*(record_id, decision, reviewer,
+        # exclusion_reason=None, notes=""). ``reason`` maps to a
+        # controlled ExclusionReasons code when it matches one
+        # (falling back to OTHER), and is always preserved verbatim in
+        # ``notes``.
+        exclusion_reason = None
+        if is_exclude:
+            try:
+                exclusion_reason = ExclusionReasons.from_value(reason or "other")
+            except ValueError:
+                exclusion_reason = ExclusionReasons.OTHER
         if stage == "full_text":
-            record = mgr.screen_full_text(record_id, decision=decision,
-                                          reviewer=reviewer, reason=reason or "")
+            record = mgr.screen_full_text(
+                record_id, decision=decision, reviewer=reviewer,
+                exclusion_reason=exclusion_reason,
+                notes=reason or "")
         else:
             stage_enum = ScreeningStage.from_value(stage) if stage else None
-            record = mgr.screen_title_abstract(record_id, decision=decision,
-                                                reviewer=reviewer, reason=reason or "")
+            record = mgr.screen_title_abstract(
+                record_id, decision=decision, reviewer=reviewer,
+                exclusion_reason=exclusion_reason,
+                notes=reason or "")
         return jsonify({
             "record_id": record_id,
             "decision": decision,
             "record": record.to_dict() if hasattr(record, "to_dict") else str(record),
         })
     except Exception as exc:
-        logger.exception("/api/sr/screening/<id>/decide failed: %s", exc)
-        return jsonify({"error": "analysis_failed", "message": str(exc)}), 502
+        return error_response(logger, "/api/sr/screening/<id>/decide failed", exc,
+                              status=502, error="analysis_failed")
 
 
 @sr_bp.route("/screening/progress", methods=["GET"])
 def screening_progress():
-    """Return stage-count progress for the in-memory screening manager."""
+    """Return stage-count progress for the shared screening manager."""
     try:
-        from systematic_review.screening import ScreeningManager
-        mgr = ScreeningManager()
+        mgr = _screening_manager()
         progress = mgr.progress()
         return jsonify({"progress": progress})
     except Exception as exc:
-        logger.exception("/api/sr/screening/progress failed: %s", exc)
-        return jsonify({"error": "analysis_failed", "message": str(exc)}), 502
+        return error_response(logger, "/api/sr/screening/progress failed", exc,
+                              status=502, error="analysis_failed")
 
 
 # ----------------------------------------------------------------- Risk of Bias
@@ -193,8 +253,8 @@ def rob_assess(study_id: str):
             "result": result.to_dict() if hasattr(result, "to_dict") else str(result),
         })
     except Exception as exc:
-        logger.exception("/api/sr/rob (POST) failed: %s", exc)
-        return jsonify({"error": "analysis_failed", "message": str(exc)}), 502
+        return error_response(logger, "/api/sr/rob (POST) failed", exc,
+                              status=502, error="analysis_failed")
 
 
 @sr_bp.route("/rob/<study_id>", methods=["GET"])
@@ -238,8 +298,8 @@ def extraction(study_id: str):
             "extraction": form.to_dict() if hasattr(form, "to_dict") else str(form),
         })
     except Exception as exc:
-        logger.exception("/api/sr/extraction failed: %s", exc)
-        return jsonify({"error": "analysis_failed", "message": str(exc)}), 502
+        return error_response(logger, "/api/sr/extraction failed", exc,
+                              status=502, error="analysis_failed")
 
 
 # ----------------------------------------------------------------- Synthesis
@@ -271,8 +331,8 @@ def synthesis():
             "result": result.to_dict() if hasattr(result, "to_dict") else str(result),
         })
     except Exception as exc:
-        logger.exception("/api/sr/synthesis failed: %s", exc)
-        return jsonify({"error": "analysis_failed", "message": str(exc)}), 502
+        return error_response(logger, "/api/sr/synthesis failed", exc,
+                              status=502, error="analysis_failed")
 
 
 # ----------------------------------------------------------------- PRISMA
@@ -297,31 +357,27 @@ def prisma_flow():
         from prisma.flow_diagram import PRISMAFlowGenerator, PRISMAStageCounts
         counts = PRISMAStageCounts.from_dict(counts_data)
         gen = PRISMAFlowGenerator(counts, title=title, extension=extension)
-        # Render to a temp path then read back.
-        import base64
-        import tempfile
-        import os
+        # Render to a secure temp path then read back.
         if fmt == "svg":
-            path = tempfile.mktemp(suffix=".svg")
+            path = temp_file_path(".svg")
             gen.render_svg(path, style=style)
         elif fmt == "png":
-            path = tempfile.mktemp(suffix=".png")
+            path = temp_file_path(".png")
             gen.render_png(path, dpi=150, style=style)
         elif fmt == "pdf":
-            path = tempfile.mktemp(suffix=".pdf")
+            path = temp_file_path(".pdf")
             gen.render_pdf(path, style=style)
         else:
             return _bad_request("format must be one of svg|png|pdf")
-        with open(path, "rb") as fh:
-            content = base64.b64encode(fh.read()).decode("ascii")
         try:
-            os.remove(path)
-        except OSError:
-            pass
+            with open(path, "rb") as fh:
+                content = base64.b64encode(fh.read()).decode("ascii")
+        finally:
+            safe_remove(path)
         return jsonify({"format": fmt, "content_b64": content})
     except Exception as exc:
-        logger.exception("/api/sr/prisma-flow failed: %s", exc)
-        return jsonify({"error": "analysis_failed", "message": str(exc)}), 502
+        return error_response(logger, "/api/sr/prisma-flow failed", exc,
+                              status=502, error="analysis_failed")
 
 
 @sr_bp.route("/prisma-checklist", methods=["GET"])
@@ -332,5 +388,5 @@ def prisma_checklist():
         cl = PRISMAChecklist()
         return jsonify({"items": [i.to_dict() if hasattr(i, "to_dict") else dict(i) for i in cl.items] if hasattr(cl, "items") else []})
     except Exception as exc:
-        logger.exception("/api/sr/prisma-checklist failed: %s", exc)
-        return jsonify({"error": "analysis_failed", "message": str(exc)}), 502
+        return error_response(logger, "/api/sr/prisma-checklist failed", exc,
+                              status=502, error="analysis_failed")

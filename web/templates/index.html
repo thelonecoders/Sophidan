@@ -379,11 +379,23 @@
         statusText.textContent = label;
       }
 
+      function escapeHtml(value) {
+        // Escape everything that crosses from JSON into innerHTML —
+        // task queries / statuses are user-supplied and stored on the
+        // server, so they are a stored-XSS sink otherwise.
+        return String(value === null || value === undefined ? '' : value)
+          .replace(/&/g, '&amp;')
+          .replace(/</g, '&lt;')
+          .replace(/>/g, '&gt;')
+          .replace(/"/g, '&quot;')
+          .replace(/'/g, '&#39;');
+      }
+
       function fmtValue(v) {
         if (v === true)  return '<span class="value true">yes</span>';
         if (v === false) return '<span class="value false">no</span>';
         if (v === null || v === undefined) return '<span class="value">—</span>';
-        return '<span class="value">' + String(v) + '</span>';
+        return '<span class="value">' + escapeHtml(v) + '</span>';
       }
 
       function renderHealth(data) {
@@ -429,9 +441,10 @@
         }
         var rows = tasks.slice(0, 10).map(function (t) {
           var age = ((Date.now() / 1000) - (t.created_at || 0)).toFixed(0);
-          return '<li><span class="ts">[' + t.status + ']</span> ' +
-                 (t.query || '(empty)') + ' — ' +
-                 (t.results_count || 0) + ' results — ' + age + 's ago</li>';
+          return '<li><span class="ts">[' + escapeHtml(t.status) + ']</span> ' +
+                 escapeHtml(t.query || '(empty)') + ' — ' +
+                 escapeHtml(t.results_count || 0) + ' results — ' +
+                 escapeHtml(age) + 's ago</li>';
         });
         activityEl.innerHTML = rows.join('');
       }

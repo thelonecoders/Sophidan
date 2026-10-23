@@ -517,10 +517,14 @@ data: {<span class="k">"done"</span>: true}</pre></div>
       <div class="endpoint">
         <div class="head"><span class="method POST">POST</span>
           <span class="path">/api/export/report</span>
-          <span class="summary">PDF / DOCX / PPTX report</span></div>
+          <span class="summary">PDF / DOCX / PPTX report → returns the generated file path</span></div>
         <div class="body"><div class="col"><h4>Request body</h4>
           <pre>{<span class="k">"type"</span>: <span class="s">"pdf"</span>, <span class="k">"project_id"</span>: 1,
- <span class="k">"sections"</span>: [<span class="s">"summary"</span>, <span class="s">"analytics"</span>]}</pre></div></div>
+ <span class="k">"sections"</span>: [<span class="s">"Summary"</span>, <span class="s">"Papers"</span>]}</pre></div>
+          <div class="col"><h4>Example response</h4>
+            <pre><span class="c"># 200 OK — report built via the PDFReport builder API</span>
+{<span class="k">"type"</span>: <span class="s">"pdf"</span>, <span class="k">"project_id"</span>: 1, <span class="k">"papers"</span>: 42,
+ <span class="k">"path"</span>: <span class="s">"…/data/reports/report_project1.pdf"</span>}</pre></div></div>
       </div>
       <div class="endpoint">
         <div class="head"><span class="method POST">POST</span>

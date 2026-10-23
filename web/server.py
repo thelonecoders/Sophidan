@@ -18,18 +18,46 @@ from __future__ import annotations
 
 import logging
 import os
+import secrets
 import sys
 import threading
+import time
+import uuid
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-from flask import Flask, Response, jsonify, render_template, request
+from flask import Flask, Response, g, jsonify, render_template, request
 from flask_cors import CORS
 
 logger = logging.getLogger(__name__)
 
-# Canonical version string for the web server subsystem.
-__version__ = "0.1.0"
+# Canonical version string for the web server subsystem, sourced from
+# the layered configuration so `/api/health` reports the real version.
+try:
+    from config.settings import get_settings as _get_settings
+
+    __version__ = _get_settings().version
+except Exception:  # noqa: BLE001 - config layer must never break startup
+    __version__ = "2.0.0"
+
+# Task-registry hygiene: in-memory tasks are capped and expired so the
+# registry cannot grow without bound across a long-lived server process.
+TASK_REGISTRY_CAP = 200
+TASK_TTL_SECONDS = 3600.0  # 1 hour
+
+# Content-Security-Policy allowing the inline <script>/<style> blocks the
+# bundled templates use, while restricting every other source to 'self'.
+_CONTENT_SECURITY_POLICY = (
+    "default-src 'self'; "
+    "script-src 'self' 'unsafe-inline'; "
+    "style-src 'self' 'unsafe-inline'; "
+    "img-src 'self' data:; "
+    "font-src 'self'; "
+    "connect-src 'self'; "
+    "frame-ancestors 'none'; "
+    "base-uri 'self'; "
+    "form-action 'self'"
+)
 
 
 class ServerState:
@@ -64,6 +92,7 @@ class ServerState:
         self._chat_engine = None
         self._event_bus = None
         self._tasks: dict[str, dict[str, Any]] = {}
+        self._tasks_lock = threading.Lock()
         self._socketio = None
         self._initialized = True
 
@@ -149,32 +178,59 @@ class ServerState:
 
     @property
     def chat_engine(self):
-        """Return the shared :class:`ChatEngine`, lazily created."""
+        """Return the shared :class:`ChatEngine`, lazily created.
+
+        The engine is built from the layered settings (``ai_provider``,
+        ``ai_model``, ``ai_api_key``, ``ai_base_url``). If the real
+        provider is misconfigured or unavailable we fall back to the
+        offline echo backend so the web UI keeps working out-of-the-box.
+        """
         if self._chat_engine is None:
             try:
                 from ai_assistant.chat_engine import ChatEngine  # type: ignore
                 from ai_assistant.llm_client import LLMClient  # type: ignore
 
-                # ChatEngine requires an llm_client. Default to the offline
-                # echo backend so the web UI works out-of-the-box without
-                # cloud API keys; users can swap in a real provider later
-                # via the desktop settings panel.
-                llm = LLMClient(provider="none", model="echo")
+                llm = None
+                try:
+                    from config.settings import get_settings
+
+                    settings = get_settings()
+                    llm = LLMClient(
+                        provider=settings.ai_provider,
+                        model=settings.ai_model or "echo",
+                        api_key=settings.ai_api_key or None,
+                        base_url=settings.ai_base_url or None,
+                    )
+                except Exception as exc:  # pragma: no cover - defensive
+                    logger.warning(
+                        "Could not build LLMClient from settings: %s", exc
+                    )
+                if llm is None:  # echo fallback
+                    llm = LLMClient(provider="none", model="echo")
                 self._chat_engine = ChatEngine(llm_client=llm)
-                logger.info("ChatEngine initialised")
+                logger.info(
+                    "ChatEngine initialised (provider=%s)",
+                    getattr(llm, "provider", "?"),
+                )
             except Exception as exc:  # pragma: no cover - defensive
                 logger.warning("ChatEngine unavailable: %s", exc)
         return self._chat_engine
 
     @property
     def event_bus(self):
-        """Return the shared :class:`EventBus`, lazily created."""
+        """Return the process-wide :class:`EventBus` singleton.
+
+        Always resolves through :func:`core.events.get_event_bus` so the
+        web layer, the scraping engine, and the desktop UI all share the
+        same bus (a private ``EventBus()`` instance would silently drop
+        every cross-component event).
+        """
         if self._event_bus is None:
             try:
-                from core.events import EventBus  # type: ignore
+                from core.events import get_event_bus  # type: ignore
 
-                self._event_bus = EventBus()
-                logger.info("EventBus initialised")
+                self._event_bus = get_event_bus()
+                logger.info("EventBus initialised (process-wide singleton)")
             except Exception as exc:  # pragma: no cover - defensive
                 logger.warning("EventBus unavailable: %s", exc)
         return self._event_bus
@@ -182,17 +238,75 @@ class ServerState:
     # ------------------------------------------------------------------ #
     # Task registry (used by the scraping endpoints)
     # ------------------------------------------------------------------ #
+    # Entries are stored behind a lock and always handed out as copies,
+    # so background workers mutating their local task dict never race
+    # with request threads reading the registry.
     def register_task(self, task_id: str, payload: dict[str, Any]) -> None:
-        """Record a new long-running task in the in-memory registry."""
-        self._tasks[task_id] = payload
+        """Record a new long-running task in the in-memory registry.
+
+        The payload is copied on write and the registry is pruned
+        (TTL 1h, cap 200) on every insert so it cannot grow unbounded.
+        """
+        now = time.time()
+        with self._tasks_lock:
+            record = dict(payload)
+            record.setdefault("registered_at", now)
+            self._tasks[task_id] = record
+            self._evict_tasks(now)
+
+    def _evict_tasks(self, now: float) -> None:
+        """Drop stale entries (TTL) then enforce the registry cap."""
+        stale = [
+            task_id
+            for task_id, task in self._tasks.items()
+            if now - float(task.get("created_at")
+                            or task.get("registered_at") or 0.0)
+            > TASK_TTL_SECONDS
+        ]
+        for task_id in stale:
+            del self._tasks[task_id]
+        if len(self._tasks) > TASK_REGISTRY_CAP:
+            ordered = sorted(
+                self._tasks.items(),
+                key=lambda item: float(item[1].get("created_at")
+                                       or item[1].get("registered_at") or 0.0),
+            )
+            excess = len(self._tasks) - TASK_REGISTRY_CAP
+            for task_id, _task in ordered[:excess]:
+                del self._tasks[task_id]
+
+    def update_task(self, task_id: str,
+                    updates: dict[str, Any]) -> Optional[dict[str, Any]]:
+        """Merge ``updates`` into a stored task under the registry lock.
+
+        The background scrape worker and the ``/cancel`` request handler
+        both mutate the *shared* task record; routing every field-level
+        write through this lock-guarded merge prevents lost updates
+        (e.g. a ``cancelled`` status written by the cancel route being
+        clobbered by the worker's next progress publish). Returns the
+        updated copy, or ``None`` when the task id is unknown.
+        """
+        if not isinstance(updates, dict) or not updates:
+            return self.get_task(task_id)
+        with self._tasks_lock:
+            record = self._tasks.get(task_id)
+            if record is None:
+                return None
+            record.update(updates)
+            self._evict_tasks(time.time())
+            return dict(record)
 
     def get_task(self, task_id: str) -> Optional[dict[str, Any]]:
-        """Look up a task by id, returning ``None`` if not found."""
-        return self._tasks.get(task_id)
+        """Look up a task by id, returning a defensive copy or ``None``."""
+        with self._tasks_lock:
+            task = self._tasks.get(task_id)
+            return dict(task) if task is not None else None
 
     def all_tasks(self) -> dict[str, dict[str, Any]]:
-        """Return a shallow copy of the entire task registry."""
-        return dict(self._tasks)
+        """Return a copy of the entire task registry (copies per task)."""
+        with self._tasks_lock:
+            return {task_id: dict(task)
+                    for task_id, task in self._tasks.items()}
 
     # ------------------------------------------------------------------ #
     # Socket.IO handle (set by ``create_app`` after instantiation)
@@ -207,26 +321,41 @@ class ServerState:
         self._socketio = value
 
 
-def _register_request_logging(app: Flask) -> None:
-    """Attach an after-request hook that logs every HTTP request."""
+def _register_request_hooks(app: Flask) -> None:
+    """Attach per-request logging, a request id, and security headers."""
+
+    @app.before_request
+    def _assign_request_id():  # noqa: WPS430
+        # Correlate log lines with error responses without leaking
+        # internals to the client.
+        g.request_id = uuid.uuid4().hex
+        return None
 
     @app.after_request
-    def _log_response(response: Response) -> Response:  # noqa: WPS430
+    def _log_and_harden(response: Response) -> Response:  # noqa: WPS430
         try:
             logger.info(
-                "%s %s -> %d (%d bytes)",
+                "%s %s -> %d (%d bytes) [%s]",
                 request.method,
                 request.path,
                 response.status_code,
                 response.calculate_content_length() or 0,
+                getattr(g, "request_id", "-"),
             )
         except Exception:  # pragma: no cover - never break response
             pass
+        # Baseline hardening applied to every response (HTML, JSON, SSE).
+        response.headers.setdefault("X-Content-Type-Options", "nosniff")
+        response.headers.setdefault("X-Frame-Options", "DENY")
+        response.headers.setdefault("Referrer-Policy",
+                                    "strict-origin-when-cross-origin")
+        response.headers.setdefault("Content-Security-Policy",
+                                    _CONTENT_SECURITY_POLICY)
         return response
 
 
 def _register_error_handlers(app: Flask) -> None:
-    """Install JSON error handlers for 404 and 500 responses."""
+    """Install JSON error handlers for 400 / 404 / 405 / 500 responses."""
 
     @app.errorhandler(404)
     def _not_found(err):  # noqa: WPS430
@@ -236,19 +365,34 @@ def _register_error_handlers(app: Flask) -> None:
             "path": request.path,
         }), 404
 
+    @app.errorhandler(405)
+    def _method_not_allowed(err):  # noqa: WPS430
+        return jsonify({
+            "error": "method_not_allowed",
+            "message": f"{request.method} is not allowed for {request.path}",
+            "path": request.path,
+            "request_id": getattr(g, "request_id", None),
+        }), 405
+
     @app.errorhandler(500)
     def _server_error(err):  # noqa: WPS430
-        logger.exception("Internal server error: %s", err)
+        # Log the full exception server-side; the client only gets a
+        # generic message plus a request id for log correlation — never
+        # ``str(err)``, which can leak paths, SQL, or key material.
+        request_id = getattr(g, "request_id", None) or uuid.uuid4().hex
+        logger.exception("Internal server error [request_id=%s]: %s",
+                         request_id, err)
         return jsonify({
             "error": "internal_server_error",
-            "message": str(err),
+            "message": "an unexpected error occurred; see server logs for details",
+            "request_id": request_id,
         }), 500
 
     @app.errorhandler(400)
     def _bad_request(err):  # noqa: WPS430
         return jsonify({
             "error": "bad_request",
-            "message": str(err),
+            "message": str(err.description) if hasattr(err, "description") else str(err),
         }), 400
 
 
@@ -306,17 +450,30 @@ def create_app(config_overrides: Optional[dict] = None) -> Flask:
     )
 
     # ---- Configuration ------------------------------------------------
+    # Security defaults: no hard-coded secret and no wildcard CORS.
+    #  * SECRET_KEY: ``ARS_SECRET_KEY`` or a random per-process key.
+    #  * CORS_ORIGINS: ``ARS_CORS_ORIGINS`` (comma-separated, or ``*`` to
+    #    opt in to the old open behaviour); default is the local origins
+    #    for the configured port. Same-origin requests never need CORS.
+    _port = os.environ.get("ARS_WEB_SERVER_PORT", "8765")
+    _env_origins = os.environ.get("ARS_CORS_ORIGINS", "").strip()
+    if _env_origins == "*":
+        _default_origins = "*"
+    elif _env_origins:
+        _default_origins = [o.strip() for o in _env_origins.split(",") if o.strip()]
+    else:
+        _default_origins = [f"http://127.0.0.1:{_port}", f"http://localhost:{_port}"]
     app.config.update(
-        SECRET_KEY=os.environ.get("ARS_SECRET_KEY", "ars-dev-secret-change-me"),
+        SECRET_KEY=os.environ.get("ARS_SECRET_KEY") or secrets.token_hex(32),
         JSON_SORT_KEYS=False,
         MAX_CONTENT_LENGTH=50 * 1024 * 1024,  # 50 MB upload cap
-        CORS_ORIGINS="*",
+        CORS_ORIGINS=_default_origins,
     )
     if config_overrides:
         app.config.update(config_overrides)
 
     # ---- Extensions ---------------------------------------------------
-    CORS(app, resources={r"/*": {"origins": "*"}})
+    CORS(app, resources={r"/*": {"origins": app.config["CORS_ORIGINS"]}})
 
     # flask-socketio is optional — if simple-websocket / eventlet are not
     # present, we still want a working HTTP API.
@@ -326,7 +483,7 @@ def create_app(config_overrides: Optional[dict] = None) -> Flask:
 
         socketio = SocketIO(
             app,
-            cors_allowed_origins="*",
+            cors_allowed_origins=app.config["CORS_ORIGINS"],
             async_mode="threading",
             logger=False,
             engineio_logger=False,
@@ -353,8 +510,8 @@ def create_app(config_overrides: Optional[dict] = None) -> Flask:
             logger.warning("Failed to register blueprint %s: %s",
                            getattr(bp, "name", "?"), exc)
 
-    # ---- Logging + errors + root routes -------------------------------
-    _register_request_logging(app)
+    # ---- Logging + security headers + errors + root routes ------------
+    _register_request_hooks(app)
     _register_error_handlers(app)
     _register_root_routes(app)
 

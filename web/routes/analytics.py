@@ -3,6 +3,18 @@
 Wraps the :mod:`data_science` and :mod:`knowledge_graph` modules to
 expose topic modeling, clustering, temporal analysis, network
 extraction, and bibliometric summaries via HTTP.
+
+Analytics contract (contract #7):
+
+* Papers are fetched through the DatabaseConnection contract:
+  ``db.list_papers(project_id=..., limit=..., offset=0)``.
+* ``TopicModeler(method=m).analyze(papers, **kw) -> dict``
+* ``Clusterer(method=m).analyze(papers, **kw) -> dict``
+* ``TemporalAnalyzer(papers).analyze(**kw) -> dict``
+* ``Bibliometrics(papers).summary() -> dict``
+* Graphs: ``CitationGraph().build(papers)`` (and the collaboration /
+  temporal equivalents), serialised via
+  ``networkx_pro.graph_io.GraphIO.to_cytoscape(g)``.
 """
 #
 # MIT License — Academic Research Suite
@@ -16,9 +28,21 @@ from typing import Any
 
 from flask import Blueprint, jsonify, request
 
+from web.routes._common import (
+    MAX_PAPER_SCAN,
+    as_int,
+    bad_request,
+    error_response,
+    json_safe,
+    service_unavailable,
+)
+
 logger = logging.getLogger(__name__)
 
 analytics_bp = Blueprint("analytics", __name__, url_prefix="/api/analytics")
+
+# Upper bound on the corpus an analysis will pull per request.
+_MAX_CORPUS = min(MAX_PAPER_SCAN, 5000)
 
 
 def _state() -> "Any":
@@ -28,45 +52,18 @@ def _state() -> "Any":
     return ServerState()
 
 
-def _service_unavailable(name: str):
-    """Helper: build a 503 JSON response for a missing backend service."""
-    return jsonify({
-        "error": "service_unavailable",
-        "message": f"{name} is not initialised; backend module not yet wired up.",
-    }), 503
+def _db() -> Any:
+    """Return the shared database connection (or ``None``)."""
+    return _state().db
 
 
-def _run_analysis(module_path: str, class_name: str, project_id: int,
-                  method: str | None = None, **kwargs: Any):
-    """Helper: lazily import an analysis class and invoke ``analyze``.
-
-    Args:
-        module_path: Dotted path to the analysis module.
-        class_name:  Class to instantiate.
-        project_id:  Project whose papers to analyze.
-        method:      Optional method name (e.g. ``"lda"``, ``"kmeans"``).
-        **kwargs:    Extra kwargs forwarded to ``analyze``.
-
-    Returns:
-        Tuple ``(result, error)`` — exactly one is non-None.
-    """
-    state = _state()
-    db = state.db
-    try:
-        import importlib
-
-        module = importlib.import_module(module_path)
-        cls = getattr(module, class_name)
-        analyzer = cls(db) if db is not None else cls()
-        if hasattr(analyzer, "analyze"):
-            if method is not None:
-                return analyzer.analyze(project_id=project_id,
-                                       method=method, **kwargs), None
-            return analyzer.analyze(project_id=project_id, **kwargs), None
-        return None, f"{class_name} has no analyze() method"
-    except Exception as exc:  # pragma: no cover - defensive
-        logger.exception("%s.%s failed: %s", module_path, class_name, exc)
-        return None, str(exc)
+def _fetch_papers(project_id: int) -> list[dict[str, Any]]:
+    """Fetch a project's papers through the DB contract."""
+    db = _db()
+    if db is None:
+        return []
+    return db.list_papers(project_id=project_id,
+                          limit=_MAX_CORPUS, offset=0) or []
 
 
 @analytics_bp.route("/topic-model", methods=["POST"])
@@ -76,24 +73,45 @@ def topic_model():
     Body: ``{"project_id": int, "num_topics": int?, "method": str?}``.
 
     Returns:
-        ``{"topics": [{"id": int, "words": [(str, float)], "weight": float}]}``.
+        ``{"result": {...}}`` — the dict produced by
+        ``TopicModeler(method).analyze(papers, num_topics=...)``.
     """
     payload = request.get_json(silent=True) or {}
-    project_id = payload.get("project_id")
-    if not isinstance(project_id, int):
-        return jsonify({"error": "bad_request",
-                        "message": "project_id (int) is required"}), 400
-    num_topics = int(payload.get("num_topics", 8))
-    method = payload.get("method", "bertopic")
+    try:
+        project_id = as_int(payload.get("project_id"), name="project_id")
+        num_topics = as_int(payload.get("num_topics"), 8, name="num_topics",
+                            minimum=2, maximum=100)
+    except ValueError as exc:
+        return bad_request(str(exc))
+    method = payload.get("method", "nmf")
 
-    result, err = _run_analysis(
-        "data_science.topic_modeler", "TopicModeler",
-        project_id=project_id, method=method, num_topics=num_topics,
-    )
-    if err is not None:
-        return jsonify({"error": "analysis_failed", "message": err}), 502
-    return jsonify({"project_id": project_id, "method": method,
-                    "num_topics": num_topics, "topics": result})
+    db = _db()
+    if db is None:
+        return service_unavailable("DatabaseConnection")
+
+    papers = _fetch_papers(project_id)
+    if not papers:
+        return bad_request(f"project {project_id} has no papers to analyze")
+
+    try:
+        from data_science.topic_modeler import TopicModeler
+
+        result = TopicModeler(method=method).analyze(
+            papers, num_topics=num_topics)
+    except ValueError as exc:  # invalid method / parameters
+        logger.warning("topic-model rejected: %s", exc)
+        return bad_request("invalid method or parameters")
+    except Exception as exc:  # pragma: no cover - defensive
+        return error_response(logger, "topic_model", exc, status=502,
+                              error="analysis_failed")
+
+    return jsonify({
+        "project_id": project_id,
+        "method": method,
+        "num_topics": num_topics,
+        "papers_analyzed": len(papers),
+        "result": json_safe(result),
+    })
 
 
 @analytics_bp.route("/cluster", methods=["POST"])
@@ -103,24 +121,45 @@ def cluster():
     Body: ``{"project_id": int, "method": str?, "n_clusters": int?}``.
 
     Returns:
-        ``{"labels": {paper_id: int}, "silhouette": float?}``.
+        ``{"result": {...}}`` — the dict produced by
+        ``Clusterer(method).analyze(papers, n_clusters=...)``.
     """
     payload = request.get_json(silent=True) or {}
-    project_id = payload.get("project_id")
-    if not isinstance(project_id, int):
-        return jsonify({"error": "bad_request",
-                        "message": "project_id (int) is required"}), 400
+    try:
+        project_id = as_int(payload.get("project_id"), name="project_id")
+        n_clusters = as_int(payload.get("n_clusters"), 5,
+                            name="n_clusters", minimum=2, maximum=100)
+    except ValueError as exc:
+        return bad_request(str(exc))
     method = payload.get("method", "kmeans")
-    n_clusters = int(payload.get("n_clusters", 5))
 
-    result, err = _run_analysis(
-        "data_science.clustering", "Clusterer",
-        project_id=project_id, method=method, n_clusters=n_clusters,
-    )
-    if err is not None:
-        return jsonify({"error": "analysis_failed", "message": err}), 502
-    return jsonify({"project_id": project_id, "method": method,
-                    "n_clusters": n_clusters, "labels": result})
+    db = _db()
+    if db is None:
+        return service_unavailable("DatabaseConnection")
+
+    papers = _fetch_papers(project_id)
+    if not papers:
+        return bad_request(f"project {project_id} has no papers to analyze")
+
+    try:
+        from data_science.clustering import Clusterer
+
+        result = Clusterer(method=method).analyze(
+            papers, n_clusters=n_clusters)
+    except ValueError as exc:
+        logger.warning("cluster rejected: %s", exc)
+        return bad_request("invalid method or parameters")
+    except Exception as exc:  # pragma: no cover - defensive
+        return error_response(logger, "cluster", exc, status=502,
+                              error="analysis_failed")
+
+    return jsonify({
+        "project_id": project_id,
+        "method": method,
+        "n_clusters": n_clusters,
+        "papers_analyzed": len(papers),
+        "result": json_safe(result),
+    })
 
 
 @analytics_bp.route("/temporal", methods=["POST"])
@@ -129,22 +168,43 @@ def temporal():
 
     Body: ``{"project_id": int, "metric": str?}``. ``metric`` is one of
     ``publications`` (default), ``citations``, ``authors``.
+
+    Returns:
+        ``{"result": {...}}`` — the dict produced by
+        ``TemporalAnalyzer(papers).analyze(metric=...)``.
     """
     payload = request.get_json(silent=True) or {}
-    project_id = payload.get("project_id")
-    if not isinstance(project_id, int):
-        return jsonify({"error": "bad_request",
-                        "message": "project_id (int) is required"}), 400
+    try:
+        project_id = as_int(payload.get("project_id"), name="project_id")
+    except ValueError as exc:
+        return bad_request(str(exc))
     metric = payload.get("metric", "publications")
 
-    result, err = _run_analysis(
-        "data_science.temporal_analysis", "TemporalAnalyzer",
-        project_id=project_id, metric=metric,
-    )
-    if err is not None:
-        return jsonify({"error": "analysis_failed", "message": err}), 502
-    return jsonify({"project_id": project_id, "metric": metric,
-                    "series": result})
+    db = _db()
+    if db is None:
+        return service_unavailable("DatabaseConnection")
+
+    papers = _fetch_papers(project_id)
+    if not papers:
+        return bad_request(f"project {project_id} has no papers to analyze")
+
+    try:
+        from data_science.temporal_analysis import TemporalAnalyzer
+
+        result = TemporalAnalyzer(papers).analyze(metric=metric)
+    except ValueError as exc:
+        logger.warning("temporal rejected: %s", exc)
+        return bad_request("invalid metric or parameters")
+    except Exception as exc:  # pragma: no cover - defensive
+        return error_response(logger, "temporal", exc, status=502,
+                              error="analysis_failed")
+
+    return jsonify({
+        "project_id": project_id,
+        "metric": metric,
+        "papers_analyzed": len(papers),
+        "result": json_safe(result),
+    })
 
 
 @analytics_bp.route("/network/<int:project_id>", methods=["GET"])
@@ -154,44 +214,48 @@ def network(project_id: int):
     Query param ``type`` selects one of:
         ``citation``      — citation graph (default).
         ``collaboration`` — co-authorship graph.
-        ``temporal``     — temporal evolution graph.
+        ``temporal``      — temporal evolution graph.
+
+    Graphs are built from the project's papers
+    (``<GraphClass>().build(papers)``) and serialised through
+    ``GraphIO.to_cytoscape`` (which sanitises None/list attributes).
     """
     net_type = request.args.get("type", "citation")
     if net_type not in {"citation", "collaboration", "temporal"}:
-        return jsonify({"error": "bad_request",
-                        "message": "type must be citation|collaboration|temporal"}), 400
+        return bad_request("type must be citation|collaboration|temporal")
 
-    state = _state()
-    db = state.db
+    db = _db()
     if db is None:
-        return _service_unavailable("DatabaseConnection")
+        return service_unavailable("DatabaseConnection")
 
-    module_map = {
-        "citation": ("knowledge_graph.citation_graph", "CitationGraph"),
-        "collaboration": ("knowledge_graph.collaboration_graph",
-                          "CollaborationGraph"),
-        "temporal": ("knowledge_graph.temporal_network", "TemporalNetwork"),
-    }
-    module_path, class_name = module_map[net_type]
+    papers = _fetch_papers(project_id)
 
     try:
-        import importlib
+        from networkx_pro.graph_io import GraphIO
 
-        module = importlib.import_module(module_path)
-        cls = getattr(module, class_name)
-        graph = cls(db) if db is not None else cls()
-        if hasattr(graph, "to_cytoscape"):
-            data = graph.to_cytoscape(project_id)
-        elif hasattr(graph, "build"):
-            data = graph.build(project_id)
+        if net_type == "citation":
+            from knowledge_graph.citation_graph import CitationGraph
+
+            graph = CitationGraph().build(papers)
+        elif net_type == "collaboration":
+            from knowledge_graph.collaboration_graph import CollaborationGraph
+
+            graph = CollaborationGraph().build(papers)
         else:
-            data = {"elements": {"nodes": [], "edges": []}}
-    except Exception as exc:  # pragma: no cover - defensive
-        logger.exception("network failed: %s", exc)
-        return jsonify({"error": "analysis_failed", "message": str(exc)}), 502
+            from knowledge_graph.temporal_network import TemporalNetwork
 
-    return jsonify({"project_id": project_id, "type": net_type,
-                    "network": data})
+            graph = TemporalNetwork().build(papers)
+        data = GraphIO.to_cytoscape(graph)
+    except Exception as exc:  # pragma: no cover - defensive
+        return error_response(logger, "network", exc, status=502,
+                              error="analysis_failed")
+
+    return jsonify({
+        "project_id": project_id,
+        "type": net_type,
+        "papers": len(papers),
+        "network": json_safe(data),
+    })
 
 
 @analytics_bp.route("/stats/<int:project_id>", methods=["GET"])
@@ -199,25 +263,25 @@ def stats(project_id: int):
     """Return a bibliometric summary for a project.
 
     Includes paper count, year range, total citations, h-index,
-    top authors, top venues, and source breakdown.
+    top authors, top venues, and source breakdown — the dict produced
+    by ``Bibliometrics(papers).summary()``.
     """
-    state = _state()
-    db = state.db
+    db = _db()
     if db is None:
-        return _service_unavailable("DatabaseConnection")
+        return service_unavailable("DatabaseConnection")
+
+    papers = _fetch_papers(project_id)
 
     try:
-        import importlib
+        from data_science.statistics import Bibliometrics
 
-        module = importlib.import_module("data_science.statistics")
-        cls = getattr(module, "BibliometricStats")
-        stats_engine = cls(db) if db is not None else cls()
-        if hasattr(stats_engine, "summary"):
-            summary = stats_engine.summary(project_id)
-        else:
-            summary = {}
+        summary = Bibliometrics(papers).summary()
     except Exception as exc:  # pragma: no cover - defensive
-        logger.exception("stats failed: %s", exc)
-        return jsonify({"error": "analysis_failed", "message": str(exc)}), 502
+        return error_response(logger, "stats", exc, status=502,
+                              error="analysis_failed")
 
-    return jsonify({"project_id": project_id, "stats": summary})
+    return jsonify({
+        "project_id": project_id,
+        "papers": len(papers),
+        "stats": json_safe(summary),
+    })

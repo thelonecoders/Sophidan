@@ -41,7 +41,7 @@ unacceptable behaviour to
 
 ## Reporting Bugs
 
-Bugs are tracked as [GitHub issues](https://github.com/academic-research-suite/academic_research_suite/issues).
+Bugs are tracked as [GitHub issues](https://github.com/thelonecoders/Sophidan/issues).
 Before opening a new issue:
 
 1. **Search existing issues** — your bug may already be reported.
@@ -92,7 +92,7 @@ Features that pull ARS towards SaaS, cloud lock-in, or non-MIT
 dependencies are likely to be declined.
 
 If you want to discuss before opening an issue, start a
-[Discussion](https://github.com/academic-research-suite/academic_research_suite/discussions)
+[Discussion](https://github.com/thelonecoders/Sophidan/discussions)
 or drop by our community chat (link in the README).
 
 ---
@@ -104,8 +104,8 @@ We follow the standard fork → branch → PR workflow.
 ### 1. Fork & branch
 
 ```bash
-gh repo fork academic-research-suite/academic_research_suite --clone
-cd academic_research_suite
+gh repo fork thelonecoders/Sophidan --clone
+cd Sophidan
 git checkout -b feat/my-feature develop
 ```
 
@@ -365,5 +365,5 @@ user_guide update is needed.
 ---
 
 *Happy hacking! If you get stuck, open a
-[Discussion](https://github.com/academic-research-suite/academic_research_suite/discussions)
+[Discussion](https://github.com/thelonecoders/Sophidan/discussions)
 or ping us in the issue tracker.*

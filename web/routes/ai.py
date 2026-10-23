@@ -1,10 +1,18 @@
 """REST endpoints for the ``/api/ai`` resource.
 
-Provides streaming chat (via Server-Sent Events), summarization, model
-discovery, and embedding generation. All heavy AI dependencies
-(``openai``, ``anthropic``, ``langchain``, ``sentence-transformers``)
-are imported lazily inside handlers so the web server boots even when
-those packages are not installed.
+Provides streaming chat (Server-Sent Events), non-streaming chat,
+summarization, model discovery, and embedding generation.
+
+ChatEngine contract (contract #5):
+
+* ``stream_chat(messages=None, prompt=None, **kw)`` — token generator.
+* ``chat(messages=None, prompt=None, **kw) -> ChatResponse`` (compat →
+  ``send()``).
+* ``summarize(text, max_words=250) -> str``.
+
+Embeddings use ``data_science.embeddings.EmbeddingsModel.encode``.
+A missing engine yields a clear 503 JSON body — exception detail is
+never echoed to clients.
 """
 #
 # MIT License — Academic Research Suite
@@ -19,6 +27,16 @@ from typing import Any, Generator
 
 from flask import Blueprint, Response, jsonify, request, stream_with_context
 
+from web.routes._common import (
+    as_int,
+    bad_request,
+    error_response,
+    json_safe,
+    not_found,
+    serialize_paper,
+    service_unavailable,
+)
+
 logger = logging.getLogger(__name__)
 
 ai_bp = Blueprint("ai", __name__, url_prefix="/api/ai")
@@ -31,60 +49,112 @@ def _state() -> "Any":
     return ServerState()
 
 
-def _service_unavailable(name: str):
-    """Helper: build a 503 JSON response for a missing backend service."""
-    return jsonify({
-        "error": "service_unavailable",
-        "message": f"{name} is not initialised; backend module not yet wired up.",
-    }), 503
-
-
 def _sse(payload: dict[str, Any]) -> str:
     """Format a dict as a Server-Sent-Events data line."""
     return f"data: {json.dumps(payload)}\n\n"
 
 
+def _build_messages(history: list, message: str) -> list[dict[str, str]]:
+    """Merge chat history + the new user message into a message list."""
+    messages: list[dict[str, str]] = []
+    for item in history or []:
+        if isinstance(item, dict) and item.get("role") and \
+                item.get("content") is not None:
+            messages.append({"role": str(item["role"]),
+                             "content": str(item["content"])})
+    messages.append({"role": "user", "content": message})
+    return messages
+
+
+def _configured_provider(engine: Any) -> str:
+    """Return the engine's effective LLM provider id ('' if unknown)."""
+    client = getattr(engine, "llm_client", None)
+    if client is None:
+        client = getattr(engine, "client", None)
+    raw = getattr(client, "provider", None) if client is not None else None
+    if raw is None:
+        try:
+            from config.settings import get_settings
+
+            raw = getattr(get_settings(), "ai_provider", None)
+        except Exception:  # pragma: no cover - defensive
+            raw = None
+    return str(getattr(raw, "value", raw) or "").strip().lower()
+
+
+def _no_provider_response():
+    """503 JSON for a ChatEngine with no usable provider configured."""
+    return jsonify({
+        "error": "no_provider",
+        "message": "No LLM provider is configured. Set ai_provider "
+                   "(openai|anthropic|ollama) and the matching API key "
+                   "in Settings (or the OPENAI_API_KEY / ANTHROPIC_API_KEY "
+                   "environment variables), then restart the server.",
+    }), 503
+
+
 @ai_bp.route("/chat", methods=["POST"])
 def chat():
-    """Stream a chat completion as Server-Sent Events.
+    """Stream a chat completion as Server-Sent Events (or plain JSON).
 
     Body: ``{"message": str, "history": [ {role, content} ]?,
-    "use_rag": bool?, "project_id": int?}``.
+    "stream": bool?, "project_id": int?}``.
 
-    The response is ``text/event-stream``; each event is a JSON object
-    with ``{"token": str}`` for incremental output, ending with a
-    ``{"done": true}`` event.
+    Streaming (default) returns ``text/event-stream``; each event is a
+    JSON object with ``{"token": str}`` for incremental output, ending
+    with a ``{"done": true}`` event. With ``"stream": false`` the
+    complete ``ChatResponse`` is returned as JSON.
     """
     payload = request.get_json(silent=True) or {}
     message = (payload.get("message") or "").strip()
     if not message:
-        return jsonify({"error": "bad_request",
-                        "message": "message is required"}), 400
+        return bad_request("message is required")
 
     history = payload.get("history") or []
-    use_rag = bool(payload.get("use_rag", False))
+    if not isinstance(history, list):
+        return bad_request("history must be a list of {role, content} items")
     project_id = payload.get("project_id")
+    stream = payload.get("stream", True)
 
-    state = _state()
-    engine = state.chat_engine
+    engine = _state().chat_engine
+    if engine is None:
+        return service_unavailable("ChatEngine")
+    if _configured_provider(engine) in ("", "none", "echo"):
+        # Contract #5 fallback engines (echo) must not masquerade as a
+        # working assistant — fail with a clear, actionable 503.
+        return _no_provider_response()
+
+    messages = _build_messages(history, message)
+
+    if not stream:
+        try:
+            # Contract: chat(messages=None, prompt=None, **kw) -> ChatResponse
+            response = engine.chat(messages=messages, prompt=message,
+                                   project_id=project_id)
+        except Exception as exc:  # pragma: no cover - defensive
+            return error_response(logger, "chat", exc, status=502,
+                                  error="chat_failed")
+        if hasattr(response, "to_dict"):
+            body = response.to_dict()
+        elif hasattr(response, "__dict__"):
+            body = {k: v for k, v in vars(response).items()
+                    if not k.startswith("_")}
+        else:
+            body = {"response": str(response)}
+        return jsonify(json_safe(body))
 
     def generate() -> Generator[str, None, None]:
-        if engine is None or not hasattr(engine, "stream_chat"):
-            yield _sse({"error": "chat_engine_unavailable",
-                        "message": "ChatEngine not yet wired up."})
-            yield _sse({"done": True})
-            return
-
         try:
-            for token in engine.stream_chat(
-                message=message, history=history,
-                use_rag=use_rag, project_id=project_id,
-            ):
+            # Contract: stream_chat(messages=None, prompt=None, **kw)
+            for token in engine.stream_chat(messages=messages,
+                                            prompt=message,
+                                            project_id=project_id):
                 yield _sse({"token": token})
             yield _sse({"done": True})
         except Exception as exc:  # pragma: no cover - defensive
             logger.exception("chat stream failed: %s", exc)
-            yield _sse({"error": "internal_error", "message": str(exc)})
+            yield _sse({"error": "chat_failed",
+                        "message": "the chat stream failed; see server logs"})
             yield _sse({"done": True})
 
     headers = {
@@ -98,40 +168,64 @@ def chat():
 
 @ai_bp.route("/summarize", methods=["POST"])
 def summarize():
-    """Summarize one or more papers.
+    """Summarize free text or the project's papers.
 
-    Body: ``{"paper_ids": [int], "type": str?}`` where ``type`` is one
-    of ``abstract`` (default), ``key_findings``, ``lay_summary``,
-    ``bulleted``.
+    Body: ``{"text": str, "max_words": int?}`` or
+    ``{"paper_ids": [int], "max_words": int?}`` (the papers' titles +
+    abstracts are concatenated into the text to summarize).
     """
     payload = request.get_json(silent=True) or {}
-    paper_ids = payload.get("paper_ids") or []
-    if not isinstance(paper_ids, list) or not paper_ids:
-        return jsonify({"error": "bad_request",
-                        "message": "paper_ids (non-empty list) is required"}), 400
+    max_words = 250
+    if payload.get("max_words") is not None:
+        try:
+            max_words = as_int(payload.get("max_words"), 250,
+                               name="max_words", minimum=20, maximum=2000)
+        except ValueError as exc:
+            return bad_request(str(exc))
 
-    summary_type = payload.get("type", "abstract")
+    text = payload.get("text")
+    paper_ids = payload.get("paper_ids")
 
-    state = _state()
-    db = state.db
-    engine = state.chat_engine
+    engine = _state().chat_engine
     if engine is None:
-        return _service_unavailable("ChatEngine")
-    if db is None:
-        return _service_unavailable("DatabaseConnection")
+        return service_unavailable("ChatEngine")
+    if _configured_provider(engine) in ("", "none", "echo"):
+        return _no_provider_response()
+
+    if text is None and paper_ids:
+        if not isinstance(paper_ids, list):
+            return bad_request("paper_ids must be a list of ints")
+        db = _state().db
+        if db is None:
+            return service_unavailable("DatabaseConnection")
+        try:
+            ids = [as_int(pid, name="paper_ids entry") for pid in paper_ids]
+            papers = db.get_papers_by_ids(ids) or []
+        except ValueError as exc:
+            return bad_request(str(exc))
+        except Exception as exc:  # pragma: no cover - defensive
+            return error_response(logger, "summarize paper lookup", exc)
+        if not papers:
+            return not_found("no papers resolved for given ids")
+        parts = []
+        for paper in papers:
+            record = serialize_paper(paper)
+            title = record.get("title") or ""
+            abstract = record.get("abstract") or ""
+            parts.append(f"{title}. {abstract}".strip())
+        text = "\n\n".join(parts)
+
+    if not text or not str(text).strip():
+        return bad_request("text (or paper_ids) is required")
 
     try:
-        if hasattr(engine, "summarize"):
-            result = engine.summarize(paper_ids, summary_type=summary_type)
-        else:
-            result = {"paper_ids": paper_ids, "summary": "",
-                      "type": summary_type}
+        # Contract: summarize(text, max_words=250) -> str
+        result = engine.summarize(str(text), max_words=max_words)
     except Exception as exc:  # pragma: no cover - defensive
-        logger.exception("summarize failed: %s", exc)
-        return jsonify({"error": "internal_error", "message": str(exc)}), 500
+        return error_response(logger, "summarize", exc, status=502,
+                              error="summarize_failed")
 
-    return jsonify({"paper_ids": paper_ids, "type": summary_type,
-                    "summary": result})
+    return jsonify({"summary": result, "max_words": max_words})
 
 
 @ai_bp.route("/models", methods=["GET"])
@@ -155,7 +249,9 @@ def list_models():
         # Sensible defaults so the endpoint always returns something useful.
         models = {
             "openai": ["gpt-4o", "gpt-4o-mini", "gpt-3.5-turbo"],
-            "anthropic": ["claude-3-5-sonnet", "claude-3-haiku",
+            "anthropic": ["claude-sonnet-5-5", "claude-opus-5-5",
+                          "claude-haiku-4-5-20251001",
+                          "claude-3-5-sonnet", "claude-3-haiku",
                           "claude-3-opus"],
             "ollama": ["llama3", "mistral", "phi3", "qwen2.5"],
         }
@@ -170,30 +266,31 @@ def embeddings():
     """Generate embeddings for a list of texts.
 
     Body: ``{"texts": [str], "model": str?}``. Returns a list of float
-    vectors, one per input text.
+    vectors, one per input text (``EmbeddingsModel.encode``; mock mode
+    activates automatically when sentence-transformers is missing).
     """
     payload = request.get_json(silent=True) or {}
     texts = payload.get("texts") or []
-    if not isinstance(texts, list) or not texts:
-        return jsonify({"error": "bad_request",
-                        "message": "texts (non-empty list) is required"}), 400
+    if not isinstance(texts, list) or not texts or \
+            not all(isinstance(t, str) for t in texts):
+        return bad_request("texts (non-empty list of strings) is required")
 
-    model = payload.get("model", "default")
-    state = _state()
+    model = payload.get("model") or "all-MiniLM-L6-v2"
 
     try:
-        import importlib
+        from data_science.embeddings import EmbeddingsModel
 
-        module = importlib.import_module("data_science.embeddings")
-        cls = getattr(module, "EmbeddingEngine")
-        emb_engine = cls()
-        if hasattr(emb_engine, "embed"):
-            vectors = emb_engine.embed(texts, model=model)
-        else:
-            vectors = []
+        emb_model = EmbeddingsModel(model_name=model)
+        vectors = emb_model.encode(texts)
     except Exception as exc:  # pragma: no cover - defensive
-        logger.exception("embeddings failed: %s", exc)
-        return jsonify({"error": "internal_error", "message": str(exc)}), 502
+        return error_response(logger, "embeddings", exc, status=502,
+                              error="embeddings_failed")
+
+    # numpy arrays (or lists of arrays) → plain nested lists.
+    tolist = getattr(vectors, "tolist", None)
+    if callable(tolist):
+        vectors = tolist()
+    vectors = [list(v) for v in vectors]
 
     return jsonify({"model": model, "count": len(vectors),
                     "vectors": vectors})

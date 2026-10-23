@@ -118,35 +118,110 @@ def init_socketio_handlers(socketio: SocketIO) -> None:
 def _wire_event_bus_bridge(socketio: SocketIO) -> None:
     """Subscribe to :class:`core.events.EventBus` and re-emit via Socket.IO.
 
-    Bridges backend events (scrape progress, log lines, AI tokens) into
+    Bridges backend events (scrape progress, completion, failures) into
     the corresponding socket rooms so connected clients get live updates.
+
+    * Subscribes through the process-wide ``get_event_bus()`` singleton
+      so events published by the scraping engine / desktop UI arrive here
+      too (a private bus would silently drop them).
+    * Uses a wildcard subscription (with a per-topic fallback) and the
+      handler accepts **both** :class:`core.events.Event` objects and
+      plain ``(topic, payload)`` dicts, mapping every topic — string or
+      :class:`core.events.EventType` — to its canonical string form.
+    * Room semantics: payloads carrying a ``task_id`` are emitted only to
+      ``task:<id>``; everything else broadcasts to all clients.
     """
-    state = _state()
-    bus = state.event_bus
-    if bus is None or not hasattr(bus, "subscribe"):
-        logger.info("EventBus unavailable — Socket.IO bridge disabled")
+    try:
+        from core.events import EventType, get_event_bus
+
+        bus = get_event_bus()
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("EventBus unavailable — Socket.IO bridge disabled: %s",
+                       exc)
         return
 
-    def _forward(event_type: str, payload: dict[str, Any]) -> None:
-        task_id = payload.get("task_id")
-        room = f"task:{task_id}" if task_id else None
+    # Canonical string topic for every publishable key: the verbatim
+    # string keys used across the app plus the EventType enum members
+    # (enum → closest contract string; unknown strings pass verbatim).
+    _TOPIC_MAP: dict[Any, str] = {
+        EventType.ScrapeStarted: "scrape:progress",
+        EventType.ScrapeProgress: "scrape:progress",
+        EventType.ScrapeCompleted: "scrape:completed",
+        EventType.ScrapeFailed: "scrape:failed",
+        EventType.AnalysisProgress: "analysis_progress",
+        EventType.AnalysisCompleted: "analysis_finished",
+        EventType.ExportCompleted: "export_finished",
+        EventType.ProxyRotated: "proxy_rotated",
+        EventType.AIResponse: "ai:token",
+        EventType.DBMigrated: "db_migrated",
+        "scrape_started": "scrape:progress",
+        "scrape_progress": "scrape:progress",
+        "scrape_completed": "scrape:completed",
+        "scrape_failed": "scrape:failed",
+        "scrape_error": "scrape:error",
+        "scrape_finished": "scrape:completed",
+        "analysis_finished": "analysis_finished",
+        "analysis_completed": "analysis_finished",
+        "export_completed": "export_finished",
+        "export_finished": "export_finished",
+        "paper_added": "paper_added",
+    }
+
+    def _normalize(evt: Any) -> tuple[str, dict[str, Any]]:
+        """Map an Event / dict / string into a canonical (topic, payload)."""
+        if isinstance(evt, dict):
+            topic = evt.get("topic") or evt.get("type")
+            payload = evt.get("payload", evt)
+        else:
+            topic = getattr(evt, "type", None)
+            payload = getattr(evt, "payload", None)
+            if topic is None and payload is None:
+                # Handler was called with a bare value.
+                topic, payload = "event", evt
+            if topic is None:
+                topic = "event"
+        if hasattr(topic, "value"):  # EventType (or any) enum member
+            topic = _TOPIC_MAP.get(topic, topic.value)
+        topic = _TOPIC_MAP.get(topic, str(topic))
+        if not isinstance(payload, dict):
+            payload = {"data": payload}
+        return topic, payload
+
+    def _forward(evt: Any) -> None:
         try:
-            if room:
-                socketio.emit(event_type, payload, room=room, namespace="/")
+            topic, payload = _normalize(evt)
+            task_id = payload.get("task_id")
+            if task_id:
+                socketio.emit(topic, payload, room=f"task:{task_id}",
+                              namespace="/")
             else:
-                socketio.emit(event_type, payload, namespace="/")
+                socketio.emit(topic, payload, namespace="/")
         except Exception as exc:  # pragma: no cover - defensive
-            logger.debug("forward of %s failed: %s", event_type, exc)
+            logger.debug("forward of %r failed: %s", evt, exc)
 
-    # Common event types emitted by the backend.
-    events = [
-        "scrape:progress", "scrape:complete", "scrape:error",
-        "scrape:cancelled", "log:line", "ai:token", "ai:done",
-    ]
-    for evt in events:
-        try:
-            bus.subscribe(evt, lambda payload, e=evt: _forward(e, payload))
-        except Exception as exc:  # pragma: no cover - defensive
-            logger.warning("subscribe to %s failed: %s", evt, exc)
+    subscribed = 0
+    try:
+        # Wildcard subscription: receives every event regardless of type.
+        bus.subscribe(None, _forward)
+        subscribed += 1
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("wildcard EventBus subscription failed: %s", exc)
 
-    logger.info("EventBus → Socket.IO bridge wired for %d events", len(events))
+    if not subscribed:
+        # Fallback: explicit per-topic subscriptions (string topics are
+        # accepted verbatim per the events contract).
+        topics = [
+            "scrape:progress", "scrape:completed", "scrape:failed",
+            "scrape:error", "scrape:cancelled", "paper_added",
+            "scrape_finished", "analysis_finished", "export_finished",
+            "log:line", "ai:token", "ai:done",
+        ]
+        for topic in topics:
+            try:
+                bus.subscribe(topic, _forward)
+                subscribed += 1
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.warning("subscribe to %s failed: %s", topic, exc)
+
+    logger.info("EventBus → Socket.IO bridge wired (%d subscription%s)",
+                subscribed, "" if subscribed == 1 else "s")

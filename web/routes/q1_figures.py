@@ -16,11 +16,12 @@ from __future__ import annotations
 
 import io
 import logging
-import os
 import tempfile
 from typing import Any, Callable
 
 from flask import Blueprint, jsonify, request, send_file
+
+from web.routes._common import as_int, error_response, safe_remove
 
 logger = logging.getLogger(__name__)
 
@@ -32,12 +33,18 @@ def _bad_request(msg: str):
 
 
 def _common_params() -> dict:
-    """Pull journal/size/dpi/format params from the request body."""
+    """Pull journal/size/dpi/format params from the request body.
+
+    Raises:
+        ValueError: when ``dpi`` (or the multi-panel grid sizes) cannot
+            be coerced to an integer — callers map that to a 400.
+    """
     payload = request.get_json(silent=True) or {}
     return {
         "journal": payload.pop("journal", "Nature"),
         "size":    payload.pop("size", "single"),
-        "dpi":     int(payload.pop("dpi", 300) or 300),
+        "dpi":     as_int(payload.pop("dpi", 300), 300, name="dpi",
+                          minimum=72, maximum=1200),
         "format":  payload.pop("format", "png").lower(),
         "title":   payload.pop("title", ""),
         "data":    payload,
@@ -46,7 +53,10 @@ def _common_params() -> dict:
 
 def _render_sendfile(builder: Callable[[str, dict], None]) -> Any:
     """Build a temp file via ``builder(path, params)`` then return send_file."""
-    params = _common_params()
+    try:
+        params = _common_params()
+    except ValueError as exc:
+        return _bad_request(str(exc))
     fmt = params["format"]
     if fmt not in ("png", "svg", "pdf", "tiff"):
         return _bad_request("format must be one of png|svg|pdf|tiff")
@@ -54,13 +64,14 @@ def _render_sendfile(builder: Callable[[str, dict], None]) -> Any:
         suffix = f".{fmt}"
         with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
             path = tmp.name
-        builder(path, params)
+        try:
+            builder(path, params)
+        except ValueError as exc:
+            # Bad integer casts inside a builder (rows/cols/dpi) → 400.
+            return _bad_request(str(exc))
         with open(path, "rb") as fh:
             buf = io.BytesIO(fh.read())
-        try:
-            os.remove(path)
-        except OSError:
-            pass
+        safe_remove(path)
         mimetype = {
             "png":  "image/png",
             "svg":  "image/svg+xml",
@@ -70,8 +81,8 @@ def _render_sendfile(builder: Callable[[str, dict], None]) -> Any:
         return send_file(buf, mimetype=mimetype, as_attachment=True,
                          download_name=f"figure.{fmt}")
     except Exception as exc:
-        logger.exception("/api/figures render failed: %s", exc)
-        return jsonify({"error": "analysis_failed", "message": str(exc)}), 502
+        return error_response(logger, "/api/figures render failed", exc,
+                              status=502, error="analysis_failed")
 
 
 # ----------------------------------------------------------------- Forest / Funnel
@@ -153,6 +164,47 @@ def funnel():
 
 # ----------------------------------------------------------------- Generic plot helpers
 
+def _call_q1_plot(fn, data, plot_method: str):
+    """Invoke a Q1 plot function tolerating ax-based, graph-based and
+    fig-returning conventions; always return a matplotlib Figure.
+
+    The Q1 figure layer mixes three calling conventions:
+      * ``fn(ax, data, ...)``  — draws onto a provided Axes (data/stats)
+      * ``fn(graph, ...)``     — builds its own figure (network plots)
+      * ``fn(data, ...) -> fig`` — returns a Figure
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    fig, ax = plt.subplots(figsize=(8, 5.5), constrained_layout=True)
+    if isinstance(data, dict) and set(data) == {"data"}:
+        data = data["data"]  # tolerate double-nested payloads
+    try:
+        if isinstance(data, dict):
+            try:
+                result = fn(ax, **data)          # ax-first convention
+            except TypeError:
+                result = fn(**data)              # fig-returning convention
+        else:
+            try:
+                result = fn(ax, data)
+            except TypeError:
+                result = fn(data)
+        out = result if isinstance(result, plt.Figure) else fig
+        if out is fig and not fig.axes[0].has_data() and result is None:
+            raise RuntimeError(f"{plot_method} drew nothing")
+        return out, fig
+    finally:
+        if not isinstance(locals().get("result"), plt.Figure):
+            pass  # keep fig alive for savefig
+
+
+def _save_and_close(out, scratch, path, fmt, dpi):
+    out.savefig(path, format=fmt, dpi=dpi)
+    import matplotlib.pyplot as plt
+    plt.close(scratch)
+
+
 def _generic_statistical_plot(plot_method: str):
     """Build a builder closure for a :class:`StatisticalPlots` method."""
     def builder(path: str, params: dict) -> None:
@@ -161,11 +213,10 @@ def _generic_statistical_plot(plot_method: str):
         fn = getattr(StatisticalPlots, plot_method, None)
         if fn is None:
             raise ValueError(f"StatisticalPlots has no method {plot_method!r}")
-        fig = fn(**data) if isinstance(data, dict) else fn(data)
-        if fig is None:
+        out, scratch = _call_q1_plot(fn, data, plot_method)
+        if out is None:
             raise RuntimeError(f"{plot_method} returned no figure")
-        fig.savefig(path, format=params["format"], dpi=params.get("dpi", 300),
-                    constrained_layout=True)
+        _save_and_close(out, scratch, path, params["format"], params.get("dpi", 300))
     return builder
 
 
@@ -176,11 +227,10 @@ def _generic_data_plot(plot_method: str):
         fn = getattr(Q1DataPlots, plot_method, None)
         if fn is None:
             raise ValueError(f"Q1DataPlots has no method {plot_method!r}")
-        fig = fn(**data) if isinstance(data, dict) else fn(data)
-        if fig is None:
+        out, scratch = _call_q1_plot(fn, data, plot_method)
+        if out is None:
             raise RuntimeError(f"{plot_method} returned no figure")
-        fig.savefig(path, format=params["format"], dpi=params.get("dpi", 300),
-                    constrained_layout=True)
+        _save_and_close(out, scratch, path, params["format"], params.get("dpi", 300))
     return builder
 
 
@@ -191,11 +241,10 @@ def _generic_network_plot(plot_method: str):
         fn = getattr(Q1NetworkPlots, plot_method, None)
         if fn is None:
             raise ValueError(f"Q1NetworkPlots has no method {plot_method!r}")
-        fig = fn(**data) if isinstance(data, dict) else fn(data)
-        if fig is None:
+        out, scratch = _call_q1_plot(fn, data, plot_method)
+        if out is None:
             raise RuntimeError(f"{plot_method} returned no figure")
-        fig.savefig(path, format=params["format"], dpi=params.get("dpi", 300),
-                    constrained_layout=True)
+        _save_and_close(out, scratch, path, params["format"], params.get("dpi", 300))
     return builder
 
 
@@ -269,10 +318,15 @@ def multi_panel():
     def builder(path: str, params: dict) -> None:
         from q1_figures.multi_panel import MultiPanelFigure
         data = params["data"]
-        mp = MultiPanelFigure(rows=int(data.get("rows", 1)),
-                              cols=int(data.get("cols", 1)))
+        mp = MultiPanelFigure(rows=as_int(data.get("rows"), 1, name="rows",
+                                          minimum=1, maximum=20),
+                              cols=as_int(data.get("cols"), 1, name="cols",
+                                          minimum=1, maximum=20))
         for p in data.get("panels", []):
-            mp.add_panel(row=int(p.get("row", 0)), col=int(p.get("col", 0)))
+            mp.add_panel(row=as_int(p.get("row"), 0, name="panel row",
+                                    minimum=0, maximum=19),
+                         col=as_int(p.get("col"), 0, name="panel col",
+                                    minimum=0, maximum=19))
         mp.save(path, format=params["format"], dpi=params.get("dpi", 300))
     return _render_sendfile(builder)
 
@@ -285,5 +339,5 @@ def palettes():
         names = JournalPalettes.all_names()
         return jsonify({"palettes": list(names)})
     except Exception as exc:
-        logger.exception("/api/figures/palettes failed: %s", exc)
-        return jsonify({"error": "analysis_failed", "message": str(exc)}), 502
+        return error_response(logger, "/api/figures/palettes failed", exc,
+                              status=502, error="analysis_failed")

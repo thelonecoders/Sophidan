@@ -4,7 +4,6 @@
 # validation agent — the first occurrence wins. Section headers are kept.
 
 # === CORE / RUNTIME (shared) ===
-python>=3.10
 PyQt5>=5.15
 qtpy>=2.4
 PyYAML>=6.0
@@ -66,7 +65,10 @@ hdbscan>=0.8.33         # density-based clustering (optional; lazy-imported)
 umap-learn>=0.5.5       # UMAP projection for clustering viz (optional; lazy-imported)
 pyLDAvis>=3.4           # interactive LDA visualization (optional; lazy-imported)
 fonttools>=4.50         # matplotlib font management
-noto-sans-sc>=1.0       # CJK font fallback (lazy; module tolerates absence)
+# noto-sans-sc REMOVED: the package does not exist on PyPI and made
+# `pip install -r requirements.txt` fail. CJK font fallback is handled
+# by matplotlib font management (fonttools, below) plus any system
+# Noto Sans CJK / WenQuanYi font; the visualizer tolerates absence.
 
 # === AI ASSISTANT ===
 openai>=1.12
@@ -167,7 +169,8 @@ pyvis>=0.3.2           # interactive HTML network visualisation (lazy-imported)
 # No new third-party packages are introduced by this sub-agent.
 
 # === TESTING ===
-pytest>=7.4
+# Floor aligned with [tool.pytest.ini_options] minversion = "8.0".
+pytest>=8.0
 
 # === v2.0.0 Q1_FIGURES (added by v2-q1) ===
 # All Q1-figure dependencies are already declared above (matplotlib,

@@ -7,7 +7,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "academic-research-suite"
-version = "1.0.0"
+version = "2.0.0"
 description = "A pure-Python PyQt desktop suite for academic literature scraping, analysis, knowledge-graph building, AI assistance, and reporting."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -54,8 +54,8 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/academic-research-suite/academic_research_suite"
-Issues = "https://github.com/academic-research-suite/academic_research_suite/issues"
+Homepage = "https://github.com/thelonecoders/Sophidan"
+Issues = "https://github.com/thelonecoders/Sophidan/issues"
 
 # ---------------------------------------------------------------------------
 # Tool configuration
@@ -79,11 +79,32 @@ include = [
     "database*",
     "ui*",
     "web*",
+    # v2.0.0 packages
+    "bibliometrics*",
+    "networkx_pro*",
+    "gephi_viz*",
+    "systematic_review*",
+    "meta_analysis*",
+    "prisma*",
+    "q1_figures*",
+    "research_lifecycle*",
+    "innovation*",
 ]
-exclude = ["tests*", "docs*", "data*", "logs*", "upload*"]
+exclude = ["tests*", "docs*", "data", "logs*", "upload*"]
+
+# ``main.py`` is a top-level module (not part of any package) and backs the
+# ``ars = main:main`` console script.
+[tool.setuptools]
+py-modules = ["main"]
 
 [tool.setuptools.package-data]
 "*" = ["*.yaml", "*.yml", "*.qss", "*.json", "*.toml"]
+# Flask/Jinja templates are data files inside the `web` package (no __init__.py).
+"web" = ["templates/*.html"]
+
+# Never ship local credentials even if a secrets.yaml exists next to config/.
+[tool.setuptools.exclude-package-data]
+"*" = ["secrets.yaml", "*.db", "*.db-wal", "*.db-shm"]
 
 [tool.black]
 line-length = 100

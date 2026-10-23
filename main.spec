@@ -68,6 +68,17 @@ for pkg in (
         # never aborts because of a missing local package on the build host.
         pass
 
+# ui/ and web/ — main_window.py resolves sidebar pages through importlib
+# string specs ("ui.widgets.xxx") and the web server imports web.routes.*
+# lazily, so PyInstaller's static analysis misses them. Collect every
+# submodule of both packages explicitly or the packaged app shows
+# placeholder pages and --web mode has no blueprints.
+for pkg in ("ui", "web"):
+    try:
+        hiddenimports += collect_submodules(pkg)
+    except Exception:
+        pass
+
 # Qt backends — PyQt5 + matplotlib's Qt5Agg backend
 hiddenimports += [
     "PyQt5.QtCore",
@@ -83,10 +94,14 @@ hiddenimports += [
 # Optional heavy deps — declared so the bundle contains them when installed.
 # Each is wrapped in collect_submodules so missing deps on a minimal build
 # host don't abort the spec compilation.
+#
+# NOTE: the deep-learning stack (torch / transformers /
+# sentence_transformers) is deliberately NOT collected here — it is
+# excluded in Analysis(excludes=...) below to keep the on-disk bundle
+# around 1.5 GB smaller.  Every ARS feature that would use it checks
+# importability first (e.g. EmbeddingsModel.is_available) and degrades
+# gracefully, so nothing crashes without it.
 for pkg in (
-    "sentence_transformers",
-    "transformers",
-    "torch",
     "sklearn",
     "scipy",
     "chromadb",
@@ -107,6 +122,7 @@ for pkg in (
 
 datas = [
     ("config/default_config.yaml", "config"),
+    ("web/templates", "web/templates"),  # Flask/Jinja templates for --web mode
     ("LICENSE", "."),
 ]
 
@@ -131,15 +147,17 @@ a = Analysis(
     hooksconfig={},
     runtime_hooks=[],
     excludes=[
-        # Trim unrelated heavy packages that may be present in the build
-        # host's venv but are NOT declared in ARS' requirements.txt. Excluding
-        # them shrinks the on-disk bundle by ~1.5 GB without breaking any ARS
-        # module. Each entry is a top-level package name; PyInstaller skips
-        # collecting it AND its data files.
+        # Trim heavy packages to keep the bundle lean.  torch/transformers/
+        # sentence_transformers are the deep-learning stack: they are NOT
+        # collected above, and every ARS feature that would use them
+        # degrades gracefully when they are missing.  The remaining entries
+        # are packages that may be present in the build host's venv but are
+        # not declared in ARS' requirements.txt.  Each entry is a top-level
+        # package name; PyInstaller skips collecting it AND its data files.
         "nvidia",            # CUDA runtime (only needed by torch GPU builds)
-        "torch",
-        "transformers",
-        "sentence_transformers",
+        "torch",             # DL stack — graceful degradation, see note above
+        "transformers",      # DL stack — graceful degradation, see note above
+        "sentence_transformers",  # DL stack — graceful degradation
         "catboost",          # not in requirements.txt
         "cv2",               # opencv — not declared
         "opencv",

@@ -27,7 +27,15 @@ from typing import Optional
 
 # === Constants ============================================================
 
-__version__ = "0.1.0"
+# Version is sourced from the layered configuration (config/settings.py,
+# default_config.yaml, ARS_VERSION env var) so the CLI, web server and
+# packaging metadata can never drift apart again.
+try:
+    from config.settings import get_settings as _get_settings
+
+    __version__ = _get_settings().version
+except Exception:  # noqa: BLE001 - config layer must never break startup
+    __version__ = "2.0.0"
 APP_NAME = "Academic Research Suite"
 
 logger = logging.getLogger("ars.main")
@@ -151,12 +159,17 @@ def _install_signal_handlers() -> None:
 
 
 def _shutdown() -> None:
-    """Best-effort cleanup: flush logs, close DB."""
-    try:  # pragma: no cover - depends on backend availability
-        from web.server import ServerState
+    """Best-effort cleanup: flush logs, close the live DB connection.
 
-        state = ServerState()
-        db = state.db
+    Uses :meth:`database.connection.DatabaseConnection.get_existing` so the
+    shutdown path never *constructs* a new connection (the old code built a
+    fresh ``web.server.ServerState``, which lazily created a brand-new DB
+    file and then never closed anything).
+    """
+    try:  # pragma: no cover - depends on backend availability
+        from database.connection import DatabaseConnection
+
+        db = DatabaseConnection.get_existing()
         if db is not None and hasattr(db, "close"):
             db.close()
             logger.info("Database connection closed")
@@ -169,17 +182,18 @@ def _shutdown() -> None:
 # === Database reset =======================================================
 
 def _reset_database() -> None:
-    """Wipe and reinitialise the local SQLite database."""
+    """Wipe and reinitialise the local SQLite database.
+
+    Implemented via ``DatabaseConnection(...).reset()`` (drop_all +
+    init_db), which now exists on the connection class.
+    """
     logger.warning("Resetting database as requested via --reset-db")
     try:
         from database.connection import DatabaseConnection  # type: ignore
 
         db = DatabaseConnection()
-        if hasattr(db, "reset"):
-            db.reset()
-            logger.info("Database reset complete")
-        else:
-            logger.warning("DatabaseConnection has no reset() method")
+        db.reset()
+        logger.info("Database reset complete")
     except Exception as exc:  # pragma: no cover - defensive
         logger.error("Could not reset database: %s", exc)
 
@@ -206,6 +220,41 @@ def run_web_server(port: int = 8765, host: str = "127.0.0.1",
 
 # === Desktop UI entry =====================================================
 
+def _show_welcome_modal() -> None:
+    """Show the first-run welcome screen as a modal dialog.
+
+    ``ui.welcome_screen.WelcomeScreen`` subclasses ``QWidget`` (not
+    ``QDialog``), so it has no ``exec_()`` of its own — the widget is
+    embedded in a plain ``QDialog`` which is then exec'd, giving correct
+    modal semantics on both PyQt5 and PySide2. If a future version of
+    ``WelcomeScreen`` becomes a ``QDialog``, it is exec'd directly.
+    """
+    from qtpy.QtWidgets import QDialog, QVBoxLayout
+
+    from ui.welcome_screen import WelcomeScreen  # type: ignore
+
+    welcome = WelcomeScreen()
+    if isinstance(welcome, QDialog):
+        exec_fn = getattr(welcome, "exec", None)
+        if callable(exec_fn):
+            exec_fn()
+        else:  # pragma: no cover - legacy bindings
+            welcome.exec_()
+        return
+    dialog = QDialog()
+    dialog.setWindowTitle(APP_NAME)
+    layout = QVBoxLayout(dialog)
+    layout.setContentsMargins(0, 0, 0, 0)
+    layout.addWidget(welcome)
+    dialog.setModal(True)
+    dialog.resize(760, 560)
+    exec_fn = getattr(dialog, "exec", None)
+    if callable(exec_fn):
+        exec_fn()
+    else:  # pragma: no cover - PyQt4-era bindings
+        dialog.exec_()
+
+
 def run_desktop(theme: str = "dark") -> int:
     """Launch the PyQt5 desktop UI.
 
@@ -231,7 +280,6 @@ def run_desktop(theme: str = "dark") -> int:
 
     from ui.modern_theme import ModernTheme  # type: ignore
     from ui.main_window import MainWindow  # type: ignore
-    from ui.welcome_screen import WelcomeScreen  # type: ignore
 
     app = QApplication.instance() or QApplication(sys.argv)
     ModernTheme.apply(app, theme=theme)
@@ -239,15 +287,14 @@ def run_desktop(theme: str = "dark") -> int:
     window = MainWindow()
     window.show()
 
-    # Show the welcome screen on first launch (when no DB exists yet).
+    # Show the welcome screen on first launch.
     try:
         from utils.config_manager import ConfigManager  # type: ignore
 
         cfg = ConfigManager()
         if not cfg.get_setting("first_run_completed", False):
-            welcome = WelcomeScreen()
-            welcome.exec_()
-            cfg.set_setting("first_run_completed", True)
+            _show_welcome_modal()
+            cfg.set_setting("first_run_completed", True, persist=True)
     except Exception as exc:  # pragma: no cover - defensive
         logger.warning("Welcome screen skipped: %s", exc)
 

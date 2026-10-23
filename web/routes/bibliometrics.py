@@ -17,6 +17,8 @@ from typing import Any
 
 from flask import Blueprint, jsonify, request
 
+from web.routes._common import as_int, error_response, json_safe
+
 logger = logging.getLogger(__name__)
 
 bibliometrics_bp = Blueprint("bibliometrics", __name__, url_prefix="/api/bibliometrics")
@@ -79,8 +81,8 @@ def indices():
         result = PoPIndices().compute_all(citations, years=years)
         return jsonify({"indices": result})
     except Exception as exc:
-        logger.exception("/api/bibliometrics/indices failed: %s", exc)
-        return jsonify({"error": "analysis_failed", "message": str(exc)}), 502
+        return error_response(logger, "/api/bibliometrics/indices failed", exc,
+                              status=502, error="analysis_failed")
 
 
 @bibliometrics_bp.route("/journal-metrics", methods=["POST"])
@@ -105,8 +107,8 @@ def journal_metrics():
         result = JournalMetrics().compute_journal_metrics(papers, journal, year=year)
         return jsonify({"metrics": result})
     except Exception as exc:
-        logger.exception("/api/bibliometrics/journal-metrics failed: %s", exc)
-        return jsonify({"error": "analysis_failed", "message": str(exc)}), 502
+        return error_response(logger, "/api/bibliometrics/journal-metrics failed", exc,
+                              status=502, error="analysis_failed")
 
 
 @bibliometrics_bp.route("/vos", methods=["POST"])
@@ -148,8 +150,8 @@ def vos():
             }
         return jsonify({"graph": data})
     except Exception as exc:
-        logger.exception("/api/bibliometrics/vos failed: %s", exc)
-        return jsonify({"error": "analysis_failed", "message": str(exc)}), 502
+        return error_response(logger, "/api/bibliometrics/vos failed", exc,
+                              status=502, error="analysis_failed")
 
 
 @bibliometrics_bp.route("/bursts", methods=["POST"])
@@ -164,15 +166,19 @@ def bursts():
     """
     payload = request.get_json(silent=True) or {}
     papers = _coerce_papers(payload)
-    time_window = int(payload.get("time_window", 1) or 1)
+    try:
+        time_window = as_int(payload.get("time_window"), 1,
+                             name="time_window", minimum=1)
+    except ValueError as exc:
+        return jsonify({"error": "bad_request", "message": str(exc)}), 400
     try:
         from bibliometrics.citespace import CiteSpaceAnalyzer
         analyzer = CiteSpaceAnalyzer()
         bursts = analyzer.detect_citation_bursts(papers, time_window=time_window)
-        return jsonify({"bursts": [b.to_dict() if hasattr(b, "to_dict") else dict(b) for b in bursts]})
+        return jsonify({"bursts": [json_safe(b.to_dict() if hasattr(b, "to_dict") else dict(b)) for b in bursts]})
     except Exception as exc:
-        logger.exception("/api/bibliometrics/bursts failed: %s", exc)
-        return jsonify({"error": "analysis_failed", "message": str(exc)}), 502
+        return error_response(logger, "/api/bibliometrics/bursts failed", exc,
+                              status=502, error="analysis_failed")
 
 
 @bibliometrics_bp.route("/author-profile/<author_id>", methods=["GET"])
@@ -192,8 +198,8 @@ def author_profile(author_id: str):
         profile = AuthorProfile.from_papers(papers, name=author_id)
         return jsonify({"profile": profile.__dict__ if hasattr(profile, "__dict__") else str(profile)})
     except Exception as exc:
-        logger.exception("/api/bibliometrics/author-profile failed: %s", exc)
-        return jsonify({"error": "analysis_failed", "message": str(exc)}), 502
+        return error_response(logger, "/api/bibliometrics/author-profile failed", exc,
+                              status=502, error="analysis_failed")
 
 
 @bibliometrics_bp.route("/journal-profile/<path:journal_name>", methods=["GET"])
@@ -212,5 +218,5 @@ def journal_profile(journal_name: str):
         profile = JournalProfile.from_papers(papers, journal_name)
         return jsonify({"profile": profile.__dict__ if hasattr(profile, "__dict__") else str(profile)})
     except Exception as exc:
-        logger.exception("/api/bibliometrics/journal-profile failed: %s", exc)
-        return jsonify({"error": "analysis_failed", "message": str(exc)}), 502
+        return error_response(logger, "/api/bibliometrics/journal-profile failed", exc,
+                              status=502, error="analysis_failed")

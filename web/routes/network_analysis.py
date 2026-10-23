@@ -16,9 +16,20 @@ modules are unavailable.
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any
 
 from flask import Blueprint, jsonify, request
+
+from web.routes._common import (
+    as_int,
+    bad_request,
+    error_response,
+    json_safe,
+    not_found,
+    safe_remove,
+    temp_file_path,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -122,8 +133,8 @@ def centrality():
             "centrality": {str(k): v for k, v in (result or {}).items()},
         })
     except Exception as exc:
-        logger.exception("/api/network/centrality failed: %s", exc)
-        return jsonify({"error": "analysis_failed", "message": str(exc)}), 502
+        return error_response(logger, "/api/network/centrality failed", exc,
+                              status=502, error="analysis_failed")
 
 
 @network_bp.route("/community", methods=["POST"])
@@ -166,8 +177,8 @@ def community():
         ]
         return jsonify({"method": method, "communities": communities})
     except Exception as exc:
-        logger.exception("/api/network/community failed: %s", exc)
-        return jsonify({"error": "analysis_failed", "message": str(exc)}), 502
+        return error_response(logger, "/api/network/community failed", exc,
+                              status=502, error="analysis_failed")
 
 
 @network_bp.route("/components", methods=["POST"])
@@ -201,8 +212,8 @@ def components():
             "average_clustering": ComponentAnalysis.average_clustering(g),
         })
     except Exception as exc:
-        logger.exception("/api/network/components failed: %s", exc)
-        return jsonify({"error": "analysis_failed", "message": str(exc)}), 502
+        return error_response(logger, "/api/network/components failed", exc,
+                              status=502, error="analysis_failed")
 
 
 @network_bp.route("/paths", methods=["POST"])
@@ -225,20 +236,37 @@ def paths():
         return _bad_request(str(exc))
     try:
         from networkx_pro.algorithms_paths_flows import PathsAndFlows
-        path = PathsAndFlows.shortest_path(g, source, target)
-        length = PathsAndFlows.shortest_path_length(g, source, target)
+
+        def _is_unreachable(exc: BaseException) -> bool:
+            """True when the failure means 'no path / unknown node'."""
+            name = type(exc).__name__
+            return name in {"NetworkXNoPath", "NodeNotFound",
+                            "NetworkXPointlessConcept"}
+
         try:
-            all_paths = [list(p) for p in PathsAndFlows.all_shortest_paths(g, source, target)]
+            path = PathsAndFlows.shortest_path(g, source, target)
+            length = PathsAndFlows.shortest_path_length(g, source, target)
+        except Exception as exc:
+            if _is_unreachable(exc):
+                return not_found(
+                    f"no path between {source!r} and {target!r}")
+            raise
+        try:
+            all_paths = [list(p) for p in
+                         PathsAndFlows.all_shortest_paths(g, source, target)]
         except Exception:
             all_paths = []
+        if not path or (length is None and not path):
+            return not_found(f"no path between {source!r} and {target!r}")
         return jsonify({
             "shortest_path": [str(n) for n in (path or [])],
-            "length": int(length) if length is not None else None,
+            "length": int(length) if isinstance(length, (int, float)) \
+                      and not isinstance(length, bool) else None,
             "all_shortest_paths": [[str(n) for n in p] for p in all_paths],
         })
     except Exception as exc:
-        logger.exception("/api/network/paths failed: %s", exc)
-        return jsonify({"error": "analysis_failed", "message": str(exc)}), 502
+        return error_response(logger, "/api/network/paths failed", exc,
+                              status=502, error="analysis_failed")
 
 
 @network_bp.route("/link-prediction", methods=["POST"])
@@ -246,40 +274,58 @@ def link_prediction():
     """Predict the top-N most likely future edges.
 
     Body: ``{"graph": {...}, "method": str, "top_n": int?}`` where
-    ``method`` is one of ``jaccard``, ``adamic_adar``, ``preferential_attachment``,
-    ``resource_allocation``, ``common_neighbor_centrality``, ``katz_similarity``,
+    ``method`` is one of ``jaccard``, ``adamic_adar``,
+    ``preferential_attachment``, ``resource_allocation``,
+    ``common_neighbor_centrality``, ``katz_similarity``,
     ``predict_top_links``.
+
+    The five local predictors run through
+    ``LinkPrediction.predict_top_links(g, method=..., n=top_n)``.
+    ``katz_similarity`` returns a ``{u: {v: score}}`` matrix, which is
+    flattened to sorted ``(u, v, score)`` triples before returning.
     """
     payload = request.get_json(silent=True) or {}
     method = (payload.get("method") or "jaccard").strip()
-    top_n = int(payload.get("top_n", 10) or 10)
+    try:
+        top_n = as_int(payload.get("top_n"), 10, name="top_n",
+                       minimum=1, maximum=1000)
+    except ValueError as exc:
+        return _bad_request(str(exc))
     try:
         g = _build_graph(payload)
     except Exception as exc:
         return _bad_request(str(exc))
     try:
         from networkx_pro.algorithms_link_prediction import LinkPrediction
-        method_map = {
-            "jaccard": LinkPrediction.jaccard_coefficient,
-            "adamic_adar": LinkPrediction.adamic_adar_index,
-            "preferential_attachment": LinkPrediction.preferential_attachment,
-            "resource_allocation": LinkPrediction.resource_allocation_index,
-            "common_neighbor_centrality": LinkPrediction.common_neighbor_centrality,
-            "katz_similarity": LinkPrediction.katz_similarity,
-            "predict_top_links": LinkPrediction.predict_top_links,
-        }
-        fn = method_map.get(method)
-        if fn is None:
+        supported = {"jaccard", "adamic_adar", "preferential_attachment",
+                     "resource_allocation", "common_neighbor_centrality"}
+        if method in supported or method == "predict_top_links":
+            inner = "jaccard" if method == "predict_top_links" else method
+            result = LinkPrediction.predict_top_links(g, method=inner, n=top_n)
+        elif method == "katz_similarity":
+            # Katz returns a nested {u: {v: score}} matrix — flatten to
+            # sorted (u, v, score) triples (self-pairs excluded).
+            matrix = LinkPrediction.katz_similarity(g)
+            triples = [
+                (u, v, float(score))
+                for u, inner_row in (matrix or {}).items()
+                for v, score in inner_row.items()
+                if u != v
+            ]
+            triples.sort(key=lambda t: -t[2])
+            result = triples[:top_n]
+        else:
             return _bad_request(f"unknown method: {method}")
-        result = fn(g) if method != "predict_top_links" else fn(g, top_n=top_n)
         preds = []
         for u, v, score in (result or []):
             preds.append({"source": str(u), "target": str(v), "score": float(score)})
-        preds = preds[:top_n]
         return jsonify({"method": method, "predictions": preds})
+    except ValueError as exc:
+        logger.warning("link-prediction rejected: %s", exc)
+        return _bad_request("unknown method or invalid graph")
     except Exception as exc:
-        logger.exception("/api/network/link-prediction failed: %s", exc)
-        return jsonify({"error": "analysis_failed", "message": str(exc)}), 502
+        return error_response(logger, "/api/network/link-prediction failed", exc,
+                              status=502, error="analysis_failed")
 
 
 @network_bp.route("/layouts", methods=["POST"])
@@ -321,8 +367,8 @@ def layouts():
             "positions": {str(k): [float(v[0]), float(v[1])] for k, v in (positions or {}).items()},
         })
     except Exception as exc:
-        logger.exception("/api/network/layouts failed: %s", exc)
-        return jsonify({"error": "analysis_failed", "message": str(exc)}), 502
+        return error_response(logger, "/api/network/layouts failed", exc,
+                              status=502, error="analysis_failed")
 
 
 @network_bp.route("/stats", methods=["POST"])
@@ -342,8 +388,8 @@ def stats():
         data = report.to_dict() if hasattr(report, "to_dict") else {"nodes": g.number_of_nodes(), "edges": g.number_of_edges()}
         return jsonify({"stats": data})
     except Exception as exc:
-        logger.exception("/api/network/stats failed: %s", exc)
-        return jsonify({"error": "analysis_failed", "message": str(exc)}), 502
+        return error_response(logger, "/api/network/stats failed", exc,
+                              status=502, error="analysis_failed")
 
 
 @network_bp.route("/filter", methods=["POST"])
@@ -391,8 +437,8 @@ def filter_graph():
         data = json_graph.node_link_data(filtered)
         return jsonify({"filtered": data})
     except Exception as exc:
-        logger.exception("/api/network/filter failed: %s", exc)
-        return jsonify({"error": "analysis_failed", "message": str(exc)}), 502
+        return error_response(logger, "/api/network/filter failed", exc,
+                              status=502, error="analysis_failed")
 
 
 @network_bp.route("/export", methods=["POST"])
@@ -416,37 +462,32 @@ def export():
     try:
         from networkx_pro.graph_io import GraphIO
         if fmt == "json":
-            return jsonify({"format": fmt, "data": GraphIO.to_json(g)})
+            return jsonify({"format": fmt, "data": json_safe(GraphIO.to_json(g))})
         if fmt == "cytoscape":
             return jsonify({"format": fmt, "data": GraphIO.to_cytoscape(g)})
         if fmt == "d3":
-            return jsonify({"format": fmt, "data": GraphIO.to_d3_force(g)})
-        # Textual formats — return the string content directly.
-        text_format_map = {
-            "graphml": "graphml", "gexf": "gexf", "gml": "gml",
-            "pajek": "pajek", "edgelist": "edgelist", "adjlist": "adjlist",
+            return jsonify({"format": fmt, "data": json_safe(GraphIO.to_d3_force(g))})
+        # Textual formats — written through the sanitised GraphIO
+        # writers (they normalise None/list node attributes that crash
+        # the raw networkx writers) into a secure temp file.
+        writer_map = {
+            "graphml": GraphIO.write_graphml,
+            "gexf": GraphIO.write_gexf,
+            "gml": GraphIO.write_gml,
+            "pajek": GraphIO.write_pajek,
+            "edgelist": GraphIO.write_edgelist,
+            "adjlist": GraphIO.write_adjlist,
         }
-        if fmt not in text_format_map:
+        if fmt not in writer_map:
             return _bad_request(f"unknown format: {fmt}")
-        # Use an in-memory buffer.
-        import io
-        if fmt in ("graphml", "gexf", "gml", "pajek", "edgelist", "adjlist"):
-            # All networkx writers ultimately call .write() with bytes
-            # (the networkx 3.x writers always encode their output),
-            # so we use BytesIO and decode at the end.
-            import networkx as nx
-            buf = io.BytesIO()
-            writer_map = {
-                "graphml":  nx.write_graphml,
-                "gexf":     nx.write_gexf,
-                "gml":      nx.write_gml,
-                "pajek":    nx.write_pajek,
-                "edgelist": nx.write_weighted_edgelist,
-                "adjlist":  nx.write_adjlist,
-            }
-            writer_map[fmt](g, buf)
-            return jsonify({"format": fmt, "content": buf.getvalue().decode("utf-8", errors="replace")})
-        return _bad_request(f"unknown format: {fmt}")
+        path = temp_file_path(f".{fmt}")
+        try:
+            writer_map[fmt](g, path)
+            with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                content = fh.read()
+        finally:
+            safe_remove(path)
+        return jsonify({"format": fmt, "content": content})
     except Exception as exc:
-        logger.exception("/api/network/export failed: %s", exc)
-        return jsonify({"error": "analysis_failed", "message": str(exc)}), 502
+        return error_response(logger, "/api/network/export failed", exc,
+                              status=502, error="analysis_failed")

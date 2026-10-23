@@ -12,6 +12,12 @@
 > (citation-burst detection, knowledge-frontier mapping, trend
 > forecasting, novelty scoring).
 
+> **Compliance and security notes:** journal-level indicators are proxies
+> computed from your local corpus (not official JCR/SJR/CiteScore values); the
+> web API has no authentication and defaults to local CORS origins; some
+> scrapers and the proxy pool may conflict with provider terms. See
+> [docs/COMPLIANCE_AND_LICENSING.md](docs/COMPLIANCE_AND_LICENSING.md).
+
 Sophidan ARS (Academic Research Suite) is a pure-Python, PyQt5 desktop application for
 academic literature research. It bundles multi-source scraping, a proxy
 pool, bibliometric analysis, knowledge-graph construction, a local-LLM
@@ -43,9 +49,9 @@ and there is no telemetry or cloud dependency.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
-[![Platform](https://img.shields.io/badge/platform-win%20%7C%20mac%20%7C%20linux-lightgrey.svg)](https://github.com/academic-research-suite/academic_research_suite)
+[![Platform](https://img.shields.io/badge/platform-win%20%7C%20mac%20%7C%20linux-lightgrey.svg)](https://github.com/thelonecoders/Sophidan)
 [![Version](https://img.shields.io/badge/version-v2.0.0-blue.svg)](docs/CHANGELOG.md)
-[![Tests](https://img.shields.io/badge/tests-272_passing-brightgreen.svg)](tests/)
+[![Tests](https://img.shields.io/badge/tests-303_passing-brightgreen.svg)](tests/)
 
 ---
 
@@ -118,7 +124,7 @@ literature review.
 | **Health checker** | Batch + continuous monitor with latency measurement and geoip enrichment. |
 | **Multi-hop proxy chains** | SOCKS4/SOCKS5/HTTP-CONNECT tunneling with hand-rolled protocol handshakes. |
 | **Rotation strategies** | Round-robin, random, least-used, best-latency, weighted-by-success — with banlist & cooldown. |
-| **ProxyPool facade** | One-call `refresh_pool()`, `get_workable()`, `get_proxy(strategy=...)`. |
+| **ProxyPool facade** | One-call `refresh()` / `refresh_pool()`, `list_proxies()`, `get_proxy()`, `get_proxy_url()`, `test_proxy()`, `ban()`, `build_chain()`, `set_chain()`, `health_check_all()`. |
 | **Import / export** | Round-trip TXT / JSON / CSV proxy lists. |
 | **Background refresh** | Daemon thread that keeps the pool topped up at a configurable interval. |
 | **Per-source parsers** | Dedicated parsers for raw IP:port lists, HTML tables, and obfuscated JS sources. |
@@ -146,7 +152,7 @@ literature review.
 | **Temporal network** | Year-tagged edges with snapshot, evolution animation, and growth curves. |
 | **Graph algorithms** | k-core, modularity (Louvain/Leiden), link prediction, betweenness. |
 | **NetworkAnalyzer** | Unified builder + generic centrality / community / topology metrics. |
-| **Cytoscape export** | One-call JSON output for web embedding (`to_cytoscape(project_id)`). |
+| **Cytoscape export** | One-call JSON output for web embedding (`GraphIO.to_cytoscape(graph)`). |
 
 ### AI Assistant
 
@@ -216,7 +222,7 @@ literature review.
 
 | Feature | Description |
 |---|---|
-| **Centralities** | 20 centrality measures: degree, in/out, closeness, betweenness, eigenvector, eigenvector_numpy, katz, pagerank, HITS, authority, hub, harmonic, percolation, second-order, current-flow closeness, current-flow betweenness, communicability, load, subgraph; plus a one-call `all_centralities` aggregator. |
+| **Centralities** | 17 centrality measures: degree, closeness, betweenness, eigenvector (+numpy), katz, pagerank, HITS hub/authority, harmonic, percolation, second-order, current-flow closeness/betweenness, communicability, load, subgraph; plus a one-call `all_centralities` aggregator. |
 | **CommunityDetection** | Louvain, greedy modularity, label propagation (sync + async), Girvan-Newman, k-clique; plus modularity, partition quality, density, silhouette, NMI, AMI, ARI, VI for community comparison. |
 | **ComponentAnalysis** | Connected / strongly / weakly components, condensation DAG, articulation points, bridges, k-core / k-shell / k-crust / k-corona / k-truss, core_number, onion_layers, all cliques, max-weight clique, triangles, transitivity, average clustering. |
 | **PathsAndFlows** | Shortest paths (single / all / all-pairs), diameter / radius / eccentricity / center / periphery, max-flow / min-cut, Edmonds-Karp, Ford-Fulkerson (manual), edge/node disjoint paths, A*, all simple paths. |
@@ -231,8 +237,8 @@ literature review.
 
 | Feature | Description |
 |---|---|
-| **Layouts** | 11 Gephi-grade algorithms: ForceAtlas2, OpenOrd, YifanHu, Fruchterman-Reingold, Kamada-Kawai, circular, grid, radial, hierarchical, geographic, plus a `LayoutPipeline` for chained layout passes. |
-| **Filters** | 15 filters: degree/weight/edge-weight/property range, giant component, connected components, k-core, ego-network, shortest-path, mutual-edge, parallel-edge, partition, equal-property, edge-type, inter-edges, time-range; combinable via `FilterChain`. |
+| **Layouts** | 10 Gephi-grade algorithms: ForceAtlas2, OpenOrd, YifanHu, Fruchterman-Reingold, Kamada-Kawai, circular, grid, radial, hierarchical, geographic, plus a `LayoutPipeline` for chained layout passes. |
+| **Filters** | 16 filters: degree/weight/edge-weight/property range, giant component, connected components, k-core, ego-network, shortest-path, mutual-edge, parallel-edge, partition, equal-property, edge-type, inter-edges, time-range; combinable via `FilterChain`. |
 | **NetworkStatistics** | Gephi "Statistics" panel: density, modularity, avg. path length, HITS, PageRank, connected components, in/out degree distribution, network diameter. |
 | **Partition** | Color nodes/edges by community, attribute or clustering; multiple palettes. |
 | **Ranking** | Size/color nodes by metric, set edge widths, prioritise labels. |
@@ -269,7 +275,7 @@ literature review.
 | Feature | Description |
 |---|---|
 | **PRISMAFlowGenerator** | Renders the canonical PRISMA 2020 flow diagram to matplotlib, SVG, PDF, PNG, and standalone HTML; supports BMJ and BMJ-style templates. |
-| **PRISMAStageCounts** | Identifies & holds counts at each PRISMA stage (identification, screening, eligibility, included, plus new/old records). |
+| **PRISMAStageCounts** | Holds the PRISMA 2020 stage counts (n_records_databases / n_records_registers, n_records_before/after_duplicates, n_records_screened, n_full_text_*, n_studies_included_qualitative/quantitative); unknown stages are simply omitted from the diagram. |
 | **PRISMAChecklist** | 27-item PRISMA 2020 checklist with markdown / YAML / PDF / DOCX export and `completion_rate()` / `missing_items()`. |
 | **PRISMAExtensionsChecklist** | 6 official extensions: IPD, NMA, ScR, Harms, Abstract, Diagnostic. |
 | **PRISMAExtensionGenerator** | Generates extension-specific flow diagrams for each of the 6 extensions. |
@@ -284,10 +290,10 @@ literature review.
 | **Q1Typography** | Journal-specific font families, sizes, and matplotlib rcParams; auto-applies via `configure_matplotlib("nature")`. |
 | **Q1FigureFactory** | Single-call builder with `set_journal`, `set_size` (single/double column), `new_figure_and_axes`, `style_axes`, `add_legend`, `add_significance_bar`, `add_error_bars`, `add_colorbar`, `annotate_panel`, `save` (auto-format inference). |
 | **MultiPanelFigure** | Grid layout, panel labelling (a, b, c, ...), shared axes, per-panel colorbars, fine-grained spacing. |
-| **StatisticalPlots** | 14 plots: box, violin, raincloud, beeswarm, paired, volcano, Manhattan, QQ, Kaplan-Meier, ROC, PR-curve, calibration, Bland-Altman. |
+| **StatisticalPlots** | 13 plots: box, violin, raincloud, beeswarm, paired, volcano, Manhattan, QQ, Kaplan-Meier, ROC, PR-curve, calibration, Bland-Altman. |
 | **Q1NetworkPlots** | Network, bipartite, circular network, arc diagram, heatmap-graph, Sankey, chord, hive plots. |
 | **BibliometricPlots** | 12 plots: Lotka, Bradford, Zipf, growth curve, citation distribution, h-index curve, impact-factor distribution, author collaboration heatmap, citation network graph, topic-evolution streamgraph, overlay visualization, co-word map. |
-| **Q1DataPlots** | 11 plots: scatter, line, bar, stacked-bar, grouped-bar, heatmap, clustered heatmap, density, contour, ridgeline, parallel coordinates, polar. |
+| **Q1DataPlots** | 12 plots: scatter, line, bar, stacked-bar, grouped-bar, heatmap, clustered heatmap, density, contour, ridgeline, parallel coordinates, polar. |
 
 ### Research Lifecycle — `research_lifecycle` (v2.0.0)
 
@@ -297,7 +303,7 @@ literature review.
 | **IdeaGenerator** | Generates, refines, combines, and scores research ideas using LLM (offline fallback). |
 | **ProtocolTemplateLibrary** | 9 templates: systematic review, scoping review, meta-analysis protocol, rapid review, case study, cohort study, RCT, qualitative, mixed methods. Plus `ProtocolBuilder` for fill/validate/markdown/PDF/DOCX export. |
 | **ExtractionTemplateLibrary** | 7 templates: Cochrane RCT, observational, qualitative, mixed-methods, bibliometric, content-analysis, survey. |
-| **QualityAssessmentTool** | 8 tools: MMAT, STROBE, CONSORT, PRISMA-compliance, CARE, CARE-Plus, SRQR, ENTREQ, CASP. |
+| **QualityAssessmentTool** | 9 tools: MMAT, STROBE, CONSORT, PRISMA-compliance, CARE, CARE-Plus, SRQR, ENTREQ, CASP. |
 | **Synthesis methods** | Narrative, thematic, QCA, meta-synthesis, Best-Fit Framework synthesis. |
 | **EquatorChecklists** | 10 EQUATOR-Network reporting checklists: CONSORT, STROBE, PRISMA, STARD, TRIPOD, SPIRIT, SQUIRE, CHEERS, TREND, COREQ. |
 | **WritingAssistant** | Outline, draft section, improve prose, grammar check, abstract & title generation, citation formatting (APA/MLA/Chicago/Vancouver), paraphrase, IMRaD summary. |
@@ -321,7 +327,7 @@ literature review.
 |---|---|
 | **`/api/bibliometrics`** | 6 endpoints — author indices, journal metrics, VOS analyses, citation bursts, author/journal profiles. |
 | **`/api/network`** | 9 endpoints — centrality, community, components, paths, link-prediction, layouts, stats, filter, export. |
-| **`/api/sr`** | 11 endpoints — protocol CRUD, screening import / decide / progress, RoB assess + retrieve, extraction, synthesis, PRISMA flow, PRISMA checklist. |
+| **`/api/sr`** | 12 endpoints — protocol CRUD, screening import / decide / progress, RoB assess + retrieve, extraction, synthesis, PRISMA flow, PRISMA checklist. |
 | **`/api/ma`** | 8 endpoints — effect-size, pool, forest plot, funnel plot, subgroup, sensitivity, NMA, report. |
 | **`/api/figures`** | 16 endpoints — forest, funnel, volcano, Manhattan, QQ, Kaplan-Meier, ROC, PR-curve, boxplot, violin, raincloud, heatmap, network, Sankey, multi-panel, palettes. |
 | **`/api/innovation`** | 7 endpoints — bursts, frontiers, forecast, recommend-papers, recommend-collaborators, novelty, directions. |
@@ -398,9 +404,9 @@ aggregation / multi-edge-aware PageRank).
 
 ### 3. `gephi_viz/` — Gephi-style interactive visualization
 
-Eleven layout algorithms (`ForceAtlas2`, `OpenOrd`, `YifanHu`,
+Ten layout algorithms (`ForceAtlas2`, `OpenOrd`, `YifanHu`,
 `Fruchterman-Reingold`, `Kamada-Kawai`, `Circular`, `Grid`, `Radial`,
-`Hierarchical`, `Geo`, plus `LayoutPipeline`); 15 filters
+`Hierarchical`, `Geo`, plus `LayoutPipeline`); 16 filters
 (`DegreeRangeFilter`, `WeightRangeFilter`, `EdgeWeightRangeFilter`,
 `PropertyValueRangeFilter`, `GiantComponentFilter`,
 `ConnectedComponentsFilter`, `KCoreFilter`, `EgoNetworkFilter`,
@@ -463,8 +469,8 @@ column), `new_figure_and_axes`, `style_axes`, `add_legend`,
 `add_significance_bar`, `add_error_bars`, `add_colorbar`,
 `annotate_panel`, `save` (with auto-format inference). `MultiPanelFigure`
 composes multi-panel grids with panel labels and shared axes.
-`StatisticalPlots` (14 plots), `Q1NetworkPlots` (8 plots), `BibliometricPlots`
-(12 plots), and `Q1DataPlots` (11 plots) cover every common figure
+`StatisticalPlots` (13 plots), `Q1NetworkPlots` (8 plots), `BibliometricPlots`
+(12 plots), and `Q1DataPlots` (12 plots) cover every common figure
 type for systematic reviews, meta-analyses and bibliometric studies.
 
 ### 8. `research_lifecycle/` — End-to-end research workflow
@@ -474,7 +480,7 @@ type for systematic reviews, meta-analyses and bibliometric studies.
 `ProtocolTemplateLibrary` (9 templates — systematic review, scoping
 review, meta-analysis protocol, rapid review, case study, cohort study,
 RCT, qualitative, mixed methods), `ExtractionTemplateLibrary` (7 templates),
-`QualityAssessmentTool` (8 tools — MMAT, STROBE, CONSORT, PRISMA-compliance,
+`QualityAssessmentTool` (9 tools — MMAT, STROBE, CONSORT, PRISMA-compliance,
 CARE, CARE-Plus, SRQR, ENTREQ, CASP), 5 synthesis methods
 (NarrativeSynthesis, ThematicSynthesis, QualitativeComparativeAnalysis,
 MetaSynthesis, BestFitFrameworkSynthesis), `EquatorChecklists` (10
@@ -505,7 +511,7 @@ Nine new academic scrapers — `SpringerScraper`, `IEEEXploreScraper`,
 `CitationResolver` (cross-API DOI / OpenAlex / Crossref /
 OpenCitations resolver), `OpenAccessFinder` (best-URL OA lookup),
 `MetadataEnricher` (cross-source author / abstract / reference-list
-enrichment). The `ScrapingEngine` now registers 13+ scrapers by default
+enrichment). The `ScrapingEngine` registers 17 scrapers: 13 by default and 4 that need an API key (Springer, IEEE, CORE, BASE)
 and parallel-searches all of them in one call.
 
 ---
@@ -533,7 +539,7 @@ desktop-first package. The detailed head-to-head is in
 | Network meta-analysis + SUCRA | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | partial | partial | ✗ |
 | Publication-bias tests (Egger/Begg/Peters/Harbord + trim-fill) | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | partial | ✓ | ✗ |
 | Q1-journal palettes (Nature/Science/Cell/NEJM/Lancet/JAMA) | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
-| 14 statistical + 8 network + 12 bibliometric plot recipes | ✓ | ✗ | partial | partial | partial | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
+| 13 statistical + 8 network + 12 bibliometric plot recipes | ✓ | ✗ | partial | partial | partial | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
 | Citation-burst detection (Kleinberg) | ✓ | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | partial |
 | Knowledge-frontier mapping + trend forecasting | ✓ | ✗ | ✗ | ✗ | partial | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
 | Novelty scoring (Uzzi atypicality + disruption index) | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
@@ -541,7 +547,7 @@ desktop-first package. The detailed head-to-head is in
 | PDF / DOCX / PPTX / BibTeX reporting | ✓ | partial | ✗ | ✗ | ✗ | partial | partial | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | partial |
 | Local SQLite + FTS5 + ChromaDB | ✓ | ✗ | ✗ | ✗ | ✗ | ✓ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
 | MIT-licensed, runs fully offline | ✓ | ✓ | ✓ | ✓ | ✗ | partial | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✓ | ✓ |
-| Web API (15 blueprints, 65+ endpoints) | ✓ | ✗ | ✗ | ✗ | ✗ | partial | partial | ✗ | ✗ | ✗ | partial | ✗ | ✗ | ✗ |
+| Web API (15 blueprints, 108 endpoints) | ✓ | ✗ | ✗ | ✗ | ✗ | partial | partial | ✗ | ✗ | ✗ | partial | ✗ | ✗ | ✗ |
 
 **Bottom line:** ARS v2.0.0 covers in one tool what is today spread
 across Publish or Perish (bibliometrics), Gephi/VOSviewer/CiteSpace
@@ -569,8 +575,8 @@ infrastructure.
 
 ```bash
 # 1. Clone
-git clone https://github.com/academic-research-suite/academic_research_suite.git
-cd academic_research_suite
+git clone https://github.com/thelonecoders/Sophidan.git
+cd Sophidan
 
 # 2. Create a virtual environment
 python -m venv venv
@@ -683,7 +689,8 @@ print(f"Top by PageRank: {sorted(graph.pagerank().items(), key=lambda kv: -kv[1]
 
 # Save as Cytoscape JSON for the web viewer
 import json
-print(json.dumps(CitationGraph().to_cytoscape(papers), indent=2)[:400])
+from networkx_pro.graph_io import GraphIO
+print(json.dumps(GraphIO.to_cytoscape(graph), indent=2)[:400])
 ```
 
 ### 4. Summarize 20 Papers with the AI Assistant
@@ -696,32 +703,41 @@ llm = LLMClient(provider="ollama", model="llama3", base_url="http://localhost:11
 summarizer = PaperSummarizer(llm)
 
 topic_summary = summarizer.summarize_topic(papers[:20])
-print(topic_summary.overview)
-for paper, summary in zip(papers[:20], topic_summary.paper_summaries):
-    print(f"  - {paper.title}: {summary.tldr}")
+print(topic_summary.topic)
+print(topic_summary.consensus)          # agreed findings across the corpus
+for theme in topic_summary.sub_themes:
+    print(f"  - {theme}")
+for direction in topic_summary.future_directions:
+    print(f"  → {direction}")
 ```
 
 ### 5. Generate a PDF Report
 
 ```python
 from reporting.pdf_report import PDFReport
-from project_management.project_manager import ProjectManager
 from database.connection import DatabaseConnection
 
 db = DatabaseConnection()
-db.init_db()
-pm = ProjectManager(db)
+papers = db.list_papers(limit=100)
 
-report = PDFReport(pm, db)
-buf = report.generate(
-    project_id=42,
-    sections=["cover", "abstract", "methods", "results",
-              "tables", "charts", "bibliography"],
-)
-with open("my_report.pdf", "wb") as fh:
-    fh.write(buf.read() if hasattr(buf, "read") else buf)
-print("Report written.")
+report = PDFReport(title="Literature Review — 2026",
+                   author="Your Name",
+                   subject="Academic Research Suite corpus report")
+report.add_toc()
+report.add_cover_page({"title": "Literature Review — 2026",
+                       "author": "Your Name", "date": "2026-10"})
+report.add_section("Introduction",
+                   "This report surveys the current corpus …")
+report.add_papers_table(papers)
+report.add_section("Methods", "Records were identified via multi-source search …")
+path = report.build("my_report.pdf")
+print("Report written to", path)
 ```
+
+Other builder chains in `reporting/`: `DOCXReport`, `PPTXReport`
+(`add_title_slide` / `add_section_slide` / `add_papers_slides`),
+`BibTeXExporter`, `RisExporter`, plus the module-level wrappers
+`export_csv(papers, path)`, `export_xlsx(...)` and `export_bibtex(...)`.
 
 ### 6. Run Topic Modeling on a Project
 
@@ -770,9 +786,9 @@ stats = quick_stats(
     years=[2018, 2019, 2020, 2021, 2022, 2023, 2024, 2025, 2025, 2025],
     author_counts=[3, 4, 2, 5, 6, 2, 3, 4, 1, 1],
 )
-print(f"h = {stats['h_index']}")            # h = 6
-print(f"g = {stats['g_index']}")            # g = 7
-print(f"e = {stats['e_index']:.2f}")         # e ≈ 7.94
+print(f"h = {stats['h_index']}")            # h = 5
+print(f"g = {stats['g_index']}")            # g = 10  (capped at the number of papers)
+print(f"e = {stats['e_index']:.2f}")         # e ≈ 13.78
 print(f"hc = {stats['contemporary_h_index']:.2f}")
 print(f"AWCR = {stats['age_weighted_citation_rate']:.2f}")
 print(f"hm = {stats['multi_authored_h_index']:.2f}")
@@ -784,7 +800,7 @@ For the full author profile from a list of `Paper` objects:
 ```python
 from bibliometrics import AuthorProfile
 
-profile = AuthorProfile.from_papers(papers, author_id="A123")
+profile = AuthorProfile.from_papers(papers, name="A123")
 print(profile.to_dict())   # citations, publications, h, g, i10, e, hm, ARi, AWCR, h_max
 ```
 
@@ -794,15 +810,18 @@ print(profile.to_dict())   # citations, publications, h, g, i10, e, hm, ARi, AWC
 from prisma.flow_diagram import PRISMAFlowGenerator, PRISMAStageCounts
 
 counts = PRISMAStageCounts(
-    records_identified_via_databases=1248,
-    records_identified_via_other_methods=132,
-    records_after_deduplication=1107,
-    records_screened=1107,
-    records_excluded_title_abstract=923,
-    full_text_articles_assessed_for_eligibility=184,
-    full_text_articles_excluded=67,
-    studies_included_in_qualitative_synthesis=117,
-    studies_included_in_quantitative_synthesis=84,
+    n_records_databases=1248,
+    n_records_registers=132,
+    n_records_after_duplicates=1107,
+    n_records_screened=1107,
+    n_records_excluded_title_abstract=923,
+    n_records_sought_full_text=184,
+    n_records_not_retrieved=8,
+    n_full_text_assessed=176,
+    n_full_text_excluded=67,
+    n_excluded_with_reasons=[("Wrong design", 18), ("Wrong population", 12)],
+    n_studies_included_qualitative=109,
+    n_studies_included_quantitative=84,
 )
 
 gen = PRISMAFlowGenerator(counts, title="PRISMA 2020 — my systematic review")
@@ -849,8 +868,8 @@ studies = [
 
 result = PoolingEngine().pool(studies, method=PoolingMethod.DL)
 print(result.to_markdown())
-# Pooled effect = ~1.94, 95% CI [1.51, 2.37]
-# I² ≈ 0%, Q-test p > 0.05, τ² ≈ 0
+# Pooled effect = 1.82 (SE 0.34), 95% CI [1.15, 2.50]
+# I² = 0%, Q = 1.04 (df 4, p = 0.90), τ² = 0  (DL equals fixed-effect here)
 
 fp = ForestPlot(effect_sizes=studies, pooled=result.pooled_effect,
                 title="Effect of Treatment X (5 RCTs)")
@@ -890,7 +909,7 @@ from networkx_pro import Centralities, CommunityDetection, ComponentAnalysis
 
 g = nx.karate_club_graph()
 
-# 20 centralities in one call
+# 17 centralities in one call
 cent = Centralities.all_centralities(g)
 print(f"Top-5 by betweenness: {sorted(cent['betweenness_centrality'].items(), key=lambda kv: -kv[1])[:5]}")
 
@@ -957,7 +976,8 @@ for b in bursts[:10]:
     print(f"{b.entity_name}: burst {b.start_year}→{b.end_year} "
           f"(strength={b.strength:.2f}, peak={b.peak_year})")
 
-det.visualize(bursts, path="bursts.png")  # matplotlib timeline
+fig = det.visualize(bursts, figsize=(12, 8))   # matplotlib timeline figure
+fig.savefig("bursts.png", dpi=150)
 ```
 
 ### 8. Generate a research-protocol template
@@ -997,7 +1017,7 @@ writer = WritingAssistant(llm_client=llm)
 
 outline = writer.outline(topic="Effect of remdesivir on COVID-19 mortality",
                          papers=papers[:30])
-abstract = writer.generate_abstract(topic="...", papers=papers[:20])
+abstract = writer.generate_abstract(papers[0], max_words=250)
 print(abstract)
 ```
 
@@ -1010,7 +1030,7 @@ Every field of `config/settings.py::Settings`:
 | Field | Type | Default | Env var | Description |
 |---|---|---|---|---|
 | `app_name` | str | `"Academic Research Suite"` | `ARS_APP_NAME` | Human-readable application name. |
-| `version` | str | `"1.0.0"` | `ARS_VERSION` | Semantic version string. |
+| `version` | str | `"2.0.0"` | `ARS_VERSION` | Semantic version string. |
 | `data_dir` | str | `"data"` | `ARS_DATA_DIR` | Root data directory. |
 | `cache_dir` | str | `"data/cache"` | `ARS_CACHE_DIR` | HTTP / scraper cache directory. |
 | `projects_dir` | str | `"data/projects"` | `ARS_PROJECTS_DIR` | User project workspace directory. |
@@ -1028,7 +1048,7 @@ Every field of `config/settings.py::Settings`:
 | `user_agent` | str | (see below) | `ARS_USER_AGENT` | Default User-Agent header. |
 
 Default `user_agent`:
-`"Mozilla/5.0 (compatible; AcademicResearchSuite/1.0; +https://github.com/academic-research-suite)"`
+`"Mozilla/5.0 (compatible; AcademicResearchSuite/1.0; +https://github.com/thelonecoders/Sophidan)"`
 
 A second env var, `ARS_DATABASE_URL`, overrides the DB connection URL entirely (useful for Postgres deployments).
 
@@ -1058,7 +1078,7 @@ A second env var, `ARS_DATABASE_URL`, overrides the DB connection URL entirely (
 2. Add to `config/secrets.yaml`:
    ```yaml
    ai_provider: "anthropic"
-   ai_model: "claude-3-5-sonnet"
+   ai_model: "<anthropic-model-id>"   # use a current model id from the Anthropic docs
    ai_api_key: "sk-ant-..."
    ```
 
@@ -1116,7 +1136,7 @@ graph TD
     UI["ui/ — PyQt5 desktop<br/>MainWindow + Sidebar + Widgets"]
     WEB["web/ — Flask + Socket.IO"]
     CORE["core/ — Orchestrator<br/>TaskQueue · EventBus · SignalHub"]
-    DAQ["data_acquisition/ — 9 scrapers<br/>+ ScrapingEngine"]
+    DAQ["data_acquisition/ — 17 scrapers<br/>+ ScrapingEngine"]
     PROXY["proxy/ — 6-module suite"]
     DS["data_science/ — topics · clustering<br/>temporal · embeddings · bibliometrics"]
     KG["knowledge_graph/ — citation · collaboration<br/>temporal · algorithms"]
@@ -1160,7 +1180,7 @@ academic_research_suite/
 ├── LICENSE                       MIT license
 ├── README.md                     This file
 ├── CONTRIBUTING.md               Contribution guidelines
-├── requirements.txt              Pinned Python dependencies
+├── requirements.txt              Python dependencies (minimum versions)
 ├── pyproject.toml                PEP 621 metadata + tool config
 ├── main.py                       Application entry point
 ├── config/
@@ -1255,7 +1275,7 @@ academic_research_suite/
 │   ├── citespace.py               CiteSpaceAnalyzer (bursts, fronts, turning points)
 │   └── scientogram.py             ScientogramBuilder (co-word, co-journal, institute)
 ├── networkx_pro/                   (v2) Full NetworkX library exposed
-│   ├── algorithms_centralities.py Centralities (20 measures)
+│   ├── algorithms_centralities.py Centralities (17 measures)
 │   ├── algorithms_communities.py  CommunityDetection (Louvain / GN / k-clique)
 │   ├── algorithms_components.py   ComponentAnalysis (k-core, k-truss, cliques)
 │   ├── algorithms_paths_flows.py  PathsAndFlows (shortest path, max-flow, A*)
@@ -1266,8 +1286,8 @@ academic_research_suite/
 │   ├── graph_io.py                GraphIO (GraphML/GEXF/GML/Pajek/JSON/pyvis)
 │   └── multigraph.py              MultiGraphAnalysis (multi-degree, multi-pagerank)
 ├── gephi_viz/                      (v2) Gephi-style interactive viz
-│   ├── layouts.py                 11 layouts (ForceAtlas2, OpenOrd, YifanHu, ...)
-│   ├── filters.py                 15 filters + FilterChain
+│   ├── layouts.py                 10 layouts + LayoutPipeline (ForceAtlas2, OpenOrd, YifanHu, ...)
+│   ├── filters.py                 16 filters + FilterChain
 │   ├── statistics.py               NetworkStatsReport + NetworkStatistics
 │   ├── partition.py               Partition coloring
 │   ├── ranking.py                 Ranking-based sizing/coloring
@@ -1299,10 +1319,10 @@ academic_research_suite/
 │   ├── typography.py               Q1Typography (journal-specific fonts)
 │   ├── figure_factory.py          Q1FigureFactory (single-call builder)
 │   ├── multi_panel.py              MultiPanelFigure (panel labels, shared axes)
-│   ├── statistical_plots.py       StatisticalPlots (14 plots)
+│   ├── statistical_plots.py       StatisticalPlots (13 plots)
 │   ├── network_plots.py            Q1NetworkPlots (8 plots)
 │   ├── bibliometric_plots.py      BibliometricPlots (12 plots)
-│   └── data_plots.py               Q1DataPlots (11 plots)
+│   └── data_plots.py               Q1DataPlots (12 plots)
 ├── research_lifecycle/            (v2) End-to-end research workflow
 │   ├── ideation.py                 ResearchGapDetector + IdeaGenerator
 │   ├── protocol_templates.py     ProtocolTemplateLibrary (9) + ProtocolBuilder
@@ -1373,12 +1393,17 @@ academic_research_suite/
 ├── tests/
 │   ├── test_smoke.py              117-case v1 pytest suite
 │   ├── test_v2.py                 92-case v2 pytest suite
-│   ├── test_reports_view.py       7-case reports-view regression suite
-│   └── test_functional_v2.py      56-case value-checking functional suite
-│                                  (verifies computed values vs. published
-│                                   references: Hirsch 2005, Egghe 2006,
-│                                   Zhang 2009, Cochrane Handbook v6.3,
-│                                   PRISMA 2020 / BMJ 2021;372:n71, etc.)
+│   ├── test_functional_v2.py      72-case value-checking functional suite
+│   │                              (verifies computed values vs. published
+│   │                               references: Hirsch 2005, Egghe 2006,
+│   │                               Zhang 2009, Cochrane Handbook v6.3,
+│   │                               PRISMA 2020 / BMJ 2021;372:n71, etc.)
+│   ├── test_patch_regressions.py  20-case regression lock for the patch
+│   │                              round (MH RBG variance, SUCRA, REML τ²,
+│   │                              log-rank, heatmap, GraphIO round-trip,
+│   │                              DB CRUD, EventBus, Worker, CSV/RIS
+│   │                              export guards, proxy facade …)
+│   └── test_readme_examples.py    2-case lock of the documented examples
 └── docs/
     ├── architecture.md
     ├── api_reference.md
@@ -1422,7 +1447,7 @@ academic_research_suite/
 
 ## Web API Reference
 
-Fifteen REST blueprints are registered at startup (8 v1 + 7 v2 = 65+
+Fifteen REST blueprints are registered at startup (8 v1 + 7 v2 = 108
 endpoints). Full request/response schemas with examples are in
 [docs/api_reference.md](docs/api_reference.md).
 
@@ -1481,7 +1506,7 @@ endpoints). Full request/response schemas with examples are in
 | POST | `/api/bibliometrics/bursts` | Detect citation bursts (Kleinberg). |
 | GET | `/api/bibliometrics/author-profile/<id>` | Full author profile. |
 | GET | `/api/bibliometrics/journal-profile/<name>` | Full journal profile. |
-| POST | `/api/network/centrality` | Compute centralities (20 measures). |
+| POST | `/api/network/centrality` | Compute centralities (17 measures). |
 | POST | `/api/network/community` | Run community detection. |
 | POST | `/api/network/components` | Component / k-core / k-truss analysis. |
 | POST | `/api/network/paths` | Shortest paths / max-flow / disjoint paths. |
@@ -1548,8 +1573,9 @@ endpoints). Full request/response schemas with examples are in
 The repo ships a hermetic pytest suite plus a bash smoke runner:
 
 ```bash
-# Run the full 272-case pytest suite
-# (117 v1 + 92 v2 + 7 reports-view + 56 functional-value tests)
+# Run the full 303-case pytest suite
+# (117 v1 + 92 v2 + 72 functional-value + 20 patch-regression +
+#  2 README-example tests)
 pytest tests/
 
 # Run only the v1 smoke tests
@@ -1613,7 +1639,7 @@ request. In short:
 - ✓ 92 new tests in `tests/test_v2.py` (209 total).
 - ✓ 10 journal-grade color palettes.
 - ✓ 4 RoB tools, 6 PRISMA extensions, 60+ NetworkX algorithms,
-  11 Gephi-style layouts.
+  10 Gephi-style layouts plus LayoutPipeline.
 - ✓ Sidebar expanded from 10 to 18 nav items.
 
 ### v2.1.0 (planned — Q4 2026)
@@ -1691,7 +1717,7 @@ Thanks to: https://github.com/I-am-Programming-the-World & ""
 - **2-validate** — integration tests + bug fixes.
 - **v2-networkx-pro** — `networkx_pro/` package (60+ algorithms).
 - **v2-bibliometrics** — `bibliometrics/` package (PoP + VOS + CiteSpace + scientogram).
-- **v2-gephi-viz** — `gephi_viz/` package (11 layouts + 15 filters + partition + ranking + preview).
+- **v2-gephi-viz** — `gephi_viz/` package (10 layouts + 16 filters + partition + ranking + preview).
 - **v2-systematic-review** — `systematic_review/` package (PRISMA lifecycle + 4 RoB tools).
 - **v2-meta-analysis** — `meta_analysis/` package (DL/MH/Peto/REML + NMA + plots).
 - **v2-prisma** — `prisma/` package (flow-diagram generator + 6 extensions).
@@ -1719,7 +1745,7 @@ If Academic Research Suite helps your research, please cite it as:
   author = {{Academic Research Suite Contributors}},
   year   = {2026},
   version = {v2.0.0},
-  url    = {https://github.com/academic-research-suite/academic_research_suite},
+  url    = {https://github.com/thelonecoders/Sophidan},
   note   = {MIT License}
 }
 ```

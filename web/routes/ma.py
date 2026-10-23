@@ -13,11 +13,11 @@ from __future__ import annotations
 
 import base64
 import logging
-import tempfile
-import os
 from typing import Any
 
 from flask import Blueprint, jsonify, request
+
+from web.routes._common import error_response, safe_remove, temp_file_path
 
 logger = logging.getLogger(__name__)
 
@@ -69,8 +69,8 @@ def effect_size():
             return _bad_request(f"unknown effect-size type: {es_type}")
         return jsonify({"effect_size": es.to_dict() if hasattr(es, "to_dict") else str(es)})
     except Exception as exc:
-        logger.exception("/api/ma/effect-size failed: %s", exc)
-        return jsonify({"error": "analysis_failed", "message": str(exc)}), 502
+        return error_response(logger, "/api/ma/effect-size failed", exc,
+                              status=502, error="analysis_failed")
 
 
 @ma_bp.route("/pool", methods=["POST"])
@@ -128,8 +128,8 @@ def pool():
         result = PoolingEngine.pool(es_list, method=method)
         return jsonify({"result": result.to_dict() if hasattr(result, "to_dict") else str(result)})
     except Exception as exc:
-        logger.exception("/api/ma/pool failed: %s", exc)
-        return jsonify({"error": "analysis_failed", "message": str(exc)}), 502
+        return error_response(logger, "/api/ma/pool failed", exc,
+                              status=502, error="analysis_failed")
 
 
 def _render_plot(kind: str, payload: dict):
@@ -181,14 +181,14 @@ def _render_plot(kind: str, payload: dict):
         fp = ForestPlot(es_list, pooled=pooled, title=payload.get("title", ""))
     else:
         fp = FunnelPlot(es_list, pooled=pooled)
-    path = tempfile.mktemp(suffix=f".{fmt}")
-    fp.save(path, format=fmt)
-    with open(path, "rb") as fh:
-        content = base64.b64encode(fh.read()).decode("ascii")
+    # Secure temp file (replaces the TOCTOU-prone tempfile.mktemp).
+    path = temp_file_path(f".{fmt}")
     try:
-        os.remove(path)
-    except OSError:
-        pass
+        fp.save(path, format=fmt)
+        with open(path, "rb") as fh:
+            content = base64.b64encode(fh.read()).decode("ascii")
+    finally:
+        safe_remove(path)
     return content, fmt
 
 
@@ -203,8 +203,8 @@ def forest_plot():
         content, fmt = _render_plot("forest", payload)
         return jsonify({"format": fmt, "content_b64": content})
     except Exception as exc:
-        logger.exception("/api/ma/forest-plot failed: %s", exc)
-        return jsonify({"error": "analysis_failed", "message": str(exc)}), 502
+        return error_response(logger, "/api/ma/forest-plot failed", exc,
+                              status=502, error="analysis_failed")
 
 
 @ma_bp.route("/funnel-plot", methods=["POST"])
@@ -215,20 +215,26 @@ def funnel_plot():
         content, fmt = _render_plot("funnel", payload)
         return jsonify({"format": fmt, "content_b64": content})
     except Exception as exc:
-        logger.exception("/api/ma/funnel-plot failed: %s", exc)
-        return jsonify({"error": "analysis_failed", "message": str(exc)}), 502
+        return error_response(logger, "/api/ma/funnel-plot failed", exc,
+                              status=502, error="analysis_failed")
 
 
 @ma_bp.route("/subgroup", methods=["POST"])
 def subgroup():
     """Run a subgroup analysis.
 
-    Body: ``{"effect_sizes": [...], "subgroups": [str, ...]}`` — the
-    ``subgroups`` list must align index-by-index with ``effect_sizes``.
+    Body: ``{"effect_sizes": [...], "subgroups": {...}|[...]}``.
+
+    ``subgroups`` may be either a ``{study_id: subgroup}`` mapping
+    (canonical for :meth:`SubgroupAnalysis.analyze`) or a plain list
+    aligned index-by-index with ``effect_sizes`` — the list form is
+    converted to the mapping before the analysis runs.
     """
     payload = request.get_json(silent=True) or {}
     es_list_payload = payload.get("effect_sizes") or []
-    subgroups = payload.get("subgroups") or []
+    subgroups_payload = payload.get("subgroups")
+    if not isinstance(es_list_payload, list) or not es_list_payload:
+        return _bad_request("effect_sizes (non-empty list) is required")
     try:
         from meta_analysis.effect_sizes import EffectSize, EffectSizeType
         from meta_analysis.subgroup import SubgroupAnalysis
@@ -250,12 +256,30 @@ def subgroup():
                 value=float(es_dict.get("value", 0.0)),
                 se=float(es_dict.get("se", 0.0)) or None,
                 variance=float(es_dict.get("variance", 0.0)) or None,
+                study_id=es_dict.get("study_id", ""),
+                study_name=es_dict.get("study_name", ""),
             ))
-        result = SubgroupAnalysis().analyze(es_list, subgroups)
+        # Build the {study_id: subgroup} mapping the analyzer expects.
+        if isinstance(subgroups_payload, dict):
+            subgroups = {str(k): str(v)
+                         for k, v in subgroups_payload.items()}
+        elif isinstance(subgroups_payload, (list, tuple)):
+            if len(subgroups_payload) != len(es_list):
+                return _bad_request(
+                    "subgroups list must align index-by-index with "
+                    "effect_sizes")
+            subgroups = {}
+            for es, group in zip(es_list, subgroups_payload):
+                subgroups[str(getattr(es, "study_id", "") or "")] = str(group)
+        else:
+            return _bad_request(
+                "subgroups must be a {study_id: subgroup} object or a "
+                "list aligned with effect_sizes")
+        result = SubgroupAnalysis.analyze(es_list, subgroups)
         return jsonify({"result": result.to_dict() if hasattr(result, "to_dict") else str(result)})
     except Exception as exc:
-        logger.exception("/api/ma/subgroup failed: %s", exc)
-        return jsonify({"error": "analysis_failed", "message": str(exc)}), 502
+        return error_response(logger, "/api/ma/subgroup failed", exc,
+                              status=502, error="analysis_failed")
 
 
 @ma_bp.route("/sensitivity", methods=["POST"])
@@ -297,8 +321,8 @@ def sensitivity():
             "results": [r.to_dict() if hasattr(r, "to_dict") else str(r) for r in (results or [])],
         })
     except Exception as exc:
-        logger.exception("/api/ma/sensitivity failed: %s", exc)
-        return jsonify({"error": "analysis_failed", "message": str(exc)}), 502
+        return error_response(logger, "/api/ma/sensitivity failed", exc,
+                              status=502, error="analysis_failed")
 
 
 @ma_bp.route("/nma", methods=["POST"])
@@ -333,8 +357,8 @@ def nma():
             "result": result.to_dict() if hasattr(result, "to_dict") else str(result),
         })
     except Exception as exc:
-        logger.exception("/api/ma/nma failed: %s", exc)
-        return jsonify({"error": "analysis_failed", "message": str(exc)}), 502
+        return error_response(logger, "/api/ma/nma failed", exc,
+                              status=502, error="analysis_failed")
 
 
 @ma_bp.route("/report", methods=["POST"])
@@ -356,15 +380,14 @@ def report():
             effect_sizes=payload.get("effect_sizes") or [],
             study_data=payload.get("study_data") or {},
         )
-        path = tempfile.mktemp(suffix=f".{fmt}")
-        report_obj.generate(path, format=fmt)
-        with open(path, "rb") as fh:
-            content = base64.b64encode(fh.read()).decode("ascii")
+        path = temp_file_path(f".{fmt}")
         try:
-            os.remove(path)
-        except OSError:
-            pass
+            report_obj.generate(path, format=fmt)
+            with open(path, "rb") as fh:
+                content = base64.b64encode(fh.read()).decode("ascii")
+        finally:
+            safe_remove(path)
         return jsonify({"format": fmt, "content_b64": content})
     except Exception as exc:
-        logger.exception("/api/ma/report failed: %s", exc)
-        return jsonify({"error": "analysis_failed", "message": str(exc)}), 502
+        return error_response(logger, "/api/ma/report failed", exc,
+                              status=502, error="analysis_failed")

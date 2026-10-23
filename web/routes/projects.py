@@ -2,6 +2,10 @@
 
 Provides CRUD for projects plus sub-resources for papers, snapshots,
 and side-by-side comparison of two projects.
+
+Every handler calls the real :class:`ProjectManager` API directly
+(no ``hasattr`` guards faking success — a missing manager yields a
+503 and a failed call yields a generic 500, never ``str(exc)``).
 """
 #
 # MIT License — Academic Research Suite
@@ -15,6 +19,8 @@ from typing import Any
 
 from flask import Blueprint, jsonify, request
 
+from web.routes._common import as_int, error_response, json_safe
+
 logger = logging.getLogger(__name__)
 
 projects_bp = Blueprint("projects", __name__, url_prefix="/api/projects")
@@ -25,14 +31,6 @@ def _state() -> "Any":
     from web.server import ServerState
 
     return ServerState()
-
-
-def _service_unavailable(name: str):
-    """Helper: build a 503 JSON response for a missing backend service."""
-    return jsonify({
-        "error": "service_unavailable",
-        "message": f"{name} is not initialised; backend module not yet wired up.",
-    }), 503
 
 
 def _serialize(obj: Any) -> dict[str, Any]:
@@ -46,7 +44,7 @@ def _serialize(obj: Any) -> dict[str, Any]:
     else:
         data = {"value": str(obj)}
     data.pop("_sa_instance_state", None)
-    return data
+    return json_safe(data)
 
 
 @projects_bp.route("/", methods=["GET"])
@@ -55,17 +53,16 @@ def list_projects():
     state = _state()
     pm = state.project_manager
     if pm is None:
-        return _service_unavailable("ProjectManager")
+        return error_response(logger, "ProjectManager unavailable",
+                              RuntimeError("ProjectManager not initialised"),
+                              status=503, error="service_unavailable")
 
     q = request.args.get("q")
     try:
-        if hasattr(pm, "list_projects"):
-            projects = pm.list_projects(query=q) or []
-        else:
-            projects = []
+        # Contract: list_projects(query=None) -> list[Project]
+        projects = pm.list_projects(query=q) or []
     except Exception as exc:  # pragma: no cover - defensive
-        logger.exception("list_projects failed: %s", exc)
-        return jsonify({"error": "internal_error", "message": str(exc)}), 500
+        return error_response(logger, "list_projects", exc)
 
     return jsonify({"projects": [_serialize(p) for p in projects],
                     "count": len(projects)})
@@ -81,7 +78,9 @@ def create_project():
     state = _state()
     pm = state.project_manager
     if pm is None:
-        return _service_unavailable("ProjectManager")
+        return error_response(logger, "ProjectManager unavailable",
+                              RuntimeError("ProjectManager not initialised"),
+                              status=503, error="service_unavailable")
 
     payload = request.get_json(silent=True) or {}
     if not payload.get("name"):
@@ -89,18 +88,15 @@ def create_project():
                         "message": "name is required"}), 400
 
     try:
-        if hasattr(pm, "create_project"):
-            project = pm.create_project(
-                name=payload["name"],
-                description=payload.get("description", ""),
-                color=payload.get("color", "#3B82F6"),
-                settings=payload.get("settings"),
-            )
-        else:
-            project = {"id": 0, **payload}
+        # Contract: create_project(name, description="", color=..., settings=None)
+        project = pm.create_project(
+            name=payload["name"],
+            description=payload.get("description", ""),
+            color=payload.get("color", "#3B82F6"),
+            settings=payload.get("settings"),
+        )
     except Exception as exc:  # pragma: no cover - defensive
-        logger.exception("create_project failed: %s", exc)
-        return jsonify({"error": "internal_error", "message": str(exc)}), 500
+        return error_response(logger, "create_project", exc)
 
     return jsonify(_serialize(project)), 201
 
@@ -111,16 +107,15 @@ def get_project(project_id: int):
     state = _state()
     pm = state.project_manager
     if pm is None:
-        return _service_unavailable("ProjectManager")
+        return error_response(logger, "ProjectManager unavailable",
+                              RuntimeError("ProjectManager not initialised"),
+                              status=503, error="service_unavailable")
 
     try:
-        if hasattr(pm, "get_project"):
-            project = pm.get_project(project_id)
-        else:
-            project = None
+        # Contract: get_project(project_id) -> Project
+        project = pm.get_project(project_id)
     except Exception as exc:  # pragma: no cover - defensive
-        logger.exception("get_project failed: %s", exc)
-        return jsonify({"error": "internal_error", "message": str(exc)}), 500
+        return error_response(logger, "get_project", exc)
 
     if project is None:
         return jsonify({"error": "not_found",
@@ -134,17 +129,16 @@ def update_project(project_id: int):
     state = _state()
     pm = state.project_manager
     if pm is None:
-        return _service_unavailable("ProjectManager")
+        return error_response(logger, "ProjectManager unavailable",
+                              RuntimeError("ProjectManager not initialised"),
+                              status=503, error="service_unavailable")
 
     payload = request.get_json(silent=True) or {}
     try:
-        if hasattr(pm, "update_project"):
-            project = pm.update_project(project_id, payload)
-        else:
-            project = {"id": project_id, **payload}
+        # Contract: update_project(project_id, payload) -> Project | None
+        project = pm.update_project(project_id, payload)
     except Exception as exc:  # pragma: no cover - defensive
-        logger.exception("update_project failed: %s", exc)
-        return jsonify({"error": "internal_error", "message": str(exc)}), 500
+        return error_response(logger, "update_project", exc)
 
     if project is None:
         return jsonify({"error": "not_found",
@@ -158,16 +152,15 @@ def delete_project(project_id: int):
     state = _state()
     pm = state.project_manager
     if pm is None:
-        return _service_unavailable("ProjectManager")
+        return error_response(logger, "ProjectManager unavailable",
+                              RuntimeError("ProjectManager not initialised"),
+                              status=503, error="service_unavailable")
 
     try:
-        if hasattr(pm, "delete_project"):
-            deleted = pm.delete_project(project_id)
-        else:
-            deleted = False
+        # Contract: delete_project(project_id) -> bool
+        deleted = pm.delete_project(project_id)
     except Exception as exc:  # pragma: no cover - defensive
-        logger.exception("delete_project failed: %s", exc)
-        return jsonify({"error": "internal_error", "message": str(exc)}), 500
+        return error_response(logger, "delete_project", exc)
 
     if not deleted:
         return jsonify({"error": "not_found",
@@ -184,22 +177,25 @@ def add_papers(project_id: int):
     state = _state()
     pm = state.project_manager
     if pm is None:
-        return _service_unavailable("ProjectManager")
+        return error_response(logger, "ProjectManager unavailable",
+                              RuntimeError("ProjectManager not initialised"),
+                              status=503, error="service_unavailable")
 
     payload = request.get_json(silent=True) or {}
     paper_ids = payload.get("paper_ids", [])
     if not isinstance(paper_ids, list) or not paper_ids:
         return jsonify({"error": "bad_request",
                         "message": "paper_ids (non-empty list) is required"}), 400
+    try:
+        paper_ids = [as_int(pid, name="paper_ids entry") for pid in paper_ids]
+    except ValueError as exc:
+        return jsonify({"error": "bad_request", "message": str(exc)}), 400
 
     try:
-        if hasattr(pm, "add_papers_to_project"):
-            added = pm.add_papers_to_project(project_id, paper_ids)
-        else:
-            added = 0
+        # Contract: add_papers_to_project(project_id, paper_ids) -> int
+        added = pm.add_papers_to_project(project_id, paper_ids)
     except Exception as exc:  # pragma: no cover - defensive
-        logger.exception("add_papers failed: %s", exc)
-        return jsonify({"error": "internal_error", "message": str(exc)}), 500
+        return error_response(logger, "add_papers", exc)
 
     return jsonify({"project_id": project_id, "added": added,
                     "paper_ids": paper_ids})
@@ -211,16 +207,15 @@ def remove_paper(project_id: int, paper_id: int):
     state = _state()
     pm = state.project_manager
     if pm is None:
-        return _service_unavailable("ProjectManager")
+        return error_response(logger, "ProjectManager unavailable",
+                              RuntimeError("ProjectManager not initialised"),
+                              status=503, error="service_unavailable")
 
     try:
-        if hasattr(pm, "remove_paper_from_project"):
-            removed = pm.remove_paper_from_project(project_id, paper_id)
-        else:
-            removed = False
+        # Contract: remove_paper_from_project(project_id, paper_id) -> bool
+        removed = pm.remove_paper_from_project(project_id, paper_id)
     except Exception as exc:  # pragma: no cover - defensive
-        logger.exception("remove_paper failed: %s", exc)
-        return jsonify({"error": "internal_error", "message": str(exc)}), 500
+        return error_response(logger, "remove_paper", exc)
 
     if not removed:
         return jsonify({"error": "not_found",
@@ -235,16 +230,15 @@ def list_snapshots(project_id: int):
     state = _state()
     pm = state.project_manager
     if pm is None:
-        return _service_unavailable("ProjectManager")
+        return error_response(logger, "ProjectManager unavailable",
+                              RuntimeError("ProjectManager not initialised"),
+                              status=503, error="service_unavailable")
 
     try:
-        if hasattr(pm, "list_snapshots"):
-            snaps = pm.list_snapshots(project_id) or []
-        else:
-            snaps = []
+        # Contract: list_snapshots(project_id) -> list
+        snaps = pm.list_snapshots(project_id) or []
     except Exception as exc:  # pragma: no cover - defensive
-        logger.exception("list_snapshots failed: %s", exc)
-        return jsonify({"error": "internal_error", "message": str(exc)}), 500
+        return error_response(logger, "list_snapshots", exc)
 
     return jsonify({"project_id": project_id,
                     "snapshots": [_serialize(s) for s in snaps],
@@ -260,17 +254,16 @@ def create_snapshot(project_id: int):
     state = _state()
     pm = state.project_manager
     if pm is None:
-        return _service_unavailable("ProjectManager")
+        return error_response(logger, "ProjectManager unavailable",
+                              RuntimeError("ProjectManager not initialised"),
+                              status=503, error="service_unavailable")
 
     payload = request.get_json(silent=True) or {}
     try:
-        if hasattr(pm, "create_snapshot"):
-            snapshot = pm.create_snapshot(project_id, payload)
-        else:
-            snapshot = {"project_id": project_id, **payload}
+        # Contract: create_snapshot(project_id, payload)
+        snapshot = pm.create_snapshot(project_id, payload)
     except Exception as exc:  # pragma: no cover - defensive
-        logger.exception("create_snapshot failed: %s", exc)
-        return jsonify({"error": "internal_error", "message": str(exc)}), 500
+        return error_response(logger, "create_snapshot", exc)
 
     return jsonify(_serialize(snapshot)), 201
 
@@ -285,7 +278,9 @@ def compare_projects():
     state = _state()
     pm = state.project_manager
     if pm is None:
-        return _service_unavailable("ProjectManager")
+        return error_response(logger, "ProjectManager unavailable",
+                              RuntimeError("ProjectManager not initialised"),
+                              status=503, error="service_unavailable")
 
     payload = request.get_json(silent=True) or {}
     a_id = payload.get("a")
@@ -295,16 +290,9 @@ def compare_projects():
                         "message": "a and b (integers) are required"}), 400
 
     try:
-        if hasattr(pm, "compare_projects"):
-            result = pm.compare_projects(a_id, b_id)
-        else:
-            result = {
-                "a": a_id, "b": b_id,
-                "shared_papers": [], "unique_to_a": [], "unique_to_b": [],
-                "metrics": {},
-            }
+        # Contract: compare_projects(a_id, b_id) -> ComparisonResult
+        result = pm.compare_projects(a_id, b_id)
     except Exception as exc:  # pragma: no cover - defensive
-        logger.exception("compare_projects failed: %s", exc)
-        return jsonify({"error": "internal_error", "message": str(exc)}), 500
+        return error_response(logger, "compare_projects", exc)
 
     return jsonify(_serialize(result))

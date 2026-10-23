@@ -16,6 +16,8 @@ from typing import Any
 
 from flask import Blueprint, jsonify, request
 
+from web.routes._common import as_int, error_response, json_safe
+
 logger = logging.getLogger(__name__)
 
 innovation_bp = Blueprint("innovation", __name__, url_prefix="/api/innovation")
@@ -103,18 +105,42 @@ def _coerce_papers(payload: Any) -> list:
     return out
 
 
+def _serialise_one(it: Any) -> Any:
+    """Serialise a single dataclass-like object to a JSON value."""
+    if hasattr(it, "to_dict"):
+        return json_safe(it.to_dict())
+    if isinstance(it, dict):
+        return json_safe(dict(it))
+    if hasattr(it, "__dict__"):
+        return json_safe({k: v for k, v in vars(it).items()
+                          if not k.startswith("_")})
+    return str(it)
+
+
 def _serialise(items: list) -> list:
-    """Serialise a list of dataclass-like objects to dicts."""
+    """Serialise a list of results to JSON-friendly dicts.
+
+    ``(paper, score)`` tuples (the shape returned by novelty ranking and
+    paper recommendation) are serialised as
+    ``{"paper": paper.to_dict(), "score": float}``; a two-tuple whose
+    first element is not paper-like degrades to ``{"name": ..., "score"}`
+    (e.g. collaboration recommendations return ``(author, score)``).
+    """
     out = []
     for it in (items or []):
-        if hasattr(it, "to_dict"):
-            out.append(it.to_dict())
-        elif isinstance(it, dict):
-            out.append(dict(it))
-        elif hasattr(it, "__dict__"):
-            out.append({k: v for k, v in vars(it).items() if not k.startswith("_")})
+        if isinstance(it, tuple) and len(it) == 2 and \
+                isinstance(it[1], (int, float)) and \
+                not isinstance(it, str):
+            first, second = it
+            entry: dict[str, Any] = {"score": float(second)}
+            if hasattr(first, "to_dict") or isinstance(first, dict) or \
+                    hasattr(first, "__dict__"):
+                entry["paper"] = _serialise_one(first)
+            else:
+                entry["name"] = str(first)
+            out.append(entry)
         else:
-            out.append(str(it))
+            out.append(_serialise_one(it))
     return out
 
 
@@ -126,15 +152,19 @@ def bursts():
     """
     payload = request.get_json(silent=True) or {}
     papers = _coerce_papers(payload)
-    time_window = int(payload.get("time_window", 1) or 1)
+    try:
+        time_window = as_int(payload.get("time_window"), 1,
+                             name="time_window", minimum=1)
+    except ValueError as exc:
+        return _bad_request(str(exc))
     try:
         from innovation.citation_bursts import CitationBurstDetector
         det = CitationBurstDetector()
         result = det.detect_papers(papers, time_window=time_window)
         return jsonify({"bursts": _serialise(result)})
     except Exception as exc:
-        logger.exception("/api/innovation/bursts failed: %s", exc)
-        return jsonify({"error": "analysis_failed", "message": str(exc)}), 502
+        return error_response(logger, "/api/innovation/bursts failed", exc,
+                              status=502, error="analysis_failed")
 
 
 @innovation_bp.route("/frontiers", methods=["POST"])
@@ -152,8 +182,8 @@ def frontiers():
         result = kf.compute_frontier(method=method)
         return jsonify({"frontiers": _serialise(result)})
     except Exception as exc:
-        logger.exception("/api/innovation/frontiers failed: %s", exc)
-        return jsonify({"error": "analysis_failed", "message": str(exc)}), 502
+        return error_response(logger, "/api/innovation/frontiers failed", exc,
+                              status=502, error="analysis_failed")
 
 
 @innovation_bp.route("/forecast", methods=["POST"])
@@ -165,7 +195,11 @@ def forecast():
     payload = request.get_json(silent=True) or {}
     papers = _coerce_papers(payload)
     topic = payload.get("topic")
-    years_ahead = int(payload.get("years_ahead", 3) or 3)
+    try:
+        years_ahead = as_int(payload.get("years_ahead"), 3,
+                             name="years_ahead", minimum=1, maximum=20)
+    except ValueError as exc:
+        return _bad_request(str(exc))
     if not topic:
         return _bad_request("topic is required")
     try:
@@ -174,8 +208,8 @@ def forecast():
         result = tf.forecast_topic(topic, years_ahead=years_ahead)
         return jsonify({"forecast": result.to_dict() if hasattr(result, "to_dict") else _serialise([result])[0]})
     except Exception as exc:
-        logger.exception("/api/innovation/forecast failed: %s", exc)
-        return jsonify({"error": "analysis_failed", "message": str(exc)}), 502
+        return error_response(logger, "/api/innovation/forecast failed", exc,
+                              status=502, error="analysis_failed")
 
 
 @innovation_bp.route("/recommend-papers", methods=["POST"])
@@ -187,7 +221,11 @@ def recommend_papers():
     payload = request.get_json(silent=True) or {}
     papers = _coerce_papers(payload)
     query = payload.get("query", "")
-    top_k = int(payload.get("top_k", 10) or 10)
+    try:
+        top_k = as_int(payload.get("top_k"), 10, name="top_k",
+                       minimum=1, maximum=500)
+    except ValueError as exc:
+        return _bad_request(str(exc))
     try:
         from innovation.paper_recommendation import PaperRecommender
         rec = PaperRecommender(papers)
@@ -198,8 +236,8 @@ def recommend_papers():
             result = rec.recommend_trending(top_k=top_k)
         return jsonify({"recommendations": _serialise(result)})
     except Exception as exc:
-        logger.exception("/api/innovation/recommend-papers failed: %s", exc)
-        return jsonify({"error": "analysis_failed", "message": str(exc)}), 502
+        return error_response(logger, "/api/innovation/recommend-papers failed", exc,
+                              status=502, error="analysis_failed")
 
 
 @innovation_bp.route("/recommend-collaborators", methods=["POST"])
@@ -211,7 +249,11 @@ def recommend_collaborators():
     payload = request.get_json(silent=True) or {}
     papers = _coerce_papers(payload)
     author = payload.get("author")
-    top_k = int(payload.get("top_k", 10) or 10)
+    try:
+        top_k = as_int(payload.get("top_k"), 10, name="top_k",
+                       minimum=1, maximum=500)
+    except ValueError as exc:
+        return _bad_request(str(exc))
     if not author:
         return _bad_request("author is required")
     try:
@@ -220,8 +262,8 @@ def recommend_collaborators():
         result = rec.recommend_collaborators(author, top_k=top_k)
         return jsonify({"recommendations": _serialise(result)})
     except Exception as exc:
-        logger.exception("/api/innovation/recommend-collaborators failed: %s", exc)
-        return jsonify({"error": "analysis_failed", "message": str(exc)}), 502
+        return error_response(logger, "/api/innovation/recommend-collaborators failed", exc,
+                              status=502, error="analysis_failed")
 
 
 @innovation_bp.route("/novelty", methods=["POST"])
@@ -238,8 +280,8 @@ def novelty():
         result = scorer.rank_novel_papers(top_n=len(papers))
         return jsonify({"novelty_scores": _serialise(result)})
     except Exception as exc:
-        logger.exception("/api/innovation/novelty failed: %s", exc)
-        return jsonify({"error": "analysis_failed", "message": str(exc)}), 502
+        return error_response(logger, "/api/innovation/novelty failed", exc,
+                              status=502, error="analysis_failed")
 
 
 @innovation_bp.route("/directions", methods=["POST"])
@@ -251,12 +293,16 @@ def directions():
     payload = request.get_json(silent=True) or {}
     papers = _coerce_papers(payload)
     topic = payload.get("topic", "")
-    count = int(payload.get("count", 5) or 5)
+    try:
+        count = as_int(payload.get("count"), 5, name="count",
+                       minimum=1, maximum=100)
+    except ValueError as exc:
+        return _bad_request(str(exc))
     try:
         from innovation.research_directions import ResearchDirectionRecommender
         rec = ResearchDirectionRecommender(papers)
         result = rec.recommend_directions(topic=topic, count=count)
         return jsonify({"directions": _serialise(result)})
     except Exception as exc:
-        logger.exception("/api/innovation/directions failed: %s", exc)
-        return jsonify({"error": "analysis_failed", "message": str(exc)}), 502
+        return error_response(logger, "/api/innovation/directions failed", exc,
+                              status=502, error="analysis_failed")
