@@ -35,18 +35,10 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 import numpy as np
 
 logger = logging.getLogger(__name__)
-
-# Many forecasting backends emit noisy warnings on tiny inputs; we
-# silence them here because the module falls back to simpler models
-# automatically.
-warnings.filterwarnings("ignore", category=RuntimeWarning)
-warnings.filterwarnings("ignore", category=UserWarning)
-warnings.filterwarnings("ignore", category=FutureWarning)
-warnings.filterwarnings("ignore", message=".*Prophet.*")
-warnings.filterwarnings("ignore", message=".*overflow.*")
-warnings.filterwarnings("ignore", message=".*Maximum Likelihood optimization failed.*")
-warnings.filterwarnings("ignore", message=".*ConvergenceWarning.*")
-warnings.filterwarnings("ignore", message=".*No frequency.*")
+#
+# NOTE: no module-level ``warnings.filterwarnings`` here — global filters
+# leak into user code. Forecast backends suppress their noisy warnings
+# locally via ``warnings.catch_warnings()``.
 
 
 # ---------------------------------------------------------------------------
@@ -68,6 +60,12 @@ class Forecast:
             ``"exponential"``.
         mae: Mean absolute error of in-sample fit (lower is better).
         r2: R² of in-sample fit (1.0 = perfect, ≤ 0 = poor).
+        label: Provenance label. Empty for forecasts fitted on real
+            per-year data; ``"synthetic-linear-reference"`` for a clearly
+            labelled linear reference trajectory shown when only a
+            cumulative citation total exists; ``"no-data"`` when no
+            trajectory could be produced at all.
+        notes: Human-readable caveats (e.g. why a series is synthetic).
     """
 
     topic: str = ""
@@ -77,6 +75,8 @@ class Forecast:
     method: str = ""
     mae: float = 0.0
     r2: float = 0.0
+    label: str = ""
+    notes: List[str] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         """Return a JSON-serializable representation."""
@@ -85,6 +85,8 @@ class Forecast:
             "method": self.method,
             "mae": float(self.mae),
             "r2": float(self.r2),
+            "label": self.label,
+            "notes": list(self.notes),
         }
         if self.historical_data is not None:
             d["historical"] = {
@@ -151,6 +153,20 @@ def _series_to_pd(s: Dict[int, float]) -> Any:
     return pd.Series([float(s[y]) for y in years], index=years)
 
 
+def _year_period_index(start_year: int, periods: int) -> Any:
+    """Annual period index compatible with old and new pandas.
+
+    pandas ≥ 2.2 renamed the annual frequency alias ``"Y"`` → ``"YE"``
+    (``"Y"`` is deprecated and removed in pandas 3.x); older pandas only
+    knows ``"Y"``.
+    """
+    import pandas as pd  # lazy
+    try:
+        return pd.period_range(start=str(int(start_year)), periods=int(periods), freq="YE")
+    except Exception:  # noqa: BLE001 - older pandas
+        return pd.period_range(start=str(int(start_year)), periods=int(periods), freq="Y")
+
+
 def _ci_to_pd(
     years: Sequence[int],
     lower: Sequence[float],
@@ -208,8 +224,37 @@ class TrendForecaster:
     # Series construction
     # ------------------------------------------------------------------
 
+    def _corpus_year_range(self) -> Tuple[Optional[int], Optional[int]]:
+        """Return ``(min_year, max_year)`` across the corpus, or ``(None, None)``."""
+        years = [y for y in (_safe_year(p) for p in self.papers) if y is not None]
+        if not years:
+            return None, None
+        return min(years), max(years)
+
+    def _fill_year_gaps(self, series: Dict[int, float]) -> Dict[int, float]:
+        """Zero-fill ``series`` over the corpus's full year range.
+
+        Missing years are genuine zeros for count data, not missing
+        observations — feeding a gappy series to ARIMA / exponential
+        smoothing silently misaligns the time index (pandas treats the
+        PeriodIndex as contiguous), so we zero-fill before modelling.
+        """
+        if not series:
+            return {}
+        min_y, max_y = self._corpus_year_range()
+        if min_y is None or max_y is None:
+            years = sorted(series.keys())
+            min_y, max_y = years[0], years[-1]
+        return {y: float(series.get(y, 0.0)) for y in range(min_y, max_y + 1)}
+
     def _topic_yearly_counts(self, topic: str) -> Dict[int, int]:
-        """Return ``{year: count}`` for papers matching ``topic`` (cached)."""
+        """Return ``{year: count}`` for papers matching ``topic`` (cached).
+
+        Zero-filled over the corpus's full year range. Matching is
+        substring-based and consistent across title/abstract text and
+        keyword/field lists (a keyword counts when the topic appears
+        *within* it, mirroring the text matching).
+        """
         if topic in self._topic_series_cache:
             return self._topic_series_cache[topic]
         counts: Dict[int, int] = {}
@@ -225,14 +270,20 @@ class TrendForecaster:
             ).lower()
             kws = [str(k).lower() for k in (getattr(p, "keywords", []) or [])]
             fos = [str(f).lower() for f in (getattr(p, "fields_of_study", []) or [])]
-            if (topic_lower in text or topic_lower in kws
-                    or topic_lower in fos):
+            if (topic_lower in text
+                    or any(topic_lower in kw for kw in kws)
+                    or any(topic_lower in f for f in fos)):
                 counts[y] = counts.get(y, 0) + 1
-        self._topic_series_cache[topic] = counts
-        return counts
+        result = self._fill_year_gaps(counts)
+        result = {int(k): int(v) for k, v in result.items()}
+        self._topic_series_cache[topic] = result
+        return result
 
     def _author_yearly_counts(self, author_id: str) -> Dict[int, int]:
-        """Return ``{year: count}`` of papers per year for an author."""
+        """Return ``{year: count}`` of papers per year for an author.
+
+        Zero-filled over the corpus's full year range.
+        """
         counts: Dict[int, int] = {}
         for p in self.papers:
             y = _safe_year(p)
@@ -242,41 +293,47 @@ class TrendForecaster:
                 if author_id.lower() in str(a).lower():
                     counts[y] = counts.get(y, 0) + 1
                     break
-        return counts
+        result = self._fill_year_gaps(counts)
+        return {int(k): int(v) for k, v in result.items()}
 
-    def _paper_citation_yearly(self, paper_id: str) -> Dict[int, int]:
-        """Approximate per-year citation trajectory for a single paper.
-
-        Because most scrapers only return the *current* cumulative
-        citation count, we synthesize a monotonic ramp (linear growth)
-        from the publication year to the latest year in the corpus,
-        ending at the paper's reported citation count.
-        """
-        target = None
+    def _find_paper(self, paper_id: str) -> Optional[Any]:
+        """Locate a paper in the corpus by DOI or title."""
+        target_id = str(paper_id)
         for p in self.papers:
             pid = getattr(p, "doi", None) or getattr(p, "title", None) or ""
-            if str(pid) == str(paper_id):
-                target = p
-                break
+            if str(pid) == target_id:
+                return p
+        return None
+
+    def _paper_citation_yearly(self, paper_id: str) -> Dict[int, int]:
+        """Return the paper's *real* per-year citation counts.
+
+        Uses the per-year citation history when the paper provides one
+        (``citations_by_year`` / ``citation_count_by_year`` attributes or
+        the same keys in the ``raw`` payload, e.g. Semantic Scholar's
+        ``citationCountByYear``). When only a cumulative total exists this
+        returns ``{}`` — a synthetic ramp is never fabricated here (see
+        :meth:`forecast_citation_growth` for the clearly-labelled linear
+        reference trajectory).
+        """
+        target = self._find_paper(paper_id)
         if target is None:
             return {}
-        pub_year = _safe_year(target)
-        if pub_year is None:
-            return {}
-        max_year = pub_year
-        for p in self.papers:
-            y = _safe_year(p)
-            if y is not None and y > max_year:
-                max_year = y
-        total = int(getattr(target, "citations_count", 0) or 0)
-        span = max(1, max_year - pub_year + 1)
-        counts: Dict[int, int] = {}
-        for i, y in enumerate(range(pub_year, max_year + 1)):
-            counts[y] = int(round(total * (i + 1) / span))
-        return counts
+        try:
+            from innovation.citation_bursts import _paper_yearly_citations
+
+            hist = _paper_yearly_citations(target)
+        except Exception:  # noqa: BLE001 - citation_bursts is optional
+            hist = {}
+        if hist:
+            return {int(y): int(round(c)) for y, c in sorted(hist.items())}
+        return {}
 
     def _field_yearly_counts(self, field: str) -> Dict[int, int]:
-        """Return ``{year: count}`` for papers in a field of study."""
+        """Return ``{year: count}`` for papers in a field of study.
+
+        Zero-filled over the corpus's full year range.
+        """
         counts: Dict[int, int] = {}
         field_lower = field.lower()
         for p in self.papers:
@@ -284,9 +341,10 @@ class TrendForecaster:
             if y is None:
                 continue
             fos = [str(f).lower() for f in (getattr(p, "fields_of_study", []) or [])]
-            if field_lower in fos:
+            if any(field_lower in f for f in fos):
                 counts[y] = counts.get(y, 0) + 1
-        return counts
+        result = self._fill_year_gaps(counts)
+        return {int(k): int(v) for k, v in result.items()}
 
     # ------------------------------------------------------------------
     # Core forecast dispatch
@@ -312,13 +370,17 @@ class TrendForecaster:
         try:
             from statsmodels.tsa.arima.model import ARIMA  # lazy
             import pandas as pd  # lazy
-            idx = pd.period_range(start=str(years[0]), periods=n, freq="Y")
+            idx = _year_period_index(years[0], n)
             ts = pd.Series(values, index=idx)
             if n < 4:
                 raise ValueError("ARIMA needs >=4 observations")
             order = (1, 1, 1) if n >= 6 else (1, 0, 0)
             model = ARIMA(ts, order=order)
-            fit = model.fit()
+            with warnings.catch_warnings():
+                # Suppress statsmodels' noisy convergence / frequency
+                # warnings locally (no global filters).
+                warnings.simplefilter("ignore")
+                fit = model.fit()
             fitted = list(map(float, np.asarray(fit.fittedvalues)))
             # Forecast with confidence interval.
             fobj = fit.get_forecast(steps=years_ahead)
@@ -349,9 +411,11 @@ class TrendForecaster:
             })
             m = Prophet(interval_width=0.80, yearly_seasonality=False,
                          weekly_seasonality=False, daily_seasonality=False)
-            m.fit(df)
-            future = m.make_future_dataframe(periods=years_ahead, freq="YS")
-            fc = m.predict(future)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                m.fit(df)
+                future = m.make_future_dataframe(periods=years_ahead, freq="YS")
+                fc = m.predict(future)
             fitted = list(map(float, np.asarray(fc["yhat"][:len(values)])))
             forecast = list(map(float, np.asarray(fc["yhat"][len(values):])))
             lower = list(map(float, np.asarray(fc["yhat_lower"][len(values):])))
@@ -404,12 +468,14 @@ class TrendForecaster:
         try:
             from statsmodels.tsa.holtwinters import ExponentialSmoothing  # lazy
             import pandas as pd  # lazy
-            idx = pd.period_range(start=str(years[0]), periods=n, freq="Y")
+            idx = _year_period_index(years[0], n)
             ts = pd.Series(values, index=idx)
             model = ExponentialSmoothing(
                 ts, trend="add", seasonal=None, initialization_method="estimated",
             )
-            fit = model.fit()
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                fit = model.fit()
             fitted = list(map(float, np.asarray(fit.fittedvalues)))
             fc = fit.forecast(years_ahead)
             forecast = list(map(float, np.asarray(fc)))
@@ -600,16 +666,78 @@ class TrendForecaster:
     ) -> Forecast:
         """Forecast the citation trajectory of a single paper.
 
+        When the paper provides a real per-year citation history, a regular
+        forecast is fitted on it (empty ``label``). When only a cumulative
+        citation total is available, NO fitted forecast is fabricated:
+        instead a clearly-labelled *synthetic linear reference* trajectory
+        (constant accrual of the observed total) is returned with
+        ``label="synthetic-linear-reference"`` and an explanatory note, so
+        downstream UIs can disclose the provenance. When the paper cannot
+        be resolved, the Forecast carries ``label="no-data"``.
+
         Args:
             paper_id: DOI or title identifying the paper.
             years_ahead: Forecast horizon.
-            method: Forecasting method.
+            method: Forecasting method (used only when real history exists).
 
         Returns:
-            A :class:`Forecast`.
+            A :class:`Forecast` (check ``label``/``notes`` for provenance).
         """
         series = self._paper_citation_yearly(paper_id)
-        return self._run_forecast(paper_id, series, years_ahead, method)
+        if series:
+            return self._run_forecast(paper_id, series, years_ahead, method)
+
+        target = self._find_paper(paper_id)
+        pub_year = _safe_year(target) if target is not None else None
+        total = int(getattr(target, "citations_count", 0) or 0) if target is not None else 0
+        if target is None or pub_year is None or total <= 0:
+            return Forecast(
+                topic=paper_id, method=method, label="no-data",
+                notes=[
+                    "No citation data available for this paper; no "
+                    "trajectory was generated.",
+                ],
+            )
+
+        _, max_corpus_year = self._corpus_year_range()
+        max_year = max(pub_year, int(max_corpus_year or pub_year))
+        if max_year <= pub_year:
+            return Forecast(
+                topic=paper_id, method=method, label="no-data",
+                notes=[
+                    "The paper was published in the corpus's latest year; "
+                    "there is no temporal signal to display.",
+                ],
+            )
+
+        # Synthetic linear reference: constant per-year accrual of the
+        # observed cumulative total. Clearly labelled, never presented as
+        # a fitted forecast.
+        span = max_year - pub_year + 1
+        hist = {
+            y: float(round(total * (i + 1) / span))
+            for i, y in enumerate(range(pub_year, max_year + 1))
+        }
+        fc = {
+            y: float(round(total * (span + i + 1) / span))
+            for i, y in enumerate(range(max_year + 1, max_year + 1 + years_ahead))
+        }
+        return Forecast(
+            topic=paper_id,
+            historical_data=_series_to_pd(hist),
+            forecast_data=_series_to_pd(fc),
+            confidence_intervals=None,
+            method="linear",
+            label="synthetic-linear-reference",
+            notes=[
+                "SYNTHETIC: only a cumulative citation total is available "
+                "for this paper, so this trajectory is a linear reference "
+                "(constant accrual of the observed total), NOT a forecast "
+                "fitted on real per-year data.",
+                f"source_total={total}, window={pub_year}-{max_year}, "
+                f"horizon={years_ahead}",
+            ],
+        )
 
     def forecast_author_productivity(
         self,

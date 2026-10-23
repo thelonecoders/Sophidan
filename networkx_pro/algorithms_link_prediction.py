@@ -340,6 +340,29 @@ class LinkPrediction:
             out[u] = {v: float(S[idx[u], idx[v]]) for v in nodes}
         return out
 
+    @staticmethod
+    def _katz_triples(g: Any, **kw: Any) -> List[Tuple[Any, Any, float]]:
+        """Flatten :meth:`katz_similarity` into ``(u, v, score)`` triples.
+
+        The Katz matrix is a nested ``{u: {v: score}}`` dict; predictors
+        in :meth:`predict_top_links` must all share the flat triple
+        shape. Diagonal entries and duplicate undirected pairs are
+        dropped.
+        """
+        matrix = LinkPrediction.katz_similarity(g, **kw)
+        seen: set = set()
+        triples: List[Tuple[Any, Any, float]] = []
+        for u, row in matrix.items():
+            for v, score in row.items():
+                if u == v:
+                    continue
+                key = (u, v) if str(u) <= str(v) else (v, u)
+                if key in seen:
+                    continue
+                seen.add(key)
+                triples.append((u, v, float(score)))
+        return triples
+
     # ------------------------------------------------------------------
     # One-shot top-N predictor
     # ------------------------------------------------------------------
@@ -359,12 +382,15 @@ class LinkPrediction:
             g: Undirected graph (DiGraphs converted).
             method: One of ``'jaccard'`` (default), ``'adamic_adar'``,
                 ``'preferential_attachment'``, ``'resource_allocation'``,
-                ``'common_neighbor_centrality'``.
+                ``'common_neighbor_centrality'``, ``'katz_similarity'``.
 
         Returns:
-            A list of ``(u, v, score)`` tuples sorted descending by
+            A list of ``(u, v, score)`` triples sorted descending by
             score. Zero-score predictions are filtered out (except for
             preferential_attachment, which has no canonical baseline).
+            Every method — including ``katz_similarity`` (flattened
+            internally from its matrix) — returns the same flat triple
+            shape, so route/web callers can iterate uniformly.
         """
         method = method.lower().strip()
         predictors = {
@@ -374,13 +400,24 @@ class LinkPrediction:
             "resource_allocation": LinkPrediction.resource_allocation_index,
             "common_neighbor_centrality": LinkPrediction.common_neighbor_centrality,
         }
-        if method not in predictors:
-            raise ValueError(
-                f"Unknown method: {method!r}. "
-                f"Expected one of {list(predictors)}."
-            )
         try:
-            preds = predictors[method](g, ebunch=None)
+            if method == "katz_similarity":
+                preds = LinkPrediction._katz_triples(g)
+                # Katz scores every pair, not just non-edges — drop
+                # existing edges so the semantics match the other
+                # predictors.
+                g_und = g.to_undirected() if g.is_directed() else g
+                preds = [
+                    (u, v, s) for (u, v, s) in preds
+                    if not g_und.has_edge(u, v)
+                ]
+            elif method in predictors:
+                preds = predictors[method](g, ebunch=None)
+            else:
+                raise ValueError(
+                    f"Unknown method: {method!r}. Expected one of "
+                    f"['katz_similarity'] + {sorted(predictors)}."
+                )
         except Exception as exc:  # pragma: no cover - defensive
             logger.warning("predict_top_links(%s) failed: %s", method, exc)
             return []

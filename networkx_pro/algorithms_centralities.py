@@ -337,29 +337,37 @@ class Centralities:
     @staticmethod
     def harmonic_centrality(
         g: Any,
-        source: str = "in",
         distance: Optional[str] = None,
+        **legacy: Any,
     ) -> Dict[Any, float]:
         """Return harmonic centrality (sum of 1/distance to every other node).
 
+        Note: networkx's harmonic centrality has NO direction semantics.
+        The old ``source='in' / 'out'`` parameter was fiction — the
+        underlying call always raised ``TypeError`` and silently fell
+        back. Any legacy ``source=...`` kwarg is now ignored with a
+        debug log; directed graphs use the directed distances that
+        networkx computes natively.
+
         Args:
             g: A networkx graph.
-            source: For directed graphs: ``'in'`` counts incoming paths,
-                ``'out'`` counts outgoing paths.
             distance: Edge attribute to use as distance (default = hop count).
+            **legacy: Accepted-for-compatibility kwargs (e.g. a stray
+                ``source=``); ignored.
 
         Returns:
             ``{node: score}``.
         """
         import networkx as nx
 
+        if legacy:
+            logger.debug(
+                "harmonic_centrality ignoring unsupported kwargs: %s",
+                sorted(legacy),
+            )
         if g.number_of_nodes() == 0:
             return {}
         try:
-            # networkx ≥ 3.x renamed the kwarg to ``source`` (was nbunch).
-            return dict(nx.harmonic_centrality(g, distance=distance, source=source))
-        except TypeError:
-            # Old networkx signatures: fall back without source.
             return dict(nx.harmonic_centrality(g, distance=distance))
         except Exception as exc:  # pragma: no cover - defensive
             logger.warning("harmonic_centrality failed: %s", exc)
@@ -390,22 +398,35 @@ class Centralities:
         if g.number_of_nodes() == 0:
             return {}
         has_any = any(attribute in d for _, d in g.nodes(data=True))
-        if not has_any:
-            logger.debug(
-                "percolation_centrality: attribute %r missing on every node — "
-                "using degree (normalised) as a percolation-state proxy.",
-                attribute,
-            )
-            max_deg = max((g.degree(n) for n in g.nodes()), default=1) or 1
-            for n in g.nodes():
-                g.nodes[n][attribute] = float(g.degree(n)) / float(max_deg)
+        # Build the state mapping WITHOUT touching the input graph —
+        # nx.percolation_centrality accepts an explicit ``states`` dict
+        # and the previous implementation wrote the attribute back onto
+        # the caller's nodes (a contract-violating mutation).
+        if states is None:
+            if has_any:
+                computed_states = {
+                    n: float(d.get(attribute) or 0.0)
+                    for n, d in g.nodes(data=True)
+                }
+            else:
+                logger.debug(
+                    "percolation_centrality: attribute %r missing on every node — "
+                    "using degree (normalised) as a percolation-state proxy.",
+                    attribute,
+                )
+                max_deg = max((g.degree(n) for n in g.nodes()), default=1) or 1
+                computed_states = {
+                    n: float(g.degree(n)) / float(max_deg) for n in g.nodes()
+                }
         else:
-            # Ensure every node has the attribute (default 0.0).
-            for n, d in g.nodes(data=True):
-                if attribute not in d:
-                    d[attribute] = 0.0
+            # Copy the caller's mapping and default any missing nodes.
+            computed_states = {n: float(v) for n, v in dict(states).items()}
+            for n in g.nodes():
+                computed_states.setdefault(n, 0.0)
         try:
-            return dict(nx.percolation_centrality(g, attribute=attribute, states=states))
+            return dict(nx.percolation_centrality(
+                g, attribute=attribute, states=computed_states
+            ))
         except ZeroDivisionError:
             # All states are equal → percolation_centrality is undefined.
             logger.debug(

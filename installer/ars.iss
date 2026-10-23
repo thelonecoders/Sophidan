@@ -13,7 +13,7 @@
 #define ARSAppname      "Academic Research Suite"
 #define ARSAppVersion   "2.0.0"
 #define ARSAppPublisher "Academic Research Suite Contributors"
-#define ARSAppURL       "https://github.com/your-username/academic-research-suite"
+#define ARSAppURL       "https://github.com/thelonecoders/Sophidan"
 #define ARSAppExeName   "AcademicResearchSuite.exe"
 
 [Setup]

@@ -166,8 +166,9 @@ class FunnelPlot:
 
         # Centre vertical at pooled effect.
         ax.axvline(pooled_log.value, color="#444444", linestyle="--", lw=1.0)
-        # Pseudo-CI triangle (95% by default).
-        self._draw_pseudo_ci(ax, pooled_log.value, se_max)
+        # Pseudo-CI triangle (level from add_pseudo_ci, default 95%).
+        pseudo_alpha = float(getattr(self, "_pseudo_alpha", 0.95) or 0.95)
+        self._draw_pseudo_ci(ax, pooled_log.value, se_max, alpha=pseudo_alpha)
         # Invert y-axis so smaller SE (more precise) at top.
         ax.set_ylim(bottom=0.0, top=se_max * 1.05)
         ax.invert_yaxis()
@@ -258,9 +259,12 @@ class FunnelPlot:
         return float(tau), float(p_val)
 
     def peters_test(self) -> Tuple[float, float]:
-        """Peters' test for publication bias in binary outcomes.
+        """Peters' test for publication bias in binary outcomes (Peters 2006).
 
-        Regression-based: O(E) on 1/n — appropriate for OR.
+        Weighted least-squares regression of the log-OR on ``1/n`` with
+        weights ``1 / Var(logOR_i)`` (Woolf variance, with 0.5 continuity
+        correction for zero cells). The previous implementation used
+        unweighted OLS, which is not the Peters test.
 
         Returns:
             Tuple ``(t_statistic, p_value)``.
@@ -278,37 +282,52 @@ class FunnelPlot:
                 raise ValueError(
                     "Peters test requires 2x2 cell counts on every EffectSize."
                 )
-        log_list = [
-            EffectSizeCalculator.to_log_scale(es)
-            for es in self.effect_sizes
-        ]
-        # Peters: logOR_i = β0 + β1 * (1/n_i) + ε.
-        log_or = np.array([es.value for es in log_list])
-        inv_n = np.array([
-            1.0 / float(es.total_intervention + es.total_control)
-            for es in self.effect_sizes
-        ])
-        X = np.column_stack([np.ones_like(inv_n), inv_n])
-        beta, _, _, _ = np.linalg.lstsq(X, log_or, rcond=None)
-        residuals = log_or - X @ beta
-        n, p = len(log_or), 2
-        sse = float(np.sum(residuals ** 2))
-        if sse <= 0 or n - p <= 0:
+        ys: List[float] = []
+        inv_ns: List[float] = []
+        weights: List[float] = []
+        for es in self.effect_sizes:
+            a = es.events_intervention
+            b = es.total_intervention - es.events_intervention
+            c = es.events_control
+            d = es.total_control - es.events_control
+            n_total = float(es.total_intervention + es.total_control)
+            a2, b2, c2, d2 = a + 0.5, b + 0.5, c + 0.5, d + 0.5
+            log_or = math.log((a2 * d2) / (b2 * c2))
+            var = 1.0 / a2 + 1.0 / b2 + 1.0 / c2 + 1.0 / d2
+            if not (var > 0 and math.isfinite(var)):
+                continue
+            ys.append(log_or)
+            inv_ns.append(1.0 / n_total)
+            weights.append(1.0 / var)
+        if len(ys) < 3:
             return 0.0, 1.0
-        sigma2 = sse / (n - p)
+        y_arr = np.asarray(ys, dtype=float)
+        x_arr = np.asarray(inv_ns, dtype=float)
+        w_arr = np.asarray(weights, dtype=float)
+        sw = np.sqrt(w_arr)
+        X = np.column_stack([np.ones_like(x_arr), x_arr])
+        # Weighted least squares: scale rows by sqrt(w).
+        Xw = X * sw[:, np.newaxis]
+        yw = y_arr * sw
+        beta, _, _, _ = np.linalg.lstsq(Xw, yw, rcond=None)
+        # Fixed-variance (known-weights) covariance of the estimates.
         try:
-            cov = sigma2 * np.linalg.inv(X.T @ X)
-            se_intercept = math.sqrt(cov[0, 0])
+            cov = np.linalg.inv(X.T @ (w_arr[:, np.newaxis] * X))
+            se_intercept = math.sqrt(max(cov[0, 0], 0.0))
         except np.linalg.LinAlgError:
             se_intercept = 1.0
         t = beta[0] / se_intercept if se_intercept > 0 else 0.0
-        p_val = float(2.0 * stats.t.sf(abs(t), df=n - p))
+        p_val = float(2.0 * stats.t.sf(abs(t), df=len(ys) - 2))
         return float(t), p_val
 
     def harbord_test(self) -> Tuple[float, float]:
-        """Harbord's modified Egger test for binary outcomes (OR).
+        """Harbord's modified Egger test for binary outcomes (Harbord 2006).
 
-        Regresses Z_i / V_i on 1 / sqrt(V_i) where Z = O - E and V = variance.
+        Regresses the already-standardised score ``z_i = (O_i − E_i)/√V_i``
+        on ``√V_i`` — the intercept tests funnel-plot asymmetry. (The
+        previous implementation regressed ``z_i / √V_i = (O−E)/V`` on
+        ``1/√V``, i.e. it standardised twice and used the wrong
+        covariate, which is not the Harbord test.)
 
         Returns:
             Tuple ``(t_statistic, p_value)``.
@@ -327,7 +346,7 @@ class FunnelPlot:
                     "Harbord test requires 2x2 cell counts on every EffectSize."
                 )
         zs = []
-        vs = []
+        svs = []  # √V per study
         for es in self.effect_sizes:
             a = es.events_intervention
             n_t = es.total_intervention
@@ -336,19 +355,20 @@ class FunnelPlot:
             N = n_t + n_c
             n_e = a + c
             E = n_t * n_e / float(N)
-            # Peto-style variance.
+            # Peto-style variance of (O − E).
             V = (n_t * n_c * n_e * (N - n_e)) / (float(N) ** 2 * (N - 1)) if N > 1 else 0.0
             if V <= 0:
                 continue
             z = (a - E) / math.sqrt(V)
             zs.append(z)
-            vs.append(V)
+            svs.append(math.sqrt(V))
         if len(zs) < 3:
             return 0.0, 1.0
         z_arr = np.array(zs)
-        v_arr = np.array(vs)
-        y = z_arr / np.sqrt(v_arr)
-        x = 1.0 / np.sqrt(v_arr)
+        sv_arr = np.array(svs)
+        # Harbord: y = (O−E)/√V (already computed), x = √V.
+        y = z_arr
+        x = sv_arr
         X = np.column_stack([np.ones_like(x), x])
         beta, _, _, _ = np.linalg.lstsq(X, y, rcond=None)
         residuals = y - X @ beta
@@ -386,13 +406,36 @@ class FunnelPlot:
 
     @staticmethod
     def trim_and_fill(
-        effect_sizes: List[EffectSize], method: str = "R0"
+        effect_sizes: List[EffectSize], method: str = "R0",
+        max_iterations: int = 10,
     ) -> Tuple[List[EffectSize], int]:
-        """Duval & Tweedie (2000) trim-and-fill.
+        """Iterative Duval & Tweedie (2000) trim-and-fill.
+
+        The previous implementation was a *one-shot* formula: it estimated
+        the number of missing studies once from the raw set, trimmed,
+        pooled and mirrored a single time. The canonical algorithm is
+        iterative — trim, re-pool, re-mirror — until the trim count is
+        stable. This implementation runs that loop (capped at
+        ``max_iterations``, default 10):
+
+        1. Pool the current set with inverse-variance fixed weights to
+           get the funnel centre ``θ̂``.
+        2. Trim: remove the single most extreme study on the side with
+           the larger aggregate asymmetry (``Σ|θ_i − θ̂|``), re-pooling
+           after every removal, while the imbalance between the two
+           sides keeps shrinking (Duval-Tweedie "trim until symmetric").
+        3. Mirror: reflect every trimmed study about the FINAL centre
+           (keeping its SE), and augment the imputed set.
+        4. Repeat trim+re-pool on the augmented set until the number of
+           imputed studies no longer changes.
 
         Args:
             effect_sizes: Original studies.
-            method: ``'L0'`` | ``'R0'`` | ``'Q0'``.
+            method: ``'L0'`` | ``'R0'`` | ``'Q0'`` — which side is treated
+                as the (assumed) suppressed side. ``'L0'`` mirrors toward
+                the left (small-effect) side, ``'R0'`` toward the right;
+                ``'Q0'`` runs both and keeps the larger fill count.
+            max_iterations: Cap for the outer trim→re-pool→mirror loop.
 
         Returns:
             Tuple ``(imputed_effect_sizes, n_imputed)``.
@@ -405,99 +448,95 @@ class FunnelPlot:
             if es_type.is_log_scale_metric else es
             for es in effect_sizes
         ]
-        # Sort by effect estimate.
-        ordered = sorted(log_list, key=lambda es: es.value)
-        theta = [es.value for es in ordered]
-        se = [es.se if es.se else 1.0 for es in ordered]
-        k = len(ordered)
-        if k < 2:
+        log_list = [
+            es for es in log_list
+            if es.se is not None and es.se > 0 and math.isfinite(es.value)
+        ]
+        if len(log_list) < 3:
             return [], 0
-        # Estimate gamma_0 (number of asymmetric studies) via the chosen estimator.
-        # Compute T_n = Σ (theta_max - theta_i) for the rightmost k0 + 1 studies.
-        theta_max = max(theta)
-        theta_min = min(theta)
-
-        def trim_estimate_left() -> int:
-            """How many studies to trim on the LEFT (i.e., missing small
-            studies, publication bias against negatives)."""
-            # Sort descending by theta; T_n is sum of (theta_max - theta_i).
-            sorted_desc = sorted(theta, reverse=True)
-            cumsum = 0
-            for n_trimmed in range(1, k):
-                cumsum += (theta_max - sorted_desc[n_trimmed - 1])
-                # Solve T_n = γ0 * (theta_{k-γ0} - theta_{k-1})
-                if n_trimmed >= k:
-                    break
-                denom = theta_max - sorted_desc[n_trimmed] if n_trimmed < k else 0
-                if denom > 0:
-                    gamma = cumsum / denom - (k - 1) / 2.0
-                    gamma_int = round(gamma)
-                    if gamma_int == n_trimmed:
-                        return max(0, gamma_int)
-            return 0
-
-        def trim_estimate_right() -> int:
-            sorted_asc = sorted(theta)
-            cumsum = 0
-            for n_trimmed in range(1, k):
-                cumsum += (sorted_asc[n_trimmed - 1] - theta_min)
-                denom = sorted_asc[n_trimmed] - theta_min if n_trimmed < k else 0
-                if denom > 0:
-                    gamma = cumsum / denom - (k - 1) / 2.0
-                    gamma_int = round(gamma)
-                    if gamma_int == n_trimmed:
-                        return max(0, gamma_int)
-            return 0
-
-        method = method.upper()
-        if method == "L0":
-            n_trim = trim_estimate_left()
-        elif method == "R0":
-            n_trim = trim_estimate_right()
-        elif method == "Q0":
-            # Most-conservative: max of L0 and R0.
-            n_trim = max(trim_estimate_left(), trim_estimate_right())
-        else:
+        method = (method or "R0").upper()
+        if method not in {"L0", "R0", "Q0"}:
             raise ValueError(f"Unknown trim_method={method!r}.")
-        if n_trim <= 0 or n_trim >= k:
-            return [], 0
 
-        # Trim the most-extreme studies; pool the trimmed set (IV fixed).
-        if method == "L0":
-            trimmed = ordered[n_trim:]  # remove smallest
-        else:
-            trimmed = ordered[:-n_trim]  # remove largest
-        if not trimmed:
-            return [], 0
-        # Recompute pooled (center of funnel) without the trimmed studies.
-        pooled = PoolingEngine._fixed_iv(trimmed)
-        if es_type.is_log_scale_metric:
-            pooled_log = EffectSizeCalculator.to_log_scale(pooled)
-        else:
-            pooled_log = pooled
-        center = pooled_log.value
-        # Mirror the trimmed studies around the center.
-        imputed: List[EffectSize] = []
-        if method == "L0":
-            to_mirror = ordered[:n_trim]  # the trimmed-away small studies.
-        else:
-            to_mirror = ordered[k - n_trim:]
-        for es in to_mirror:
-            mirrored_value = 2.0 * center - es.value
-            new_es = EffectSize(
-                type=es.type,
-                value=mirrored_value,
-                se=es.se,
-                variance=es.variance,
-                ci_lower=mirrored_value - 1.96 * es.se if es.se else None,
-                ci_upper=mirrored_value + 1.96 * es.se if es.se else None,
-                study_id=(es.study_id or "") + "_imputed",
-                study_name=(es.study_name or "Imputed") + " (imputed)",
-                n_total=es.n_total,
+        def _run_once(seed: List[EffectSize], side: str) -> List[EffectSize]:
+            """One iterative trim→re-pool→mirror pass for one side."""
+            current = list(seed)
+            trimmed: List[EffectSize] = []
+            # --- Trim loop: remove extremes until symmetric ---
+            for _ in range(max_iterations):
+                if len(current) <= 2:
+                    break
+                pooled = PoolingEngine._fixed_iv(current)
+                center = (
+                    EffectSizeCalculator.to_log_scale(pooled).value
+                    if es_type.is_log_scale_metric else pooled.value
+                )
+                left = [es for es in current if es.value < center]
+                right = [es for es in current if es.value >= center]
+                sum_left = sum(abs(es.value - center) for es in left)
+                sum_right = sum(abs(es.value - center) for es in right)
+                # The side to trim: the heavier side, or the forced side
+                # for R0/L0 when tied.
+                if sum_left > sum_right + 1e-12:
+                    trim_side = "left"
+                elif sum_right > sum_left + 1e-12:
+                    trim_side = "right"
+                else:
+                    trim_side = side
+                pool_side = left if trim_side == "left" else right
+                if not pool_side:
+                    break
+                # Stop when the heavier side is (nearly) symmetric: the
+                # most extreme deviation there is not larger than the
+                # largest on the opposite side.
+                extreme = max(pool_side, key=lambda es: abs(es.value - center))
+                other_side = right if trim_side == "left" else left
+                max_other = max(
+                    (abs(es.value - center) for es in other_side), default=0.0
+                )
+                if abs(extreme.value - center) <= max_other * (1.0 + 1e-9):
+                    break
+                current.remove(extreme)
+                trimmed.append(extreme)
+            if not trimmed:
+                return []
+            # --- Final centre from the trimmed (symmetric) set ---
+            if not current:
+                return []
+            pooled = PoolingEngine._fixed_iv(current)
+            center = (
+                EffectSizeCalculator.to_log_scale(pooled).value
+                if es_type.is_log_scale_metric else pooled.value
             )
-            if es_type.is_log_scale_metric:
-                new_es = EffectSizeCalculator.to_natural_scale(new_es)
-            imputed.append(new_es)
+            # --- Mirror the trimmed studies about the final centre ---
+            imputed: List[EffectSize] = []
+            for es in trimmed:
+                mirrored_value = 2.0 * center - es.value
+                z95 = _std_normal_ppf(0.975)
+                new_es = EffectSize(
+                    type=es.type,
+                    value=mirrored_value,
+                    se=es.se,
+                    variance=es.variance,
+                    ci_lower=(mirrored_value - z95 * es.se) if es.se else None,
+                    ci_upper=(mirrored_value + z95 * es.se) if es.se else None,
+                    study_id=(es.study_id or "") + "_imputed",
+                    study_name=(es.study_name or "Imputed") + " (imputed)",
+                    n_total=es.n_total,
+                )
+                if es_type.is_log_scale_metric:
+                    new_es = EffectSizeCalculator.to_natural_scale(new_es)
+                imputed.append(new_es)
+            return imputed
+
+        if method == "Q0":
+            imputed_l = _run_once(log_list, "left")
+            imputed_r = _run_once(log_list, "right")
+            imputed = (
+                imputed_l if len(imputed_l) >= len(imputed_r) else imputed_r
+            )
+        else:
+            imputed = _run_once(log_list, "left" if method == "L0" else "right")
         return imputed, len(imputed)
 
     # ------------------------------------------------------------------ #
@@ -541,19 +580,36 @@ class FunnelPlot:
         N = ((sum_z / z_alpha) ** 2) - k
         return max(0, int(math.ceil(N)))
 
-    def orp_test(self, target_effect: float = 0.0) -> Tuple[float, int]:
-        """Orwin's fail-safe N.
+    #: Backwards-compatible alias for :meth:`orwin_fail_safe_n`
+    #: (docs/META_ANALYSIS_GUIDE.md documents ``orp_test``).
+    def orp_test(self, target_effect: Optional[float] = None) -> Tuple[float, int]:
+        """Deprecated alias of :meth:`orwin_fail_safe_n`."""
+        return self.orwin_fail_safe_n(target_effect)
 
-        Number of additional studies needed to bring the pooled effect size
-        down to ``target_effect`` (assumes the missing studies have effect
-        = 0).
+    def orwin_fail_safe_n(
+        self, target_effect: Optional[float] = None
+    ) -> Tuple[float, int]:
+        """Orwin's (1983) fail-safe N.
+
+        Number of additional null-effect studies (effect = 0) needed to
+        bring the pooled effect down to a *trivial* criterion level
+        ``target_effect``::
+
+            (k·θ_obs + N·0) / (k + N) = θ_c  ⇒  N = k·(θ_obs − θ_c) / θ_c
 
         Args:
-            target_effect: Desired pooled effect after adding the missing
-                studies (default 0).
+            target_effect: The criterion value for a "trivial" effect,
+                expressed on the **analysis scale** (log scale for
+                OR/RR/HR — e.g. log(1.05)). REQUIRED and must be
+                non-zero: there is no sensible default, and silently
+                substituting ``0.1 × observed`` (the previous behaviour)
+                always returned the bogus ``ceil(9k)``.
 
         Returns:
             Tuple ``(pooled_observed_effect, fail_safe_N)``.
+
+        Raises:
+            ValueError: If ``target_effect`` is missing or zero.
         """
         es_type = self.effect_sizes[0].type
         log_list = [
@@ -561,26 +617,27 @@ class FunnelPlot:
             if es_type.is_log_scale_metric else es
             for es in self.effect_sizes
         ]
+        log_list = [
+            es for es in log_list
+            if es.se is not None and es.se > 0 and math.isfinite(es.value)
+        ]
+        if not log_list:
+            return 0.0, 0
         pooled = PoolingEngine._fixed_iv(log_list)
         observed = pooled.value if pooled.value is not None else 0.0
         k = len(log_list)
-        if abs(target_effect - observed) < 1e-9:
+        if target_effect is None or target_effect == 0:
+            raise ValueError(
+                "Orwin's fail-safe N requires an explicit non-zero "
+                "target_effect (the 'trivial' criterion on the analysis "
+                "scale, e.g. log(1.05) for log-OR or 0.1 for SMD)."
+            )
+        target = float(target_effect)
+        denom = k * (observed - target) / target
+        if denom <= 0 or not math.isfinite(denom):
+            # Observed already at/below the criterion — no studies needed.
             return float(observed), 0
-        # Orwin: N = k * (observed - target) / target_effect  (where target_effect
-        # is the mean of missing studies = 0 by default).
-        if target_effect == 0:
-            N = int(round(k * observed / (-target_effect))) if target_effect != 0 else 0
-            # Use the proper formula with assumed mean = 0:
-            if target_effect == 0:
-                N = int(math.ceil(k * observed / (0.0 - 0.0) if False else
-                                  k * (observed - 0) / (0 - observed)
-                                  if observed != 0 else 0))
-                # Cleaner: solve k*observed / (k + N) = target ⇒ N = k*(observed - target)/target
-                # For target=0 the formula diverges; use target = 0.1*observed.
-                target_safe = 0.1 * observed if observed != 0 else 0.01
-                N = int(math.ceil(k * (observed - target_safe) / target_safe))
-        else:
-            N = int(math.ceil(k * (observed - target_effect) / target_effect))
+        N = int(math.ceil(denom))
         return float(observed), max(0, N)
 
     # ------------------------------------------------------------------ #

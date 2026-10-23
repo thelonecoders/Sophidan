@@ -42,12 +42,35 @@ class PoolingMethod(Enum):
     DL = "dl"              # DerSimonian-Laird random effects
     REML = "reml"          # REML estimator for tau²
     ML = "ml"              # maximum-likelihood estimator for tau²
-    EB = "eb"              # empirical-Bayes random effects
+    EB = "eb"              # empirical-Bayes (Morris 1983 / Berkey 1995)
+    PAULE_MANDEL = "paule_mandel"  # Paule-Mandel (iterated) estimator
 
     @property
     def is_random_effects(self) -> bool:
         return self in {PoolingMethod.RANDOM, PoolingMethod.DL, PoolingMethod.REML,
-                        PoolingMethod.ML, PoolingMethod.EB}
+                        PoolingMethod.ML, PoolingMethod.EB, PoolingMethod.PAULE_MANDEL}
+
+
+# Default z multiplier for 95% CIs (kept for backwards compatibility).
+_Z_95 = 1.959963984540054
+
+
+def _z_from_confidence(confidence: float) -> float:
+    """Return the two-sided normal quantile ``z`` for a confidence level.
+
+    ``z = norm.ppf(1 - (1 - confidence) / 2)`` — e.g. 1.96 for 0.95,
+    2.5758 for 0.99.  Falls back to a small lookup table when scipy is
+    unavailable.
+    """
+    if not (0 < confidence < 1):
+        raise ValueError("confidence must be in (0, 1).")
+    try:
+        from scipy.stats import norm  # type: ignore
+        return float(norm.ppf(1.0 - (1.0 - confidence) / 2.0))
+    except Exception:
+        z_table = {0.90: 1.6448536269514722, 0.95: 1.959963984540054,
+                   0.99: 2.5758293035489004}
+        return z_table.get(round(confidence, 4), _Z_95)
 
 
 @dataclass
@@ -121,6 +144,11 @@ class MetaAnalysisResult:
     Q_p_value: float = 1.0
     studies_count: int = 0
     total_participants: int = 0
+    #: Empirical-Bayes posterior (shrunken) per-study estimates — only
+    #: populated for :attr:`PoolingMethod.EB`. Each entry is a dict with
+    #: ``study_id``, ``observed``, ``shrunk`` and ``shrinkage_factor``
+    #: (λ = τ²/(τ²+v); 0 = fully shrunk toward the pooled mean).
+    shrunk_estimates: Optional[List[dict]] = None
 
     def to_dict(self) -> dict:
         """Serialize to a JSON-friendly dict."""
@@ -139,6 +167,8 @@ class MetaAnalysisResult:
             "Q_p_value": float(self.Q_p_value),
             "studies_count": int(self.studies_count),
             "total_participants": int(self.total_participants),
+            **({"shrunk_estimates": [dict(s) for s in self.shrunk_estimates]}
+               if self.shrunk_estimates else {}),
         }
 
     def to_markdown(self) -> str:
@@ -228,8 +258,11 @@ class PoolingEngine:
             )
         es_type = effect_sizes[0].type
 
+        # z multiplier honouring the requested confidence level end-to-end.
+        z_mult = _z_from_confidence(confidence)
+
         # Always compute fixed-effect pool (for heterogeneity + comparison).
-        fixed = PoolingEngine._fixed_iv(effect_sizes)
+        fixed = PoolingEngine._fixed_iv(effect_sizes, z_mult=z_mult)
         Q, df = PoolingEngine._q_statistic(effect_sizes, fixed)
         Q_p = PoolingEngine._q_p_value(Q, df)
         # DL tau² (used as fallback / for I²).
@@ -237,15 +270,16 @@ class PoolingEngine:
         I2 = PoolingEngine._i_squared(effect_sizes, tau2_dl, Q=Q, df=df)
 
         # Dispatch the requested method.
+        res = None  # set only by random-effects-style branches (DL/REML/ML/EB/PM)
         if method in {PoolingMethod.FIXED, PoolingMethod.IV}:
             pooled = fixed
             weights = PoolingEngine._iv_weights(effect_sizes)
             tau2 = 0.0
         elif method == PoolingMethod.MH:
             if es_type == EffectSizeType.OR:
-                pooled = PoolingEngine._mh_or(effect_sizes)
+                pooled = PoolingEngine._mh_or(effect_sizes, z_mult=z_mult)
             elif es_type == EffectSizeType.RR:
-                pooled = PoolingEngine._mh_rr(effect_sizes)
+                pooled = PoolingEngine._mh_rr(effect_sizes, z_mult=z_mult)
             else:
                 logger.warning("MH only supports OR/RR; falling back to IV fixed.")
                 pooled = fixed
@@ -253,29 +287,34 @@ class PoolingEngine:
             tau2 = 0.0
         elif method == PoolingMethod.PETO:
             if es_type == EffectSizeType.OR:
-                pooled = PoolingEngine._peto_or(effect_sizes)
+                pooled = PoolingEngine._peto_or(effect_sizes, z_mult=z_mult)
             else:
                 logger.warning("Peto only supports OR; falling back to IV fixed.")
                 pooled = fixed
             weights = PoolingEngine._iv_weights(effect_sizes)
             tau2 = 0.0
         elif method in {PoolingMethod.DL, PoolingMethod.RANDOM}:
-            res = PoolingEngine._dersimonian_laird(effect_sizes)
+            res = PoolingEngine._dersimonian_laird(effect_sizes, z_mult=z_mult)
             pooled = res.pooled_effect
             weights = res.weights
             tau2 = res.tau_squared
         elif method == PoolingMethod.REML:
-            res = PoolingEngine._reml(effect_sizes)
+            res = PoolingEngine._reml(effect_sizes, z_mult=z_mult)
             pooled = res.pooled_effect
             weights = res.weights
             tau2 = res.tau_squared
         elif method == PoolingMethod.ML:
-            res = PoolingEngine._ml(effect_sizes)
+            res = PoolingEngine._ml(effect_sizes, z_mult=z_mult)
             pooled = res.pooled_effect
             weights = res.weights
             tau2 = res.tau_squared
         elif method == PoolingMethod.EB:
-            res = PoolingEngine._empirical_bayes(effect_sizes)
+            res = PoolingEngine._empirical_bayes(effect_sizes, z_mult=z_mult)
+            pooled = res.pooled_effect
+            weights = res.weights
+            tau2 = res.tau_squared
+        elif method == PoolingMethod.PAULE_MANDEL:
+            res = PoolingEngine._paule_mandel(effect_sizes, z_mult=z_mult)
             pooled = res.pooled_effect
             weights = res.weights
             tau2 = res.tau_squared
@@ -283,7 +322,7 @@ class PoolingEngine:
             raise ValueError(f"Unknown pooling method {method!r}.")
 
         # Random-effects result (DL) for the "both" fields.
-        dl_res = PoolingEngine._dersimonian_laird(effect_sizes)
+        dl_res = PoolingEngine._dersimonian_laird(effect_sizes, z_mult=z_mult)
 
         # Compute test statistic & p-value on the analysis scale.
         test_es = pooled
@@ -308,6 +347,7 @@ class PoolingEngine:
 
         total_n = sum((es.n_total or 0) for es in effect_sizes)
 
+        shrunk = getattr(res, "shrunk_estimates", None) if res is not None else None
         return MetaAnalysisResult(
             pooled_effect=pooled,
             heterogeneity=het,
@@ -318,6 +358,7 @@ class PoolingEngine:
             random_effects_pooled=PoolingEngine._back_to_natural(
                 dl_res.pooled_effect, es_type
             ),
+            shrunk_estimates=list(shrunk) if shrunk else None,
             weights=list(weights),
             tau_squared=float(tau2),
             I_squared=float(I2),
@@ -359,11 +400,16 @@ class PoolingEngine:
         return weights
 
     @staticmethod
-    def _fixed_iv(es_list: List[EffectSize]) -> EffectSize:
+    def _fixed_iv(es_list: List[EffectSize], z_mult: float = _Z_95) -> EffectSize:
         """Inverse-variance fixed-effect pooling.
 
         For RR/OR/HR the pooling is performed on the log scale; the result is
         back-transformed to the natural scale before being returned.
+
+        Args:
+            es_list: Effect sizes to pool.
+            z_mult: Two-sided normal quantile for the CI (honours the
+                requested confidence level; 1.95996... for 95%).
         """
         if not es_list:
             raise ValueError("Cannot pool empty list.")
@@ -375,8 +421,8 @@ class PoolingEngine:
         theta = sum(w * es.value for w, es in zip(weights, log_list)) / W
         se = math.sqrt(1.0 / W)
         var = se * se
-        ci_lo = theta - 1.96 * se
-        ci_hi = theta + 1.96 * se
+        ci_lo = theta - z_mult * se
+        ci_hi = theta + z_mult * se
         # Construct on log scale, then back-transform.
         es_type = es_list[0].type
         log_pooled = EffectSize(
@@ -412,7 +458,7 @@ class PoolingEngine:
         return weights
 
     @staticmethod
-    def _mh_or(es_list: List[EffectSize]) -> EffectSize:
+    def _mh_or(es_list: List[EffectSize], z_mult: float = _Z_95) -> EffectSize:
         """Mantel-Haenszel pooled odds ratio.
 
         .. math::
@@ -437,29 +483,32 @@ class PoolingEngine:
             raise ValueError("MH denominator is zero.")
         or_mh = a_sum / b_sum
         log_or = math.log(or_mh)
-        # Robins-Breslow-Greenland variance for log(OR_MH):
-        #   V = Σ GR_i / (2 P^2) + Σ GS_i / (2 P Q) + Σ GT_i / (2 Q^2)
-        # where P = Σ(a_i d_i / N_i), Q = Σ(b_i c_i / N_i), and
-        # GR_i = (a_i d_i (a_i+d_i) + b_i c_i (b_i+c_i)) / N_i^2
-        # GS_i = (a_i d_i (b_i+c_i) + b_i c_i (a_i+d_i)) / N_i^2
-        # GT_i = (b_i c_i (a_i+d_i) + a_i d_i (b_i+c_i)) / N_i^2
+        # Robins-Breslow-Greenland (RBG) variance of log(OR_MH):
+        #   V = R / (2 P^2) + S / (2 P Q) + T / (2 Q^2)
+        # where P = Σ(a_i d_i / N_i), Q = Σ(b_i c_i / N_i) and the three
+        # per-study sums (each divided by N_i^2) are:
+        #   R_i = a_i d_i (a_i + d_i)
+        #   S_i = a_i d_i (b_i + c_i) + b_i c_i (a_i + d_i)
+        #   T_i = b_i c_i (b_i + c_i)
+        # (Robins, Breslow & Greenland 1986; Greenland & Robins 1985.)
         P = a_sum
         Q = b_sum
-        GR_sum = GS_sum = GT_sum = 0.0
+        R_sum = S_sum = T_sum = 0.0
         for es in es_list:
             a = es.events_intervention
             b = es.total_intervention - es.events_intervention
             c = es.events_control
             d = es.total_control - es.events_control
             N = es.total_intervention + es.total_control
-            GR_sum += (a * d * (a + d) + b * c * (b + c)) / (float(N) ** 2)
-            GS_sum += (a * d * (b + c) + b * c * (a + d)) / (float(N) ** 2)
-            GT_sum += (b * c * (b + c) + a * d * (a + d)) / (float(N) ** 2)
+            N2 = float(N) ** 2
+            R_sum += (a * d * (a + d)) / N2
+            S_sum += (a * d * (b + c) + b * c * (a + d)) / N2
+            T_sum += (b * c * (b + c)) / N2
         if P > 0 and Q > 0:
             var = (
-                GR_sum / (2.0 * P * P)
-                + GS_sum / (2.0 * P * Q)
-                + GT_sum / (2.0 * Q * Q)
+                R_sum / (2.0 * P * P)
+                + S_sum / (2.0 * P * Q)
+                + T_sum / (2.0 * Q * Q)
             )
         else:
             var = 0.001
@@ -469,13 +518,13 @@ class PoolingEngine:
             value=float(or_mh),
             se=float(se),
             variance=float(var),
-            ci_lower=float(math.exp(log_or - 1.96 * se)),
-            ci_upper=float(math.exp(log_or + 1.96 * se)),
+            ci_lower=float(math.exp(log_or - z_mult * se)),
+            ci_upper=float(math.exp(log_or + z_mult * se)),
             n_total=sum((es.n_total or 0) for es in es_list),
         )
 
     @staticmethod
-    def _mh_rr(es_list: List[EffectSize]) -> EffectSize:
+    def _mh_rr(es_list: List[EffectSize], z_mult: float = _Z_95) -> EffectSize:
         """Mantel-Haenszel pooled risk ratio.
 
         .. math::
@@ -532,8 +581,8 @@ class PoolingEngine:
             value=float(rr_mh),
             se=float(se),
             variance=float(var),
-            ci_lower=float(math.exp(log_rr - 1.96 * se)),
-            ci_upper=float(math.exp(log_rr + 1.96 * se)),
+            ci_lower=float(math.exp(log_rr - z_mult * se)),
+            ci_upper=float(math.exp(log_rr + z_mult * se)),
             n_total=sum((es.n_total or 0) for es in es_list),
         )
 
@@ -541,7 +590,7 @@ class PoolingEngine:
     # Peto method
     # ------------------------------------------------------------------ #
     @staticmethod
-    def _peto_or(es_list: List[EffectSize]) -> EffectSize:
+    def _peto_or(es_list: List[EffectSize], z_mult: float = _Z_95) -> EffectSize:
         """Peto one-step method for pooling odds ratios.
 
         Uses observed vs expected events in the intervention arm.
@@ -578,8 +627,8 @@ class PoolingEngine:
             value=float(math.exp(log_or)),
             se=float(se),
             variance=float(var),
-            ci_lower=float(math.exp(log_or - 1.96 * se)),
-            ci_upper=float(math.exp(log_or + 1.96 * se)),
+            ci_lower=float(math.exp(log_or - z_mult * se)),
+            ci_upper=float(math.exp(log_or + z_mult * se)),
             n_total=sum((es.n_total or 0) for es in es_list),
         )
 
@@ -609,7 +658,7 @@ class PoolingEngine:
         return max(0.0, tau2)
 
     @staticmethod
-    def _dersimonian_laird(es_list: List[EffectSize]) -> MetaAnalysisResult:
+    def _dersimonian_laird(es_list: List[EffectSize], z_mult: float = _Z_95) -> MetaAnalysisResult:
         """DerSimonian-Laird random-effects pooling."""
         log_list = PoolingEngine._to_log_list(es_list)
         weights = PoolingEngine._iv_weights(log_list)
@@ -642,8 +691,8 @@ class PoolingEngine:
             value=theta_re,
             se=se_re,
             variance=var_re,
-            ci_lower=theta_re - 1.96 * se_re,
-            ci_upper=theta_re + 1.96 * se_re,
+            ci_lower=theta_re - z_mult * se_re,
+            ci_upper=theta_re + z_mult * se_re,
             n_total=sum((es.n_total or 0) for es in es_list),
         )
         pooled_natural = PoolingEngine._back_to_natural(log_pooled, es_type)
@@ -674,8 +723,8 @@ class PoolingEngine:
                     type=es_type, value=theta_fixed,
                     se=math.sqrt(1.0 / W) if W > 0 else 0.0,
                     variance=1.0 / W if W > 0 else 0.0,
-                    ci_lower=theta_fixed - 1.96 * math.sqrt(1.0 / W) if W > 0 else None,
-                    ci_upper=theta_fixed + 1.96 * math.sqrt(1.0 / W) if W > 0 else None,
+                    ci_lower=theta_fixed - z_mult * math.sqrt(1.0 / W) if W > 0 else None,
+                    ci_upper=theta_fixed + z_mult * math.sqrt(1.0 / W) if W > 0 else None,
                     n_total=sum((es.n_total or 0) for es in es_list),
                 ),
                 es_type,
@@ -691,58 +740,147 @@ class PoolingEngine:
         )
 
     # ------------------------------------------------------------------ #
-    # REML estimator for τ²
+    # REML / ML / Paule-Mandel / EB estimators for τ²
     # ------------------------------------------------------------------ #
     @staticmethod
-    def _reml(es_list: List[EffectSize]) -> MetaAnalysisResult:
-        """REML estimator for τ² (iterated non-linear solver).
+    def _reml(es_list: List[EffectSize], z_mult: float = _Z_95) -> MetaAnalysisResult:
+        """REML estimator for τ² (Viechtbauer 2005 Fisher scoring).
 
-        Solves the REML equation:
-            τ² = (Q - (k-1)) / (Σw_i - Σw_i²/Σw_i)  [initial = DL]
-        then iterates by re-computing w_i = 1/(V_i + τ²) until convergence.
+        Solves the exact REML score equation for the intercept-only
+        random-effects model::
+
+            Σ w_i² (y_i − θ̂)² = W − Σ w_i² / W
+
+        where ``w_i = 1/(v_i + τ²)`` and ``W = Σ w_i``.  This replaces the
+        previous (incorrect) "DL-style" score equation; the root coincides
+        with the maximum of the REML profile log-likelihood.
         """
-        return PoolingEngine._iterative_tau2(es_list, estimator="reml")
+        return PoolingEngine._iterative_tau2(es_list, estimator="reml", z_mult=z_mult)
 
     @staticmethod
-    def _ml(es_list: List[EffectSize]) -> MetaAnalysisResult:
-        """Maximum-likelihood estimator for τ²."""
-        return PoolingEngine._iterative_tau2(es_list, estimator="ml")
+    def _ml(es_list: List[EffectSize], z_mult: float = _Z_95) -> MetaAnalysisResult:
+        """Maximum-likelihood estimator for τ².
 
-    @staticmethod
-    def _paule_mandel(es_list: List[EffectSize]) -> MetaAnalysisResult:
-        """Paule-Mandel (iterated) estimator for τ² — alias for the iterative
-        solver with the 'paule_mandel' loss."""
-        return PoolingEngine._iterative_tau2(es_list, estimator="paule_mandel")
+        Solves the exact ML score equation::
 
-    @staticmethod
-    def _empirical_bayes(es_list: List[EffectSize]) -> MetaAnalysisResult:
-        """Empirical-Bayes random effects.
-
-        Uses the DL τ² estimate, then shrinks each study's estimate toward
-        the pooled mean via the posterior mean:
-            θ_i^EB = (θ_i / V_i + μ / τ²) / (1/V_i + 1/τ²)
+            Σ w_i² (y_i − θ̂)² = W
         """
-        dl_res = PoolingEngine._dersimonian_laird(es_list)
-        return dl_res
+        return PoolingEngine._iterative_tau2(es_list, estimator="ml", z_mult=z_mult)
+
+    @staticmethod
+    def _paule_mandel(es_list: List[EffectSize], z_mult: float = _Z_95) -> MetaAnalysisResult:
+        """Paule-Mandel (1982) iterated estimator for τ².
+
+        Solves the unbiasedness (estimating) equation::
+
+            Σ w_i (y_i − θ̂)² = k − 1
+        """
+        return PoolingEngine._iterative_tau2(
+            es_list, estimator="paule_mandel", z_mult=z_mult
+        )
+
+    @staticmethod
+    def _empirical_bayes(es_list: List[EffectSize], z_mult: float = _Z_95) -> MetaAnalysisResult:
+        """Empirical-Bayes random-effects pooling (Morris 1983; Berkey et al. 1995).
+
+        The EB estimate of τ² solves the same iterative equation as the
+        Paule-Mandel estimator (the two methods are mathematically
+        identical — Viechtbauer et al. 2015; metafor treats ``"EB"`` and
+        ``"PM"`` as synonyms)::
+
+            Σ w_i (y_i − θ̂)² = k − 1,   w_i = 1/(v_i + τ²)
+
+        On top of the pooled estimate, the true empirical-Bayes posterior
+        (shrinkage) estimates are computed for each study::
+
+            θ_i^EB = λ_i y_i + (1 − λ_i) μ,   λ_i = τ² / (τ² + v_i)
+
+        with μ the EB pooled mean — each study is shrunk toward the pooled
+        mean with prior weight ``1/τ²``.  The shrunken estimates are
+        attached to the result as ``shrunk_estimates``.
+        """
+        res = PoolingEngine._iterative_tau2(
+            es_list, estimator="paule_mandel", z_mult=z_mult
+        )
+        res.method = PoolingMethod.EB
+        # True EB shrinkage: posterior means with a N(μ, τ²) prior on θ_i.
+        try:
+            import numpy as np  # type: ignore
+        except ImportError:
+            return res
+        log_list = PoolingEngine._to_log_list(es_list)
+        tau2 = res.tau_squared
+        es_type = es_list[0].type
+        y = np.array([es.value for es in log_list], dtype=float)
+        v = np.array([
+            (es.variance if es.variance is not None else
+             (es.se ** 2 if es.se else 1.0))
+            for es in log_list
+        ], dtype=float)
+        mu = None
+        if es_type.is_log_scale_metric:
+            mu_log = res.pooled_effect
+            mu_log = EffectSizeCalculator.to_log_scale(mu_log)
+            mu = mu_log.value
+        else:
+            mu = res.pooled_effect.value
+        shrunk: List[dict] = []
+        if tau2 <= 0:
+            # Degenerate prior — no shrinkage possible; λ undefined (0).
+            for es, yi in zip(log_list, y.tolist()):
+                shrunk.append({
+                    "study_id": es.study_id or es.study_name or "",
+                    "observed": float(
+                        math.exp(yi) if es_type.is_log_scale_metric else es.value
+                    ),
+                    "shrunk": float(mu),
+                    "shrinkage_factor": 0.0,
+                })
+        else:
+            for es, yi, vi in zip(log_list, y.tolist(), v.tolist()):
+                lam = tau2 / (tau2 + vi) if (tau2 + vi) > 0 else 0.0
+                theta_eb = lam * yi + (1.0 - lam) * mu
+                shrunk.append({
+                    "study_id": es.study_id or es.study_name or "",
+                    "observed": float(
+                        math.exp(yi) if es_type.is_log_scale_metric else es.value
+                    ),
+                    "shrunk": float(
+                        math.exp(theta_eb) if es_type.is_log_scale_metric else theta_eb
+                    ),
+                    "shrinkage_factor": float(lam),
+                })
+        res.shrunk_estimates = shrunk
+        return res
 
     @staticmethod
     def _iterative_tau2(
-        es_list: List[EffectSize], estimator: str = "reml"
+        es_list: List[EffectSize],
+        estimator: str = "reml",
+        z_mult: float = _Z_95,
     ) -> MetaAnalysisResult:
-        """Iterative estimator for τ² using ML / REML / Paule-Mandel.
+        """Iterative τ² estimation via the exact ML / REML / PM score equations.
 
-        Args:
-            es_list: list of effect sizes (will be log-transformed if needed).
-            estimator: ``'reml'``, ``'ml'``, or ``'paule_mandel'``.
+        The score equations (intercept-only random-effects model, with
+        ``w_i = 1/(v_i + τ²)`` and ``θ̂ = Σw y / Σw``) are:
 
-        Returns:
-            :class:`MetaAnalysisResult` populated using the converged τ².
+        * **REML** (Viechtbauer 2005, Fisher scoring):
+          ``Σ w² (y − θ̂)² − (W − Σ w²/W) = 0``
+        * **ML** (Hardy & Thompson 1996):
+          ``Σ w² (y − θ̂)² − W = 0``
+        * **PM / EB** (Paule & Mandel 1982):
+          ``Σ w (y − θ̂)² − (k − 1) = 0``
+
+        Root-finding uses :func:`scipy.optimize.brentq` (bracketed, robust);
+        a damped Viechtbauer-style fixed-point iteration is used as the
+        fallback when scipy is unavailable.  All equations are solved on
+        the analysis (log) scale for RR/OR/HR metrics.
         """
         try:
             import numpy as np  # type: ignore
         except ImportError:  # pragma: no cover
             logger.warning("numpy unavailable — falling back to DerSimonian-Laird.")
-            return PoolingEngine._dersimonian_laird(es_list)
+            return PoolingEngine._dersimonian_laird(es_list, z_mult=z_mult)
 
         log_list = PoolingEngine._to_log_list(es_list)
         y = np.array([es.value for es in log_list], dtype=float)
@@ -750,61 +888,80 @@ class PoolingEngine:
             (es.variance if es.variance is not None else (es.se ** 2 if es.se else 1.0))
             for es in log_list
         ], dtype=float)
+        v = np.where(np.isfinite(v) & (v > 0), v, 1.0)
         k = len(y)
         if k < 2:
             raise ValueError("Need at least 2 studies for iterative τ² estimation.")
+        df = k - 1
+        estimator = (estimator or "reml").lower()
+
+        def _score(tau2_val: float) -> float:
+            """Signed score whose root is the τ² estimate (≥ 0)."""
+            tau2_val = max(0.0, float(tau2_val))
+            w = 1.0 / (v + tau2_val)
+            W = float(w.sum())
+            theta = float((w * y).sum() / W)
+            if estimator == "reml":
+                return float((w * w * (y - theta) ** 2).sum()) - (W - float((w * w).sum()) / W)
+            if estimator == "ml":
+                return float((w * w * (y - theta) ** 2).sum()) - W
+            # paule_mandel / eb
+            return float((w * (y - theta) ** 2).sum()) - df
+
+        def _fixed_point(tau2_val: float, maxiter: int = 200) -> float:
+            """Damped fixed-point fallback (Viechtbauer-style iteration)."""
+            tau2_val = max(0.0, float(tau2_val))
+            for _ in range(maxiter):
+                w = 1.0 / (v + tau2_val)
+                W = float(w.sum())
+                theta = float((w * y).sum() / W)
+                rss2 = float((w * w * (y - theta) ** 2).sum())
+                rss = float((w * (y - theta) ** 2).sum())
+                if estimator == "reml":
+                    s, denom = rss2 - (W - float((w * w).sum()) / W), float((w * w).sum())
+                elif estimator == "ml":
+                    s, denom = rss2 - W, float((w * w).sum())
+                else:
+                    s, denom = rss - df, W
+                if denom <= 0:
+                    break
+                step = s / denom
+                new_tau = max(0.0, tau2_val + step)
+                if abs(new_tau - tau2_val) < 1e-10:
+                    tau2_val = new_tau
+                    break
+                tau2_val = new_tau
+            return tau2_val
 
         # Initial guess: DerSimonian-Laird.
         w0 = 1.0 / v
-        W0 = w0.sum()
+        W0 = float(w0.sum())
         theta0 = float((w0 * y).sum() / W0)
         Q0 = float((w0 * (y - theta0) ** 2).sum())
-        df = k - 1
         W0sq = float((w0 * w0).sum())
         C0 = W0 - W0sq / W0
         tau2 = max(0.0, (Q0 - df) / C0) if C0 > 0 else 0.0
 
-        # Iterate via scipy.optimize.brentq on the REML/ML score equation.
+        tau2 = max(0.0, tau2)
+        # Root-find on [0, hi]. If the score at 0 is already ≤ 0, τ̂² = 0
+        # (the score is decreasing in τ² for all three estimators).
+        hi = max(10.0 * float(v.max()), 10.0)
+        s0 = _score(0.0)
+        s_hi = _score(hi)
         try:
             from scipy.optimize import brentq  # type: ignore
-            from scipy.stats import chi2 as chi2_dist  # type: ignore
+            if s0 <= 0.0:
+                tau2 = 0.0
+            elif s0 * s_hi > 0:
+                # No bracket — refine with the fixed-point iteration.
+                tau2 = _fixed_point(tau2)
+            else:
+                tau2 = float(brentq(_score, 0.0, hi, maxiter=200, xtol=1e-12))
+        except Exception as exc:  # pragma: no cover — scipy missing / solver issue
+            logger.debug("τ² root solver unavailable (%s); using fixed-point.", exc)
+            tau2 = _fixed_point(tau2)
+        tau2 = max(0.0, float(tau2))
 
-            def score(tau2_val: float) -> float:
-                """Returns REML or ML score; should be 0 at the MLE."""
-                if tau2_val < 0:
-                    tau2_val = 0.0
-                w = 1.0 / (v + tau2_val)
-                W = w.sum()
-                theta = float((w * y).sum() / W)
-                # Residual SS:
-                rss = float((w * (y - theta) ** 2).sum())
-                if estimator == "reml":
-                    # REML score: rss - (k-1) - sum( (w^2 / W) * (v / (v+tau2)) ) = 0
-                    correction = float(((w * w) / W * (v / (v + tau2_val))).sum())
-                    return rss - df - correction
-                elif estimator == "ml":
-                    # ML score: rss - (k) + 1 = rss - (k-1) approx (without correction)
-                    return rss - (k - 1)
-                elif estimator == "paule_mandel":
-                    # Paule-Mandel: solve sum( w_i * (y_i - theta)^2 ) = (k-1)
-                    return rss - df
-                else:
-                    return rss - df
-
-            # Find tau² in [0, 100 * max(v)] using brentq (sign change required).
-            hi = 10.0 * max(v.max(), 1.0)
-            try:
-                if score(0.0) * score(hi) < 0:
-                    tau2 = float(brentq(score, 0.0, hi, maxiter=200, xtol=1e-10))
-                else:
-                    # No sign change → tau² should be 0 (homogeneous).
-                    tau2 = 0.0 if score(0.0) <= 0 else hi
-            except Exception as e:  # pragma: no cover
-                logger.debug("τ² solver failed (%s); using DL fallback.", e)
-        except Exception:  # pragma: no cover
-            pass
-
-        tau2 = max(0.0, tau2)
         # Final RE weights & pooled effect:
         w = 1.0 / (v + tau2)
         W = float(w.sum())
@@ -817,13 +974,13 @@ class PoolingEngine:
             value=theta,
             se=se,
             variance=var,
-            ci_lower=theta - 1.96 * se,
-            ci_upper=theta + 1.96 * se,
+            ci_lower=theta - z_mult * se,
+            ci_upper=theta + z_mult * se,
             n_total=int(sum((es.n_total or 0) for es in es_list)),
         )
         pooled_natural = PoolingEngine._back_to_natural(log_pooled, es_type)
-        # Heterogeneity stats:
-        Q_val = float(((1.0 / v) * (y - theta0) ** 2).sum())
+        # Heterogeneity stats (Cochran's Q on the IV scale):
+        Q_val = Q0
         I2 = PoolingEngine._i_squared(es_list, tau2, Q=Q_val, df=df)
         Q_p = PoolingEngine._q_p_value(Q_val, df)
         het = Heterogeneity(
@@ -841,7 +998,7 @@ class PoolingEngine:
         method_enum = {
             "reml": PoolingMethod.REML,
             "ml": PoolingMethod.ML,
-            "paule_mandel": PoolingMethod.DL,  # PM is a refined DL.
+            "paule_mandel": PoolingMethod.PAULE_MANDEL,
         }.get(estimator, PoolingMethod.REML)
         return MetaAnalysisResult(
             pooled_effect=pooled_natural,
@@ -849,7 +1006,7 @@ class PoolingEngine:
             test_statistic=float(z),
             p_value=float(p),
             method=method_enum,
-            fixed_effects_pooled=PoolingEngine._fixed_iv(es_list),
+            fixed_effects_pooled=PoolingEngine._fixed_iv(es_list, z_mult=z_mult),
             random_effects_pooled=pooled_natural,
             weights=pct_weights,
             tau_squared=float(tau2),

@@ -407,7 +407,11 @@ class CollaborationGraph:
                     "last_year",
                 ]
             )
-        betw = nx.betweenness_centrality(G, normalized=True, weight="weight")
+        betw = nx.betweenness_centrality(G, normalized=True, weight=None)
+        # NOTE: the collaboration edge ``weight`` is a STRENGTH (number of
+        # joint papers). Feeding it to betweenness as ``weight`` treats
+        # strong collaborators as *far apart* and inverts the path
+        # structure — so betweenness uses unweighted shortest paths.
         close = nx.closeness_centrality(G)
         try:
             eigen = nx.eigenvector_centrality(G, max_iter=1000, tol=1e-06, weight="weight")
@@ -495,7 +499,8 @@ class CollaborationGraph:
         try:
             comm = self.community_detection(method="louvain")
             n_communities = max(comm.values()) + 1 if comm else 1
-            cmap = plt.cm.get_cmap("tab20", max(n_communities, 1))
+            from matplotlib import colormaps as _colormaps
+            cmap = _colormaps["tab20"].resampled(max(n_communities, 1))
             colors = [cmap(comm.get(n, 0)) for n in G.nodes()]
         except Exception:  # pragma: no cover - defensive
             colors = "#4c78a8"

@@ -27,16 +27,12 @@ from __future__ import annotations
 
 import logging
 import math
-import warnings
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
 logger = logging.getLogger(__name__)
-
-warnings.filterwarnings("ignore", category=RuntimeWarning)
-warnings.filterwarnings("ignore", category=UserWarning)
 
 
 # ---------------------------------------------------------------------------
@@ -55,7 +51,15 @@ class NoveltyScore:
         atypicality_score: Uzzi-style atypicality z-score mapped to
             ``[0, 1]`` (higher = more atypical).
         disruption_index: Funk & Owen-Smith CD index in ``[-1, 1]``
-            (positive = disruptive).
+            (positive = disruptive). ``0.0`` with a non-empty
+            ``disruption_reason`` means the index is UNDEFINED (e.g. the
+            focal paper has no reference data), not merely balanced.
+        disruption_reason: Empty when the CD index is defined; otherwise a
+            short explanation (``"no reference data"``,
+            ``"no citing papers"``).
+        degraded: ``True`` when embeddings came from the random fallback
+            (no real embedding model was available) — scores in this state
+            are placeholders, not real signal.
         related_papers: Papers closely related to the focal paper
             (typically the k-NN neighborhood).
         closest_neighbors: ``[(paper, similarity)]`` pairs for the
@@ -68,6 +72,8 @@ class NoveltyScore:
     novelty_score: float = 0.0
     atypicality_score: float = 0.0
     disruption_index: float = 0.0
+    disruption_reason: str = ""
+    degraded: bool = False
     related_papers: List[Any] = field(default_factory=list)
     closest_neighbors: List[Tuple[Any, float]] = field(default_factory=list)
     percentile: float = 0.0
@@ -150,6 +156,25 @@ def _l2_normalize(v: np.ndarray) -> np.ndarray:
     return v / norms
 
 
+def _norm_ref(ref: Any) -> str:
+    """Normalize a reference/DOI string for EXACT matching.
+
+    Lowercases, strips whitespace, and removes common DOI-URL prefixes so
+    ``https://doi.org/10.1/x`` and ``10.1/X`` compare equal. Matching is
+    exact after normalization — never substring — to avoid false positives
+    (e.g. ``10.1/ab`` matching ``10.1/abc``).
+    """
+    s = str(ref or "").strip().lower()
+    for prefix in (
+        "https://doi.org/", "http://doi.org/", "https://dx.doi.org/",
+        "dx.doi.org/", "doi.org/", "doi:",
+    ):
+        if s.startswith(prefix):
+            s = s[len(prefix):]
+            break
+    return s
+
+
 # ---------------------------------------------------------------------------
 # NoveltyScorer
 # ---------------------------------------------------------------------------
@@ -171,10 +196,14 @@ class NoveltyScorer:
             papers: Sequence of :class:`Paper`-like objects.
             embedder: Optional embedder with an ``encode(texts)`` method.
                 If ``None``, a default :class:`EmbeddingsModel` is
-                constructed lazily on first use.
+                constructed lazily on first use; when that also fails,
+                outputs are marked ``degraded=True`` instead of silently
+                pretending the random fallback vectors are real.
         """
         self.papers: List[Any] = list(papers)
         self.embedder = embedder
+        self.degraded: bool = False
+        self._last_disruption_reason: str = ""
         self._embeddings: Optional[np.ndarray] = None
         self._paper_ids: List[str] = [_safe_id(p) for p in self.papers]
         self._id_to_idx: Dict[str, int] = {
@@ -196,9 +225,11 @@ class NoveltyScorer:
             return self.embedder
         except Exception as exc:  # pragma: no cover - defensive
             self.logger.warning(
-                "Could not construct EmbeddingsModel (%s); using random fallback.",
+                "Could not construct EmbeddingsModel (%s); falling back to "
+                "random vectors and marking all outputs degraded=True.",
                 exc,
             )
+            self.degraded = True
             return _RandomEmbedder(self.DEFAULT_EMBEDDING_DIM)
 
     def _get_embeddings(self) -> np.ndarray:
@@ -214,7 +245,10 @@ class NoveltyScorer:
         try:
             mat = embedder.encode(texts)
         except Exception as exc:
-            self.logger.warning("Embedding failed (%s); random fallback.", exc)
+            self.logger.warning(
+                "Embedding failed (%s); falling back to random vectors and "
+                "marking all outputs degraded=True.", exc)
+            self.degraded = True
             mat = _RandomEmbedder(self.DEFAULT_EMBEDDING_DIM).encode(texts)
         mat = np.asarray(mat, dtype=np.float32)
         if mat.ndim == 1:
@@ -262,7 +296,9 @@ class NoveltyScorer:
             if v.ndim == 1:
                 v = v.reshape(1, -1)
         except Exception as exc:  # pragma: no cover - defensive
-            self.logger.warning("Encoding failed (%s); random fallback.", exc)
+            self.logger.warning(
+                "Encoding failed (%s); random fallback, output degraded.", exc)
+            self.degraded = True
             v = _RandomEmbedder(self.DEFAULT_EMBEDDING_DIM).encode([text])
         return _l2_normalize(v)[0]
 
@@ -296,10 +332,16 @@ class NoveltyScorer:
 
         # Atypicality: z-score of pair combinations.
         atypicality = self._atypicality_for(paper)
-        # Disruption index: needs citing papers; if none provided,
-        # we approximate via the paper's references.
+        # Disruption index: needs citing papers + the focal paper's own
+        # references; when either is missing the index is undefined.
         citing_papers = self._find_citing_papers(paper)
         disruption = self.disruption_index(paper, citing_papers)
+        if disruption is None:
+            disruption_value = 0.0
+            disruption_reason = self._last_disruption_reason
+        else:
+            disruption_value = disruption
+            disruption_reason = ""
         # Percentile: novelty vs the rest of the corpus.
         all_novelties = self._all_novelties(emb)
         percentile = self._percentile(novelty, all_novelties)
@@ -309,7 +351,9 @@ class NoveltyScorer:
             paper_title=getattr(paper, "title", "") or "",
             novelty_score=novelty,
             atypicality_score=float(max(0.0, min(1.0, atypicality))),
-            disruption_index=float(max(-1.0, min(1.0, disruption))),
+            disruption_index=float(max(-1.0, min(1.0, disruption_value))),
+            disruption_reason=disruption_reason,
+            degraded=self.degraded,
             related_papers=[p for p, _ in neighbors[:3]],
             closest_neighbors=neighbors,
             percentile=float(percentile),
@@ -338,14 +382,21 @@ class NoveltyScorer:
         return rank * 100.0
 
     def _find_citing_papers(self, paper: Any) -> List[Any]:
-        """Return the list of papers that cite ``paper`` (by DOI matching)."""
-        pid = _safe_id(paper)
+        """Return the list of papers that cite ``paper`` (EXACT id match).
+
+        Reference strings are normalized (lowercased, DOI-URL prefixes
+        stripped) and compared for equality — substring matching produced
+        false positives (``10.1/ab`` matching a reference to ``10.1/abc``).
+        """
+        pid = _norm_ref(_safe_id(paper))
+        if not pid:
+            return []
         citing: List[Any] = []
         for p in self.papers:
             refs = getattr(p, "references", []) or []
             if not refs:
                 continue
-            if any(str(r) == pid or pid in str(r) for r in refs):
+            if any(_norm_ref(r) == pid for r in refs):
                 citing.append(p)
         return citing
 
@@ -408,7 +459,7 @@ class NoveltyScorer:
         self,
         paper: Any,
         citing_papers: Sequence[Any],
-    ) -> float:
+    ) -> Optional[float]:
         """Compute the Funk & Owen-Smith disruption index (CD index).
 
         Definitions (where ``focal`` is the paper under analysis):
@@ -418,9 +469,10 @@ class NoveltyScorer:
           forward and backward through ``focal``).
         * **j** = number of citing papers that reference ``focal`` but
           NOT any of ``focal``'s references.
-        * **k** = number of ``focal``'s references that are also cited
-          by any of the citing papers (links from citing papers back to
-          ``focal``'s references).
+        * **k** = number of ``focal``'s references that are cited by at
+          least one citing paper (DISTINCT references — not the total
+          number of citations to them, which double-counted and biased
+          the denominator).
 
         Disruption index ``CD = (j - i) / (i + j + k)``.
 
@@ -434,32 +486,40 @@ class NoveltyScorer:
             citing_papers: Papers that cite ``paper``.
 
         Returns:
-            Disruption index in ``[-1, 1]``.
+            The CD index in ``[-1, 1]``, or ``None`` when it is
+            undefined. The reason is stored on
+            ``self._last_disruption_reason`` (``"no reference data"`` when
+            the focal paper lists no references — previously this case
+            degenerated to a bogus ``+1.0`` because every citing paper was
+            counted as j — or ``"no citing papers"``).
         """
-        focal_refs = set(str(r) for r in (getattr(paper, "references", []) or []))
+        self._last_disruption_reason = ""
+        focal_refs = {
+            _norm_ref(r) for r in (getattr(paper, "references", []) or [])
+        } - {""}
         if not focal_refs:
-            focal_refs = set()
+            self._last_disruption_reason = "no reference data"
+            return None
+        if not citing_papers:
+            self._last_disruption_reason = "no citing papers"
+            return None
+
         i_count = 0  # citing papers that cite focal AND a focal reference
         j_count = 0  # citing papers that cite focal but NOT a focal reference
-        k_count = 0  # number of focal refs cited by any citing paper
+        cited_refs: set = set()  # DISTINCT focal refs cited by >=1 citing paper
 
-        if not citing_papers:
-            return 0.0
-
-        focal_ref_citation_count: Dict[str, int] = {r: 0 for r in focal_refs}
         for cp in citing_papers:
-            cp_refs = set(str(r) for r in (getattr(cp, "references", []) or []))
+            cp_refs = {
+                _norm_ref(r) for r in (getattr(cp, "references", []) or [])
+            } - {""}
             cites_focal_ref = focal_refs & cp_refs
             if cites_focal_ref:
                 i_count += 1
-                for r in cites_focal_ref:
-                    focal_ref_citation_count[r] = (
-                        focal_ref_citation_count.get(r, 0) + 1
-                    )
+                cited_refs.update(cites_focal_ref)
             else:
                 j_count += 1
-        # k = total (summed over focal refs) of citations from citing papers
-        k_count = sum(focal_ref_citation_count.values())
+        # k = number of DISTINCT focal references cited by the citing papers.
+        k_count = len(cited_refs)
         denom = i_count + j_count + k_count
         if denom == 0:
             return 0.0
@@ -545,8 +605,10 @@ class NoveltyScorer:
             z_list.append(z)
         # Aggregate z (mean of pair z-scores).
         avg_z = float(np.mean(z_list))
-        # Map: more negative z = more atypical = closer to 1.
-        atypicality = 1.0 / (1.0 + math.exp(avg_z))
+        # Map: more negative z = more atypical = closer to 1. Computed in
+        # log-space-stable form (sigmoid via tanh) so extreme z-scores
+        # neither overflow nor saturate to a hard 0/1.
+        atypicality = 0.5 * (1.0 + math.tanh(-avg_z / 2.0))
         return float(atypicality)
 
     def _atypicality_for(self, paper: Any) -> float:
@@ -596,11 +658,13 @@ class NoveltyScorer:
             top_n: Maximum number of papers to return.
 
         Returns:
-            List of :class:`NoveltyScore` (only papers with non-zero
-            disruption index are returned).
+            List of :class:`NoveltyScore` (only papers with a *defined*,
+            non-zero disruption index are returned — papers whose focal
+            references or citing papers are missing are excluded).
         """
         scores = [self.score_paper(p) for p in self.papers]
-        scores = [s for s in scores if s.disruption_index != 0.0]
+        scores = [s for s in scores
+                  if s.disruption_reason == "" and s.disruption_index != 0.0]
         scores.sort(key=lambda s: -s.disruption_index)
         return scores[:top_n]
 

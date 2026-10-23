@@ -43,8 +43,15 @@ class PathsAndFlows:
         if g.number_of_nodes() == 0:
             return g
         if g.is_directed():
-            comps = nx.weakly_connected_components(g)
-            if not comps or all(len(c) == 1 for c in comps) and g.number_of_edges() == 0:
+            # Materialise the components ONCE: ``weakly_connected_components``
+            # returns a generator — ``all()`` / ``not comps`` either always
+            # lie (generator truthiness) or partially consume it, so a
+            # later ``max()`` saw a truncated stream and returned the
+            # largest *remaining* component (wrong view → wrong diameter /
+            # radius / eccentricity on DiGraphs).
+            comps = list(nx.weakly_connected_components(g))
+            if not comps or (all(len(c) == 1 for c in comps)
+                             and g.number_of_edges() == 0):
                 return g
             largest = max(comps, key=len)
             return g.subgraph(largest).copy()

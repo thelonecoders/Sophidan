@@ -543,8 +543,27 @@ class TimeRangeFilter(Filter):
         self.time_attr = str(time_attr)
 
     def _in_range(self, value: Any) -> bool:
+        """Range test tolerant of TemporalNetwork-style attributes.
+
+        Accepts scalars, lists/tuples/sets of timestamps (a node is kept
+        when ANY of its observed years falls inside the window), and
+        dicts (the TemporalNetwork node schema: ``{"years": [...],
+        "first_year": int}``). The previous scalar-only implementation
+        dropped *every* node of a graph built from the repo's own
+        TemporalNetwork, whose nodes carry ``years`` lists instead of a
+        scalar ``year``.
+        """
         if value is None:
             return False
+        if isinstance(value, dict):
+            years = value.get("years")
+            if isinstance(years, (list, tuple, set)):
+                return any(self._in_range(v) for v in years)
+            return self._in_range(
+                value.get("first_year", value.get("year"))
+            )
+        if isinstance(value, (list, tuple, set)):
+            return any(self._in_range(v) for v in value)
         try:
             v = float(value)
             return float(self.start) <= v <= float(self.end)
@@ -552,17 +571,34 @@ class TimeRangeFilter(Filter):
             # Fall back to lexicographic comparison for date strings.
             return str(self.start) <= str(value) <= str(self.end)
 
+    def _time_value(self, data: Any) -> Any:
+        """Return the timestamp payload from an attr dict.
+
+        Preference order: the configured ``time_attr``, then the
+        TemporalNetwork schema (``years`` list / ``first_year``), then
+        nothing.
+        """
+        if not isinstance(data, dict):
+            return None
+        if self.time_attr in data:
+            return data[self.time_attr]
+        if "years" in data:
+            return data["years"]
+        if "first_year" in data:
+            return data["first_year"]
+        return None
+
     def apply(self, graph: Any) -> Any:
         if graph is None or graph.number_of_nodes() == 0:
             return graph.copy() if graph is not None else graph
         keep_nodes = [n for n, data in graph.nodes(data=True)
-                      if self._in_range(data.get(self.time_attr))]
+                      if self._in_range(self._time_value(data))]
         sub = graph.subgraph(keep_nodes).copy()
         # Further filter edges by their own time attr (if present).
         out = sub.__class__()
         out.add_nodes_from(sub.nodes(data=True))
         for u, v, data in sub.edges(data=True):
-            t = data.get(self.time_attr)
+            t = self._time_value(data)
             if t is None or self._in_range(t):
                 out.add_edge(u, v, **data)
         return out

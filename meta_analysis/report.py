@@ -38,6 +38,27 @@ logger = logging.getLogger(__name__)
 __all__ = ["MetaAnalysisReport"]
 
 
+# GRADE domains in downgrade order (Guyatt et al. 2011; GRADE handbook).
+_GRADE_DOMAINS = (
+    "risk_of_bias",
+    "inconsistency",
+    "indirectness",
+    "imprecision",
+    "publication_bias",
+)
+
+#: Accepted spellings → number of levels to downgrade (0 / 1 / 2).
+_DOWNGRADE_ALIASES = {
+    "0": 0, "none": 0, "no": 0, "not_serious": 0, "not serious": 0,
+    "no_downgrade": 0, "no downgrade": 0,
+    "-1": 1, "1": 1, "serious": 1, "downgrade_1": 1,
+    "-2": 2, "2": 2, "very_serious": 2, "very serious": 2, "downgrade_2": 2,
+}
+
+_CERTAINTY_LEVELS = ("High", "Moderate", "Low", "Very low")
+
+
+
 @dataclass
 class MetaAnalysisReport:
     """Generator for a complete meta-analysis report.
@@ -70,7 +91,7 @@ class MetaAnalysisReport:
             "summary": self.meta_result.summary_text(),
             "characteristics_of_studies": self._characteristics_table(),
             "summary_of_findings": self._summary_of_findings(),
-            "grade": self.settings.get("grade", None),
+            "grade": self._grade_assessment() if self.settings.get("grade") else self.settings.get("grade", None),
             "sensitivity": self._sensitivity_summary(),
             "subgroup": self._subgroup_summary(),
             "pooled_effect": self.meta_result.pooled_effect.to_dict(),
@@ -190,8 +211,9 @@ class MetaAnalysisReport:
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore", UserWarning)
                 fp.save(os.path.join(base_dir, "forest_plot.png"), format="png")
-            # Funnel.
+            # Funnel (pseudo-CI triangle wired via add_pseudo_ci).
             funnel = FunnelPlot(self.effect_sizes, pooled=self.meta_result.pooled_effect)
+            funnel.add_pseudo_ci(0.95)
             funnel.render()
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore", UserWarning)
@@ -304,6 +326,87 @@ class MetaAnalysisReport:
             return f"_Subgroup analysis failed: {e}_\n"
         return res.to_markdown() + "\n"
 
+    def _grade_assessment(self) -> dict:
+        """Minimal real GRADE assessment for the single outcome in SoF.
+
+        Starts from **High** certainty (randomised-trial body of evidence;
+        ``settings['grade']['study_design']`` mentioning an observational
+        design starts from **Low**, per GRADE). Each of the five domains
+        (risk of bias, inconsistency, indirectness, imprecision,
+        publication bias) may downgrade by −1 ("serious") or −2 ("very
+        serious"), taken from the ``settings['grade']`` assessments dict
+        — values may be ints (0/-1/-2) or strings
+        (``none|serious|very_serious``). Domains absent from the dict get
+        conservative automatic signals where the meta-analysis data
+        supports one:
+
+        * ``inconsistency`` — I² ≥ 50% → −1, ≥ 75% → −2 (labelled ``auto
+          (I²)``).
+        * ``imprecision`` — the 95% CI crosses the null value → −1
+          (labelled ``auto (CI crosses null)``).
+
+        The total downgrade is capped at 3 (floor = Very low); certainty
+        is NOT upgraded (minimal implementation).
+        """
+        g = self.settings.get("grade") or {}
+        if isinstance(g, str):
+            g = {"quality": g}
+        if not isinstance(g, dict):
+            g = {}
+
+        design = str(g.get("study_design", "randomised_trials")).lower()
+        observational = any(
+            w in design
+            for w in ("observational", "cohort", "case-control", "case control",
+                      "non-random", "nonrandom", "quasi", "cross-sectional")
+        )
+        certainty = 2 if observational else 0
+        start_label = (
+            "Low (observational body of evidence)" if observational
+            else "High (randomised trials)"
+        )
+
+        pe = self.meta_result.pooled_effect
+        def _parse(val) -> Optional[int]:
+            if val is None:
+                return None
+            if isinstance(val, bool):
+                return 0 if not val else 1
+            if isinstance(val, (int, float)):
+                return int(max(0, min(2, abs(int(val)))))
+            return _DOWNGRADE_ALIASES.get(str(val).strip().lower())
+
+        domains: Dict[str, dict] = {}
+        for domain in _GRADE_DOMAINS:
+            parsed = _parse(g.get(domain))
+            if parsed is not None:
+                dv, source = parsed, "assessments dict"
+            elif domain == "inconsistency":
+                i2 = float(self.meta_result.I_squared)
+                dv = 2 if i2 >= 75.0 else (1 if i2 >= 50.0 else 0)
+                source = f"auto (I² = {i2:.0f}%)"
+            elif domain == "imprecision":
+                crosses_null = (
+                    pe.ci_lower is not None and pe.ci_upper is not None
+                    and pe.ci_lower <= pe.type.null_value <= pe.ci_upper
+                )
+                dv = 1 if crosses_null else 0
+                source = (
+                    "auto (95% CI crosses the null value)"
+                    if crosses_null else "auto (CI excludes the null)"
+                )
+            else:
+                dv, source = 0, "not assessed (no downgrade)"
+            domains[domain] = {"downgrade": dv, "source": source}
+            certainty += dv
+        certainty = max(0, min(3, certainty))
+        return {
+            "starting_certainty": start_label,
+            "domains": domains,
+            "total_downgrades": certainty,
+            "certainty": _CERTAINTY_LEVELS[certainty],
+        }
+
     def _summary_of_findings(self) -> dict:
         """Build the summary-of-findings (SoF) table data."""
         pe = self.meta_result.pooled_effect
@@ -320,9 +423,13 @@ class MetaAnalysisReport:
             "p_value": float(self.meta_result.p_value),
             "method": self.meta_result.method.value,
         }
-        # Quality assessment (GRADE) if provided.
+        # Quality assessment (GRADE if provided; minimal real GRADE).
         if self.settings.get("grade"):
-            sof["grade_quality"] = self.settings["grade"].get("quality", "—")
+            grade = self._grade_assessment()
+            sof["grade_quality"] = grade["certainty"]
+            sof["grade"] = grade
+        else:
+            sof["grade_quality"] = "—"
         return sof
 
     def _markdown_sof(self) -> str:
@@ -344,18 +451,26 @@ class MetaAnalysisReport:
         return out
 
     def _markdown_grade(self) -> str:
+        """Render the minimal real GRADE assessment as a Markdown table."""
         g = self.settings.get("grade", {})
         if not g:
             return "_No GRADE ratings provided._\n"
-        out = ["| Domain | Rating | Comment |\n|---|---|---|\n"]
-        for domain, value in g.items():
-            if isinstance(value, dict):
-                rating = value.get("rating", "—")
-                comment = value.get("comment", "")
-            else:
-                rating = value
-                comment = ""
-            out.append(f"| {domain} | {rating} | {comment} |")
+        assessment = self._grade_assessment()
+        out = [
+            f"Starting certainty: **{assessment['starting_certainty']}**",
+            "",
+            "| Domain | Downgrade | Basis |",
+            "|---|---|---|",
+        ]
+        for domain, info in assessment["domains"].items():
+            dv = info["downgrade"]
+            dv_str = f"−{dv}" if dv else "0"
+            out.append(f"| {domain} | {dv_str} | {info['source']} |")
+        out.append("")
+        out.append(
+            f"**Certainty of evidence for this outcome:** "
+            f"**{assessment['certainty']}**"
+        )
         return "\n".join(out) + "\n"
 
     # ------------------------------------------------------------------ #

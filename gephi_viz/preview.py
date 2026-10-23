@@ -418,19 +418,53 @@ class PreviewRenderer:
                 "`pip install pyvis`."
             ) from exc
         s = self.settings
+        pos = self.positions()
+        has_positions = bool(pos)
         net = Network(height="800px", width="100%",
                       bgcolor=s.background_color, font_color=s.font_color,
                       notebook=False, directed=self.graph.is_directed())
-        # Build positions list for pyvis (it has its own layout, but we honour
-        # the supplied positions if available).
+        # Honour the computed layout: feed the positions into pyvis/vis
+        # (the previous implementation computed them and then discarded
+        # them). vis-network's y-axis points DOWN, so y is negated, and
+        # the coordinates are scaled to a ~pixel-sized canvas. When
+        # positions are supplied, physics is disabled so the layout
+        # actually sticks.
+        xs = [p[0] for p in pos.values()] or [0.0]
+        ys = [p[1] for p in pos.values()] or [0.0]
+        x_span = (max(xs) - min(xs)) or 1.0
+        y_span = (max(ys) - min(ys)) or 1.0
         sizes = self._node_sizes()
         colors = self._node_colors()
         labels = self._node_labels()
         for n in self.graph.nodes():
             data = self.graph.nodes[n]
             label = labels.get(n) or data.get("label") or data.get("title") or str(n)
-            net.add_node(str(n), label=str(label), size=float(sizes.get(n, 10)),
-                         color=colors.get(n, "#1f77b4"))
+            kwargs: Dict[str, Any] = dict(
+                label=str(label), size=float(sizes.get(n, 10)),
+                color=colors.get(n, "#1f77b4"),
+            )
+            if has_positions and n in pos:
+                x, y = pos[n]
+                # Map to an ~800×600 pixel canvas centred on the origin
+                # (vis-network uses free pixel coordinates, y pointing down).
+                px = (x - min(xs)) / x_span * 800.0 - 400.0
+                py = -((y - min(ys)) / y_span * 600.0 - 300.0)
+                kwargs.update({
+                    "x": float(px),
+                    "y": float(py),
+                    "physics": False,
+                })
+            try:
+                net.add_node(str(n), **kwargs)
+            except TypeError:  # pragma: no cover - older pyvis
+                net.add_node(str(n), label=str(label),
+                             size=float(sizes.get(n, 10)),
+                             color=colors.get(n, "#1f77b4"))
+        if has_positions:
+            try:
+                net.toggle_physics(False)
+            except Exception:  # pragma: no cover - older pyvis
+                pass
         ewidths = self._edge_widths()
         ecolors = self._edge_colors()
         for u, v in self.graph.edges():
@@ -614,7 +648,8 @@ class PreviewRenderer:
             legend_html = "".join(legend_parts)
         style_obj = (
             "{'background-color':'data(color)',"
-            "'width':20,'height':20,'label':'data(label)',"
+            "'width':'data(size)','height':'data(size)',"
+            "'label':'data(label)',"
             "'font-size':" + json.dumps(s.font_size) + ","
             "'color':" + json.dumps(s.font_color) + "}"
         )

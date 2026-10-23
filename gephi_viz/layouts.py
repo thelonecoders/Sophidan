@@ -131,10 +131,15 @@ class _BHNode:
         if self.is_leaf:
             # Subdivide: move existing point into a child, then re-insert.
             existing_x, existing_y, existing_node = self.com_x, self.com_y, self.node
+            # Capture the existing point's mass BEFORE it can be confused
+            # with the incoming point's mass (the old code inserted the
+            # existing point with the NEW mass, corrupting Barnes-Hut
+            # repulsion whenever masses differ).
+            existing_mass = self.mass
             self.node = None
             self.is_leaf = False
             self.children = [None, None, None, None]
-            self._insert_child(existing_x, existing_y, mass, existing_node, depth + 1)
+            self._insert_child(existing_x, existing_y, existing_mass, existing_node, depth + 1)
             self._insert_child(x, y, mass, node, depth + 1)
             # Update aggregate center of mass / mass.
             total = self.mass + mass
@@ -297,6 +302,9 @@ class ForceAtlas2(LayoutAlgorithm):
         self.barnes_hut_subregion_size = int(barnes_hut_subregion_size)
         self.adjust_sizes = bool(adjust_sizes)
         self.timeout = float(timeout)
+        # Per-run adaptive state (reset at the start of every apply()).
+        self._last_fmag: Optional[np.ndarray] = None
+        self._t0: Optional[float] = None
 
     def apply(self, graph: Any, positions: Optional[PositionMap] = None,
               iterations: int = 100) -> PositionMap:
@@ -358,6 +366,10 @@ class ForceAtlas2(LayoutAlgorithm):
         # Speed / swing scheduling (Gephi-style auto-tuning).
         speed = 1.0
         swing = 1.0
+        # Reset per-run adaptive state so successive apply() calls do
+        # not inherit the previous run's force magnitudes / timers.
+        self._last_fmag = None
+        self._t0 = None
 
         for it in range(iterations):
             # ---- Repulsion ----
@@ -428,11 +440,11 @@ class ForceAtlas2(LayoutAlgorithm):
             fmag = np.sqrt(fx ** 2 + fy ** 2) + 1e-12
             # Swing = how much force direction changed since last step (approx).
             # We approximate swing by 1.0 (no history) when no previous force.
-            if it == 0:
+            if self._last_fmag is None:
                 swing_arr = fmag
             else:
-                swing_arr = np.abs(fmag - getattr(self, "_last_fmag", fmag))
-                setattr(self, "_last_fmag", fmag)
+                swing_arr = np.abs(fmag - self._last_fmag)
+            self._last_fmag = fmag
             # Per-node displacement cap.
             disp = fmag * speed / (1.0 + np.sqrt(swing_arr) * speed)
             # Cap displacement to a sane fraction of the layout span.
@@ -454,7 +466,7 @@ class ForceAtlas2(LayoutAlgorithm):
             if self.timeout > 0 and it % 10 == 9:
                 # Soft timeout check; cheap because we only check every 10 iters.
                 import time
-                if not hasattr(self, "_t0"):
+                if self._t0 is None:
                     self._t0 = time.time()
                 elif time.time() - self._t0 > self.timeout * iterations:
                     logger.debug("ForceAtlas2 hit soft timeout at iter %d", it)
@@ -558,9 +570,15 @@ class OpenOrd(LayoutAlgorithm):
             step = T * rng.uniform(-1.0, 1.0, size=2)
             new_x = old_x + step[0]
             new_y = old_y + step[1]
-            # Energy: sum over neighbours of -w * dist (we want neighbours close).
-            e_old = energy_w * self._energy(old_x, old_y, adj[i], weights[i])
-            e_new = energy_w * self._energy(new_x, new_y, adj[i], weights[i])
+            # Energy: real OpenOrd attraction term — the weighted sum of
+            # distances from the candidate position to the node's
+            # neighbours at their CURRENT positions (the old code summed
+            # the weights only, which is position-independent and cancels
+            # in the acceptance test → the layout had no neighbour
+            # attraction at all).
+            nbr_pos = [(float(xy[j, 0]), float(xy[j, 1])) for j in adj[i]]
+            e_old = energy_w * self._energy(old_x, old_y, adj[i], weights[i], positions=nbr_pos)
+            e_new = energy_w * self._energy(new_x, new_y, adj[i], weights[i], positions=nbr_pos)
             # Density penalty: penalise dense cells.
             gox, goy = _grid_idx(old_x, old_y)
             gnx, gny = _grid_idx(new_x, new_y)
@@ -587,16 +605,23 @@ class OpenOrd(LayoutAlgorithm):
     @staticmethod
     def _energy(x: float, y: float, neighbours: Sequence[int],
                 weights: Sequence[float], positions=None) -> float:
-        """Sum of weighted distances from ``(x, y)`` to each neighbour.
+        """OpenOrd attraction energy at ``(x, y)``.
 
-        Currently neighbours' coordinates are *not* used (we only count
-        degrees), because OpenOrd's real cost is dominated by the edge
-        count; the deterministic density grid provides the spatial signal.
+        Real spatial term: ``Σ_j w_j · |(x,y) − p_j|`` over the node's
+        neighbours at their current positions ``p_j`` (lower = tighter
+        neighbourhood → the acceptance test now actually pulls linked
+        nodes together, as in Martin et al. 2011). ``positions`` is the
+        list of neighbour coordinates aligned 1:1 with ``neighbours`` /
+        ``weights``. When unavailable the term is 0 (the density grid
+        alone drives the layout).
         """
-        # The expensive neighbour-distance sum is approximated by the total
-        # weight: identical at old and new positions, so it cancels in the
-        # acceptance test. We keep the term so the API is explicit.
-        return float(sum(weights))
+        if positions is None or not neighbours:
+            return 0.0
+        energy = 0.0
+        for p, w in zip(positions, weights):
+            px, py = p
+            energy += float(w) * math.hypot(x - px, y - py)
+        return energy
 
     def _phase_params(self, t: float, T0: float) -> Tuple[float, float, float]:
         """Return (temperature, energy_weight, density_weight) for phase ``t``.
@@ -824,8 +849,14 @@ class YifanHu(LayoutAlgorithm):
                 attr_x[iv] += fa * dx / d
                 attr_y[iv] += fa * dy / d
 
-            fx = rep_x - attr_x
-            fy = rep_y - attr_y
+            fx = rep_x + attr_x
+            fy = rep_y + attr_y
+            # Attraction was already computed SIGNED (negative on the
+            # source endpoint, positive on the target endpoint — both
+            # pointing toward the other node), so the total force is the
+            # SUM of repulsion and attraction. The old `rep - attr`
+            # flipped the attraction sign and made connected pairs
+            # diverge (2-node graph d=1 → 36.7 after 30 iterations).
             fmag = np.sqrt(fx * fx + fy * fy) + 1e-9
             step = np.minimum(fmag, T)
             xy[:, 0] += fx / fmag * step

@@ -29,6 +29,66 @@ __all__ = ["GraphIO"]
 logger = logging.getLogger(__name__)
 
 
+def _sanitize_attrs(attrs: Dict[str, Any]) -> Dict[str, Any]:
+    """Make node/edge/graph attributes safe for file writers.
+
+    GraphML/GEXF/GML writers raise ``TypeError`` on ``None`` values and
+    on list/dict attributes (which the repo's own graphs carry: e.g.
+    ``authors``, ``papers``, ``years``, ``affiliations``, and
+    ``year=None``/``doi=None`` on sparse nodes). The sanitizer:
+
+    * drops ``None`` values entirely,
+    * joins lists/tuples/sets/ndarrays into ``"; "``-separated strings,
+    * JSON-encodes dicts,
+    * unwraps numpy scalars to Python scalars,
+    * coerces anything else to ``str`` (best effort).
+    """
+    import numpy as _np
+    out: Dict[str, Any] = {}
+    for key, value in dict(attrs).items():
+        if value is None:
+            continue
+        if isinstance(value, bool):
+            out[key] = value
+        elif isinstance(value, (int, float, str)):
+            out[key] = value
+        elif isinstance(value, _np.generic):
+            out[key] = value.item()
+        elif isinstance(value, (list, tuple, set, frozenset)):
+            out[key] = "; ".join(str(x) for x in value)
+        elif isinstance(value, _np.ndarray):
+            out[key] = "; ".join(str(x) for x in value.tolist())
+        elif isinstance(value, dict):
+            try:
+                out[key] = json.dumps(value, default=str, sort_keys=True)
+            except Exception:  # pragma: no cover - defensive
+                out[key] = str(value)
+        else:
+            try:
+                out[key] = str(value)
+            except Exception:  # pragma: no cover - defensive
+                continue
+    return out
+
+
+def _sanitized_copy(g: Any) -> Any:
+    """Return a shallow graph copy with writer-safe attributes.
+
+    The input graph is never mutated.
+    """
+    import networkx as nx
+    if g.is_directed():
+        H = nx.MultiDiGraph() if g.is_multigraph() else nx.DiGraph()
+    else:
+        H = nx.MultiGraph() if g.is_multigraph() else nx.Graph()
+    H.graph.update(_sanitize_attrs(getattr(g, "graph", {})))
+    for n, data in g.nodes(data=True):
+        H.add_node(n, **_sanitize_attrs(data))
+    for u, v, data in g.edges(data=True):
+        H.add_edge(u, v, **_sanitize_attrs(data))
+    return H
+
+
 class GraphIO:
     """Stateless wrappers for every common graph-file format."""
 
@@ -57,6 +117,9 @@ class GraphIO:
     def write_graphml(g: Any, path: str) -> None:
         """Write ``g`` to ``path`` in GraphML format.
 
+        Attributes are sanitized first (GraphML cannot encode ``None``
+        or list values — the repo's own graphs carry both).
+
         Args:
             g: A networkx graph.
             path: Destination path.
@@ -64,7 +127,7 @@ class GraphIO:
         import networkx as nx
 
         try:
-            nx.write_graphml(g, path)
+            nx.write_graphml(_sanitized_copy(g), path)
             logger.debug("Wrote GraphML to %s (%d nodes).", path, g.number_of_nodes())
         except Exception as exc:  # pragma: no cover - defensive
             logger.error("write_graphml(%s) failed: %s", path, exc)
@@ -86,11 +149,15 @@ class GraphIO:
 
     @staticmethod
     def write_gexf(g: Any, path: str) -> None:
-        """Write ``g`` to ``path`` in GEXF format."""
+        """Write ``g`` to ``path`` in GEXF format.
+
+        Attributes are sanitized first (GEXF cannot encode ``None`` or
+        list values).
+        """
         import networkx as nx
 
         try:
-            nx.write_gexf(g, path)
+            nx.write_gexf(_sanitized_copy(g), path)
             logger.debug("Wrote GEXF to %s (%d nodes).", path, g.number_of_nodes())
         except Exception as exc:  # pragma: no cover - defensive
             logger.error("write_gexf(%s) failed: %s", path, exc)
@@ -112,11 +179,15 @@ class GraphIO:
 
     @staticmethod
     def write_gml(g: Any, path: str) -> None:
-        """Write ``g`` to ``path`` in GML format."""
+        """Write ``g`` to ``path`` in GML format.
+
+        Attributes are sanitized first (GML cannot encode ``None`` or
+        list values).
+        """
         import networkx as nx
 
         try:
-            nx.write_gml(g, path)
+            nx.write_gml(_sanitized_copy(g), path)
             logger.debug("Wrote GML to %s (%d nodes).", path, g.number_of_nodes())
         except Exception as exc:  # pragma: no cover - defensive
             logger.error("write_gml(%s) failed: %s", path, exc)
@@ -257,22 +328,43 @@ class GraphIO:
     def to_cytoscape(g: Any) -> Dict[str, Any]:
         """Serialize ``g`` to a Cytoscape Web JSON dict.
 
+        Built explicitly (not via ``nx.cytoscape_data``) so attributes
+        are sanitized the same way as the file writers: ``None`` values
+        are dropped, lists/dicts are stringified, numpy scalars are
+        unwrapped. The output is always ``json.dumps``-safe.
+
         Args:
             g: A networkx graph.
 
         Returns:
-            ``{"data": [...], "directed": bool, "multigraph": bool}``
-            with ``data`` a list of ``{"data": {...}}`` entries — the
-            canonical Cytoscape.js elements shape.
+            ``{"data": {...}, "directed": bool, "multigraph": bool,
+            "elements": {"nodes": [...], "edges": [...]}}`` where each
+            element is ``{"data": {...}}`` — the canonical Cytoscape.js
+            elements shape (same top-level keys as
+            ``nx.cytoscape_data``).
         """
-        import networkx as nx
-
-        try:
-            data = nx.cytoscape_data(g)
-            return data
-        except Exception as exc:  # pragma: no cover - defensive
-            logger.error("to_cytoscape failed: %s", exc)
-            raise
+        nodes = []
+        for n, data in g.nodes(data=True):
+            entry = {"id": str(n)}
+            entry.update(_sanitize_attrs(data))
+            nodes.append({"data": entry})
+        edges = []
+        for i, (u, v, data) in enumerate(g.edges(data=True)):
+            entry = {
+                "id": str(data.get("id") or f"e{i}"),
+                "source": str(u),
+                "target": str(v),
+            }
+            payload = _sanitize_attrs(data)
+            payload.pop("id", None)
+            entry.update(payload)
+            edges.append({"data": entry})
+        return {
+            "data": _sanitize_attrs(getattr(g, "graph", {})),
+            "directed": bool(g.is_directed()),
+            "multigraph": bool(g.is_multigraph()),
+            "elements": {"nodes": nodes, "edges": edges},
+        }
 
     @staticmethod
     def from_cytoscape(d: Dict[str, Any]) -> Any:
@@ -307,9 +399,9 @@ class GraphIO:
         try:
             for n, data in g.nodes(data=True):
                 # pyvis expects str node ids; coerce non-str to str.
-                net.add_node(str(n), label=str(n), **dict(data))
+                net.add_node(str(n), label=str(n), **_sanitize_attrs(data))
             for u, v, data in g.edges(data=True):
-                net.add_edge(str(u), str(v), **dict(data))
+                net.add_edge(str(u), str(v), **_sanitize_attrs(data))
         except Exception as exc:  # pragma: no cover - defensive
             logger.error("to_pyvis population failed: %s", exc)
             raise
@@ -340,14 +432,18 @@ class GraphIO:
         """
         nodes = []
         for n, data in g.nodes(data=True):
-            entry = {"id": str(n), **{k: v for k, v in dict(data).items()}}
+            entry = {"id": str(n)}
+            entry.update(_sanitize_attrs(data))
             nodes.append(entry)
         links = []
         for u, v, data in g.edges(data=True):
             entry = {
                 "source": str(u),
                 "target": str(v),
-                **{k: v for k, v in dict(data).items()},
             }
+            payload = _sanitize_attrs(data)
+            payload.pop("source", None)
+            payload.pop("target", None)
+            entry.update(payload)
             links.append(entry)
         return {"nodes": nodes, "links": links}

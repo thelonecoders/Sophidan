@@ -43,14 +43,10 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 
 logger = logging.getLogger(__name__)
-
-# Silence noisy sklearn / numpy warnings that arise from degenerate inputs
-# (NMF non-convergence on tiny corpora, PCA divide-by-zero on constant vectors).
-# These do not affect correctness — the algorithm falls back gracefully.
-warnings.filterwarnings("ignore", category=RuntimeWarning)
-warnings.filterwarnings("ignore", category=UserWarning)
-warnings.filterwarnings("ignore", message=".*Maximum number of iterations.*")
-warnings.filterwarnings("ignore", message=".*invalid value encountered in divide.*")
+#
+# NOTE: no module-level ``warnings.filterwarnings`` — global filters leak
+# into user code. Degenerate-input warnings from sklearn are suppressed
+# locally at the call sites instead.
 
 
 # ---------------------------------------------------------------------------
@@ -73,6 +69,9 @@ class FrontierRegion:
             means ~45% year-over-year growth in paper count).
         neighbor_topics: Indices of nearby dense topics.
         keywords: Top keywords characterizing the frontier.
+        degraded: ``True`` when the region was computed on random fallback
+            embeddings (no real embedding model available) — coordinates
+            and novelty are placeholders in that case.
     """
 
     id: str = ""
@@ -82,6 +81,7 @@ class FrontierRegion:
     growth_rate: float = 0.0
     neighbor_topics: List[int] = field(default_factory=list)
     keywords: List[str] = field(default_factory=list)
+    degraded: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
         """Return a JSON-serializable representation."""
@@ -198,6 +198,7 @@ class KnowledgeFrontier:
         """
         self.papers: List[Any] = list(papers)
         self.embeddings_model = embeddings_model
+        self.degraded: bool = False
         self._embeddings: Optional[np.ndarray] = None
         self._cluster_labels: Optional[np.ndarray] = None
         self.logger = logger
@@ -216,9 +217,11 @@ class KnowledgeFrontier:
             return self.embeddings_model
         except Exception as exc:  # pragma: no cover - defensive
             self.logger.warning(
-                "Could not construct EmbeddingsModel (%s); using random "
-                "fallback vectors.", exc,
+                "Could not construct EmbeddingsModel (%s); falling back to "
+                "random vectors and marking regions degraded=True.",
+                exc,
             )
+            self.degraded = True
             return _RandomEmbedder(self.DEFAULT_EMBEDDING_DIM)
 
     def _get_embeddings(self) -> np.ndarray:
@@ -230,12 +233,19 @@ class KnowledgeFrontier:
                                          dtype=np.float32)
             return self._embeddings
         embedder = self._get_embedder()
-        texts = [_paper_text(p) or p.title or "empty" for p in self.papers]
+        texts = [
+            _paper_text(p)
+            or (p.get("title") if isinstance(p, dict) else getattr(p, "title", None))
+            or "empty"
+            for p in self.papers
+        ]
         try:
             mat = embedder.encode(texts)
         except Exception as exc:
             self.logger.warning(
-                "Embedder.encode failed (%s); using random fallback.", exc)
+                "Embedder.encode failed (%s); falling back to random vectors "
+                "and marking regions degraded=True.", exc)
+            self.degraded = True
             mat = _RandomEmbedder(self.DEFAULT_EMBEDDING_DIM).encode(texts)
         mat = np.asarray(mat, dtype=np.float32)
         if mat.ndim == 1:
@@ -317,28 +327,37 @@ class KnowledgeFrontier:
         emb = self._get_embeddings()
         n_clusters = max(2, min(n_clusters, len(self.papers) - 1))
 
-        # k-NN density: mean distance to the 5 nearest neighbors.
+        # Sparseness measure: mean cosine DISTANCE to the 5 nearest
+        # neighbours (larger = sparser). NOTE: the previous implementation
+        # selected the LOWEST-distance (i.e. densest) papers as "boundary"
+        # candidates while its docstring claimed to flag the sparsest — a
+        # full inversion. Boundary candidates are now the sparsest papers,
+        # consistent with the frontier concept.
         k = min(5, len(self.papers) - 1)
-        dists = pairwise_distances(emb, emb, metric="cosine")
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")  # degenerate-input warnings
+            dists = pairwise_distances(emb, emb, metric="cosine")
         np.fill_diagonal(dists, np.inf)
         knn = np.sort(dists, axis=1)[:, :k]
-        density = knn.mean(axis=1)
-        # Higher density -> lower value (closer neighbors).
-        threshold = np.quantile(density, boundary_quantile)
-        boundary_idx = np.where(density <= threshold)[0]
+        sparse_dist = knn.mean(axis=1)
+        # Boundary candidates: papers in the sparsest quantile.
+        upper_threshold = np.quantile(sparse_dist, 1.0 - boundary_quantile)
+        boundary_idx = np.where(sparse_dist >= upper_threshold)[0]
         if len(boundary_idx) < min_papers:
-            # Invert: take highest-density papers if no sparse boundary.
-            order = np.argsort(-density)
-            boundary_idx = order[:max(min_papers, len(order) // 5)]
+            # Fallback: the sparsest papers by rank.
+            order = np.argsort(-sparse_dist)
+            boundary_idx = order[: max(min_papers, len(order) // 5)]
 
         # Cluster the dense regions to find "established" centroids.
         dense_idx = np.setdiff1d(np.arange(len(self.papers)), boundary_idx)
         if len(dense_idx) < n_clusters:
             dense_idx = np.arange(len(self.papers))
         try:
-            km = KMeans(n_clusters=min(n_clusters, len(dense_idx)),
-                         n_init=4, random_state=42)
-            km.fit(emb[dense_idx])
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                km = KMeans(n_clusters=min(n_clusters, len(dense_idx)),
+                            n_init=4, random_state=42)
+                km.fit(emb[dense_idx])
             centroids = km.cluster_centers_
         except Exception as exc:  # pragma: no cover - defensive
             self.logger.warning("KMeans failed: %s", exc)
@@ -347,14 +366,17 @@ class KnowledgeFrontier:
         # Micro-cluster the boundary papers.
         n_sub = max(2, min(len(boundary_idx) // max(1, min_papers), 8))
         try:
-            agg = AgglomerativeClustering(
-                n_clusters=n_sub, metric="cosine", linkage="average",
-            )
-            sub_labels = agg.fit_predict(emb[boundary_idx])
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                agg = AgglomerativeClustering(
+                    n_clusters=n_sub, metric="cosine", linkage="average",
+                )
+                sub_labels = agg.fit_predict(emb[boundary_idx])
         except Exception as exc:
             self.logger.warning("Agglomerative clustering failed: %s", exc)
             return []
 
+        global_median = float(np.median(sparse_dist))
         regions: List[FrontierRegion] = []
         for sub_id in range(n_sub):
             mask = sub_labels == sub_id
@@ -365,11 +387,19 @@ class KnowledgeFrontier:
                 continue
             centroid = emb[idx].mean(axis=0)
             centroid = _normalize(centroid)
-            # Novelty: inversely proportional to mean density of papers
-            # in this micro-cluster (sparser = more novel).
-            local_density = density[idx].mean()
-            global_mean = float(density.mean()) or 1.0
-            novelty = float(min(1.0, max(0.0, local_density / global_mean)))
+            # Novelty: distance-based score consistent with the docstring
+            # ("sparser = more novel"). local sparseness relative to the
+            # corpus median: at the median -> 0.5, twice as sparse -> 1.0,
+            # denser than median -> < 0.5. (The old formula
+            # ``local / global_mean`` clipped to [0, 1] saturated at 1.0
+            # for exactly the papers the method was supposed to rank
+            # amongst itself.)
+            local_sparseness = float(sparse_dist[idx].mean())
+            if global_median > 0:
+                novelty = float(min(1.0, max(0.0,
+                    local_sparseness / (2.0 * global_median))))
+            else:
+                novelty = 0.5
             # Growth rate: fraction of papers in last 3 years.
             recent_frac = self._recent_fraction(idx.tolist())
             growth = float(recent_frac)
@@ -386,6 +416,7 @@ class KnowledgeFrontier:
                 growth_rate=growth,
                 neighbor_topics=neighbor_topics,
                 keywords=kws,
+                degraded=self.degraded,
             ))
         return regions
 
@@ -427,7 +458,9 @@ class KnowledgeFrontier:
         n_topics = max(2, min(n_topics, max(2, len(self.papers) // 5)))
         try:
             tm = TopicModeler(method=method, n_top_words=8)
-            topic_model = tm.fit(self.papers, num_topics=n_topics)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")  # NMF non-convergence on tiny corpora
+                topic_model = tm.fit(self.papers, num_topics=n_topics)
         except Exception as exc:  # pragma: no cover - defensive
             self.logger.warning("Topic model fit failed (%s).", exc)
             return []
@@ -476,6 +509,7 @@ class KnowledgeFrontier:
                 growth_rate=growth,
                 neighbor_topics=[],
                 keywords=kws,
+                degraded=self.degraded,
             ))
         return regions
 
@@ -491,14 +525,19 @@ class KnowledgeFrontier:
     ) -> List[FrontierRegion]:
         """Identify frontier papers by citation acceleration.
 
-        For each year ``y`` and each paper published in year ``y``, we
-        compute the *citation acceleration* — the second difference of
-        the paper's cumulative citation curve (approximated by a ramp
-        since publication year, as in
-        :class:`innovation.citation_bursts.CitationBurstDetector`).
+        For each recent paper we estimate **citation acceleration**: the
+        mean second difference of its per-year citation curve. When the
+        paper provides a real per-year citation history
+        (``citations_by_year`` / ``citation_count_by_year`` or the same
+        keys in ``raw``), the second difference is computed from that real
+        curve. When only a cumulative total exists, an *approximation* is
+        used — ``citations_count / age²`` — which is a coarse proxy for
+        the second difference of a linear ramp, NOT a measured
+        acceleration; treat those scores as indicative only.
+
         Papers with high positive acceleration signal an emerging
-        frontier; we group them by keyword co-occurrence to form
-        frontier regions.
+        frontier; we group them by keyword co-occurrence to form frontier
+        regions.
 
         Args:
             recent_years: Only consider papers published in the last
@@ -522,15 +561,31 @@ class KnowledgeFrontier:
         if len(recent_papers) < min_papers_per_year:
             return []
 
-        # Acceleration: proxy = citations_count / years_since_publication.
+        try:
+            from innovation.citation_bursts import _paper_yearly_citations
+        except Exception:  # noqa: BLE001 - citation_bursts is optional
+            _paper_yearly_citations = None
+
+        # Acceleration: real second difference of the yearly curve when
+        # per-year history exists; ``citations / age^2`` proxy otherwise.
         accels: List[Tuple[float, int]] = []
         for i, p in enumerate(recent_papers):
             y = _safe_year(p)
             if y is None or y > max_year:
                 continue
-            age = max(1, max_year - y + 1)
-            cit = int(getattr(p, "citations_count", 0) or 0)
-            accel = cit / (age * age)  # acceleration proxy
+            accel: Optional[float] = None
+            if _paper_yearly_citations is not None:
+                hist = _paper_yearly_citations(p)
+                if len(hist) >= 3:
+                    series = [hist[y2] for y2 in sorted(hist) if y2 >= y]
+                    if len(series) >= 3:
+                        arr = np.asarray(series, dtype=np.float64)
+                        second_diff = np.diff(arr, n=2)
+                        accel = float(np.mean(second_diff))
+            if accel is None:
+                age = max(1, max_year - y + 1)
+                cit = int(getattr(p, "citations_count", 0) or 0)
+                accel = cit / (age * age)  # APPROXIMATION proxy
             accels.append((accel, i))
         accels.sort(reverse=True)
         top_idx = [i for _, i in accels[:top_n * 3]]
@@ -582,6 +637,7 @@ class KnowledgeFrontier:
                 growth_rate=float(growth),
                 neighbor_topics=[],
                 keywords=[kw],
+                degraded=self.degraded,
             ))
             if len(regions) >= top_n:
                 break

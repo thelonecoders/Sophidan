@@ -25,16 +25,12 @@ from __future__ import annotations
 import logging
 import math
 import re
-import warnings
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
 logger = logging.getLogger(__name__)
-
-warnings.filterwarnings("ignore", category=RuntimeWarning)
-warnings.filterwarnings("ignore", category=UserWarning)
 
 
 # ---------------------------------------------------------------------------
@@ -256,7 +252,16 @@ class ResearchDirectionRecommender:
         papers: Sequence[Any],
         topic: str,
     ) -> List[Dict[str, Any]]:
-        """Detect under-explored sub-areas by keyword co-occurrence analysis."""
+        """Detect under-explored sub-areas by keyword co-occurrence analysis.
+
+        Candidate pairs come from the top-K marginal keyword set, so pairs
+        that have **never** co-occurred (observed == 0) are eligible too —
+        iterating only over observed pairs would silently exclude the most
+        under-explored intersections. Eligibility: ``observed < expected * 0.5``
+        (significantly fewer co-occurrences than chance), subject to a
+        minimum-support guard (``expected >= 0.5`` and both keywords
+        appearing in ≥ 2 papers).
+        """
         from collections import Counter
         if not papers:
             return []
@@ -270,53 +275,60 @@ class ResearchDirectionRecommender:
             for i in range(len(kws)):
                 for j in range(i + 1, len(kws)):
                     pair_counts[(kws[i], kws[j])] += 1
-        if not pair_counts:
+        if not single_counts:
             return []
-        # Find pairs that are RARE given their individual frequencies.
-        # Expected: p(a) * p(b) * N; observed: pair_counts[(a,b)].
         n = len(papers)
+
+        # Candidate pairs: all combinations of the top-K marginal keywords,
+        # so never-co-occurring pairs (observed == 0) are eligible too.
+        top_k = 30
+        marginals = [kw for kw, cnt in single_counts.most_common(top_k) if cnt >= 2]
         gaps: List[Dict[str, Any]] = []
         seen_topics: set = set()
-        for (a, b), obs in pair_counts.most_common():
-            p_a = single_counts[a] / n
-            p_b = single_counts[b] / n
-            expected = p_a * p_b * n
-            # An "under-explored" pair is one with observed < expected * 0.5
-            # (significantly fewer co-occurrences than chance would predict).
-            if expected < 0.5 or obs > expected * 0.5:
-                continue
-            # Gather supporting papers (those with EITHER keyword, ordered
-            # by recency).
-            supp = sorted(
-                [p for p in papers
-                 if a in [str(k).lower() for k in (getattr(p, "keywords", []) or [])]
-                 or b in [str(k).lower() for k in (getattr(p, "keywords", []) or [])]],
-                key=lambda p: -(_safe_year(p) or 0),
-            )[:5]
-            key = f"{a}+{b}"
-            if key in seen_topics:
-                continue
-            seen_topics.add(key)
-            # Novelty: 1 - (observed / expected), clipped to [0, 1].
-            novelty = float(max(0.0, min(1.0, 1.0 - obs / max(expected, 0.5))))
-            # Feasibility: based on availability of supporting papers.
-            feasibility = float(min(1.0, len(supp) / 5.0))
-            title = f"Bridge {a} and {b} in {topic}"
-            motivation = (
-                f"Keywords '{a}' and '{b}' co-occur in only {obs} of "
-                f"{n} papers on '{topic}' ({expected:.1f} expected by chance), "
-                f"suggesting an under-explored intersection."
-            )
-            gaps.append({
-                "title": title,
-                "motivation": motivation,
-                "papers": supp,
-                "keywords": [a, b],
-                "novelty": novelty,
-                "feasibility": feasibility,
-            })
-            if len(gaps) >= 10:
-                break
+        for i in range(len(marginals)):
+            for j in range(i + 1, len(marginals)):
+                a, b = marginals[i], marginals[j]
+                obs = int(pair_counts.get((a, b), 0))
+                p_a = single_counts[a] / n
+                p_b = single_counts[b] / n
+                expected = p_a * p_b * n
+                # Minimum-support guard + "under-explored" test:
+                # observed < expected * 0.5 (zero-observed pairs satisfy
+                # this whenever expected > 0).
+                if expected < 0.5 or obs > expected * 0.5:
+                    continue
+                # Gather supporting papers (those with EITHER keyword,
+                # ordered by recency).
+                supp = sorted(
+                    [p for p in papers
+                     if a in [str(k).lower() for k in (getattr(p, "keywords", []) or [])]
+                     or b in [str(k).lower() for k in (getattr(p, "keywords", []) or [])]],
+                    key=lambda p: -(_safe_year(p) or 0),
+                )[:5]
+                key = f"{a}+{b}"
+                if key in seen_topics:
+                    continue
+                seen_topics.add(key)
+                # Novelty: 1 - (observed / expected), clipped to [0, 1].
+                novelty = float(max(0.0, min(1.0, 1.0 - obs / max(expected, 0.5))))
+                # Feasibility: based on availability of supporting papers.
+                feasibility = float(min(1.0, len(supp) / 5.0))
+                title = f"Bridge {a} and {b} in {topic}"
+                motivation = (
+                    f"Keywords '{a}' and '{b}' co-occur in only {obs} of "
+                    f"{n} papers on '{topic}' ({expected:.1f} expected by chance), "
+                    f"suggesting an under-explored intersection."
+                )
+                gaps.append({
+                    "title": title,
+                    "motivation": motivation,
+                    "papers": supp,
+                    "keywords": [a, b],
+                    "novelty": novelty,
+                    "feasibility": feasibility,
+                })
+                if len(gaps) >= 10:
+                    return gaps
         return gaps
 
     def _build_direction(
@@ -514,9 +526,25 @@ class ResearchDirectionRecommender:
             hist = self._get_attr(fc, "historical_data", None)
             forecast = self._get_attr(fc, "forecast_data", None)
             try:
-                last_hist = float(list(hist.values())[-1]) if hist is not None and len(hist) > 0 else 0.0
-                avg_fc = float(np.mean(list(forecast.values()))) if forecast is not None and len(forecast) > 0 else 0.0
-            except Exception:  # pragma: no cover - defensive
+                # historical_data / forecast_data are pandas Series (or
+                # plain dicts). ``Series.values()`` raised TypeError
+                # ('numpy.ndarray' object is not callable), which silently
+                # zeroed the growth computation — use .iloc[-1] for
+                # Series and .values for dicts.
+                last_hist = 0.0
+                if hist is not None and len(hist) > 0:
+                    if hasattr(hist, "iloc"):
+                        last_hist = float(hist.iloc[-1])
+                    else:
+                        last_hist = float(list(hist.values())[-1])
+                avg_fc = 0.0
+                if forecast is not None and len(forecast) > 0:
+                    if hasattr(forecast, "iloc"):
+                        avg_fc = float(np.mean(np.asarray(forecast.values, dtype=float)))
+                    else:
+                        avg_fc = float(np.mean([float(v) for v in forecast.values()]))
+            except Exception as exc:  # pragma: no cover - defensive
+                self.logger.debug("from_trends: could not read series (%s)", exc)
                 last_hist, avg_fc = 0.0, 0.0
             growth = (avg_fc - last_hist) / max(last_hist, 1.0) if last_hist else 0.0
             title = f"Ride the growth trend of '{topic}'"
@@ -670,7 +698,13 @@ class ResearchDirectionRecommender:
             ax.set_axis_off()
             return fig
         fig, ax = plt.subplots(figsize=figsize, constrained_layout=True)
-        cmap = plt.cm.get_cmap("YlGn")
+        # matplotlib >= 3.9 removed plt.cm.get_cmap; use the module-level
+        # colormap registry (available since 3.6), with a legacy fallback.
+        try:
+            import matplotlib as mpl  # lazy
+            cmap = mpl.colormaps["YlGn"]
+        except Exception:  # noqa: BLE001 - very old matplotlib
+            cmap = plt.get_cmap("YlGn")
         for i, d in enumerate(directions):
             composite = (d.novelty_score + d.feasibility_score) / 2.0
             color = cmap(composite)

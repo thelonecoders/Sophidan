@@ -124,7 +124,9 @@ class ForestPlot:
             weights: Optional per-study weights (used to size the squares).
                 Defaults to inverse-variance weights.
             subgroups: Optional per-study subgroup labels (for subgroup forest).
-            confidence: Confidence level (default 0.95).
+            confidence: Confidence level for the drawn CIs (default 0.95).
+                Study and pooled intervals are re-derived from each effect
+                estimate's SE at this level (analysis scale for RR/OR/HR).
         """
         if not effect_sizes:
             raise ValueError("effect_sizes is empty.")
@@ -222,6 +224,18 @@ class ForestPlot:
         es_type = self.effect_sizes[0].type
         null_value = es_type.null_value
         is_log_metric = es_type.is_log_scale_metric
+        # z-quantile honouring the requested confidence level — recomputed
+        # bounds keep the drawn CIs consistent with ``self.confidence``.
+        from .effect_sizes import EffectSizeCalculator as _ESC  # local alias
+
+        def _ci(es: EffectSize) -> Tuple[Optional[float], Optional[float]]:
+            """Return (lo, hi) at the configured confidence level."""
+            if es.se is not None and es.se > 0 and es.value is not None:
+                try:
+                    return _ESC.confidence_interval(es, self.confidence)
+                except Exception:
+                    pass
+            return es.ci_lower, es.ci_upper
 
         # Compute weights if not supplied.
         if self.weights is None:
@@ -303,8 +317,9 @@ class ForestPlot:
         for es in rows_es:
             if es is None:
                 continue
-            lo = es.ci_lower if es.ci_lower is not None else es.value
-            hi = es.ci_upper if es.ci_upper is not None else es.value
+            lo, hi = _ci(es)
+            lo = lo if lo is not None else es.value
+            hi = hi if hi is not None else es.value
             all_vals.extend([lo, hi])
         if not all_vals:
             all_vals = [null_value - 1, null_value + 1]
@@ -339,9 +354,10 @@ class ForestPlot:
                 transform=ax_label.get_yaxis_transform(),
             )
             # Stats column.
+            lo_b, hi_b = _ci(es)
             ci_str = (
-                f"{es.value:.2f} ({es.ci_lower:.2f}, {es.ci_upper:.2f})"
-                if es.ci_lower is not None and es.ci_upper is not None
+                f"{es.value:.2f} ({lo_b:.2f}, {hi_b:.2f})"
+                if lo_b is not None and hi_b is not None
                 else f"{es.value:.2f}"
             )
             w_str = f"{w:5.1f}%" if cfg["show_weights"] else ""
@@ -351,10 +367,11 @@ class ForestPlot:
                 transform=ax_stats.get_yaxis_transform(),
             )
             # Plot column.
+            lo_b, hi_b = _ci(es)
             if kind in ("study", "diamond"):
-                if es.ci_lower is not None and es.ci_upper is not None:
+                if lo_b is not None and hi_b is not None:
                     ax_plot.plot(
-                        [es.ci_lower, es.ci_upper], [y, y],
+                        [lo_b, hi_b], [y, y],
                         color=cfg["color_study"], linewidth=1.2, zorder=2,
                     )
                 # Marker.
@@ -373,13 +390,13 @@ class ForestPlot:
                 if kind == "diamond":
                     # Draw a diamond at this row as well.
                     self._draw_diamond(
-                        ax_plot, es.value, es.ci_lower, es.ci_upper, y,
+                        ax_plot, es.value, lo_b, hi_b, y,
                         color=cfg["color_pooled"],
                         edge=cfg["diamond_edge"],
                     )
             elif kind == "pooled":
                 self._draw_diamond(
-                    ax_plot, es.value, es.ci_lower, es.ci_upper, y,
+                    ax_plot, es.value, lo_b, hi_b, y,
                     color=cfg["color_pooled"], edge=cfg["diamond_edge"],
                 )
 

@@ -68,12 +68,17 @@ class CommunityDetection:
     @staticmethod
     def greedy_modularity_communities(
         g: Any,
+        weight: Optional[str] = None,
         resolution: float = 1,
     ) -> List[Set[Any]]:
         """Detect communities via the Clauset-Newman-Moore greedy agglomeration.
 
         Args:
             g: Undirected graph.
+            weight: Optional edge-attribute name used as edge strength
+                (passed through to networkx — the previous
+                implementation silently dropped it and always ran the
+                unweighted variant).
             resolution: Modularity resolution parameter.
 
         Returns:
@@ -86,7 +91,9 @@ class CommunityDetection:
         if g.is_directed():
             g = g.to_undirected()
         try:
-            return [set(c) for c in greedy_modularity_communities(g, resolution=resolution)]
+            return [set(c) for c in greedy_modularity_communities(
+                g, weight=weight, resolution=resolution
+            )]
         except Exception as exc:  # pragma: no cover - defensive
             logger.warning("greedy_modularity_communities failed: %s", exc)
             return []

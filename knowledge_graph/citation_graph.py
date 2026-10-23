@@ -340,19 +340,31 @@ class CitationGraph:
     def authority_scores(self) -> Dict[str, float]:
         """HITS authority scores (papers heavily *cited by* hubs).
 
+        The computation is memoised per graph snapshot (nodes + edges
+        fingerprint) so repeated calls — e.g. the web preview path,
+        which draws colors from this before and after layout — do not
+        re-run HITS. The memo is invalidated whenever the graph changes.
+
         Returns:
             ``{paper_id: authority_score}`` dict. Empty dict if the graph
             is empty. If HITS fails to converge, returns uniform scores.
         """
         if self.graph.number_of_nodes() == 0:
             return {}
+        fingerprint = (self.graph.number_of_nodes(),
+                       self.graph.number_of_edges())
+        cached = getattr(self, "_auth_cache", None)
+        if cached is not None and cached[0] == fingerprint:
+            return cached[1]
         try:
             _, authorities = nx.hits(self.graph, max_iter=1000)
-            return dict(authorities)
+            scores = dict(authorities)
         except Exception as exc:  # pragma: no cover - defensive
             self.logger.warning("HITS failed (%s); returning uniform.", exc)
             n = self.graph.number_of_nodes()
-            return {node: 1.0 / n for node in self.graph.nodes()}
+            scores = {node: 1.0 / n for node in self.graph.nodes()}
+        self._auth_cache = (fingerprint, scores)
+        return scores
 
     # ------------------------------------------------------------------
     # Topology queries
@@ -408,14 +420,18 @@ class CitationGraph:
 
         # Layout — spring for small graphs, kamada-kawai for medium.
         n_nodes = G.number_of_nodes()
+        draw_G = G
         if n_nodes <= 200:
             pos = nx.spring_layout(G, seed=42, k=0.6)
         else:
-            # Subsample to keep layout tractable.
+            # Subsample to keep layout tractable. Only the positioned
+            # subgraph (largest WCC) may be DRAWN — nx raises
+            # "Node ... has no position" when the full graph is passed.
             self.logger.info("Large graph (%d nodes) — using largest WCC for layout.", n_nodes)
             wccs = max(nx.weakly_connected_components(G), key=len)
-            sub = G.subgraph(wccs)
+            sub = G.subgraph(wccs).copy()
             pos = nx.kamada_kawai_layout(sub.to_undirected())
+            draw_G = sub
 
         # Authority score → node color.
         auth = self.authority_scores()
@@ -429,17 +445,20 @@ class CitationGraph:
         ]
 
         nodes = nx.draw_networkx_nodes(
-            G, pos, ax=ax, node_color=node_color, node_size=node_size, cmap=plt.cm.viridis, alpha=0.85
+            draw_G, pos, ax=ax, node_color=node_color, node_size=node_size, cmap=plt.cm.viridis, alpha=0.85
         )
-        nx.draw_networkx_edges(G, pos, ax=ax, arrows=True, alpha=0.25, edge_color="#666666")
+        nx.draw_networkx_edges(draw_G, pos, ax=ax, arrows=True, alpha=0.25, edge_color="#666666")
         # Label the top-cited papers only — keeps the plot readable.
         top_ids = {pid for pid, _ in self.top_cited(n=10)}
         if top_ids:
-            labels = {n: (G.nodes[n].get("title") or n)[:25] for n in pos if n in top_ids}
-            nx.draw_networkx_labels(G, pos, labels=labels, ax=ax, font_size=7)
-        ax.set_title(
+            labels = {n: (draw_G.nodes[n].get("title") or n)[:25] for n in pos if n in top_ids}
+            nx.draw_networkx_labels(draw_G, pos, labels=labels, ax=ax, font_size=7)
+        title = (
             f"Citation graph — {G.number_of_nodes()} papers, {G.number_of_edges()} edges"
         )
+        if draw_G is not G:
+            title += f" (showing largest component: {draw_G.number_of_nodes()} nodes)"
+        ax.set_title(title)
         ax.set_axis_off()
         try:
             fig.colorbar(nodes, ax=ax, label="Authority score (normalized)")

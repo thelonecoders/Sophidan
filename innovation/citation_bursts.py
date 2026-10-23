@@ -60,6 +60,10 @@ class Burst:
         duration: ``end_year - start_year + 1`` (integer years).
         total_burst_score: Sum of per-year state levels over the burst
             interval — useful for ranking bursts of different lengths.
+        source: Provenance of the underlying series: ``"data"`` when the
+            burst was computed from real per-year citation history,
+            ``"synthetic-ramp"`` when a caller explicitly opted into a
+            synthesized ramp (``allow_synthetic_ramp=True``).
     """
 
     entity_id: str = ""
@@ -71,6 +75,7 @@ class Burst:
     strength: float = 0.0
     duration: int = 0
     total_burst_score: float = 0.0
+    source: str = "data"
 
     def to_dict(self) -> Dict[str, Any]:
         """Return a JSON-serializable representation."""
@@ -92,12 +97,13 @@ def _kleinberg_bursts(
     """Run Kleinberg's burst-detection automaton on a single series.
 
     Args:
-        counts: Per-time-step non-negative count values.
+        counts: Per-time-step non-negative count values (e.g. citations
+            *received* each year).
         years: Parallel year labels for each step.
         s: Burst-rate scaling parameter (each state's expected rate is
             ``s``× the previous). Defaults to ``2.0`` as in the paper.
         gamma: Transition-cost multiplier (controls how hard it is to
-            drop back to a lower state). Defaults to ``1.0``.
+            *enter* a higher, bursty state). Defaults to ``1.0``.
         threshold: Minimum burst-state level to report a burst (a real
             Kleinberg state index, not a count). Bursts that never
             exceed this level are filtered out.
@@ -136,14 +142,16 @@ def _kleinberg_bursts(
     rates = np.array([base_rate * (s ** lvl) for lvl in levels], dtype=np.float64)
     rates = np.maximum(rates, 1e-9)
 
-    # Transition cost: 0 for staying-or-going-up, positive for dropping.
-    # Following Kleinberg: tau(i, j) = 0 if j >= i else (i - j) * gamma * log(n).
+    # Transition cost (Kleinberg 2002, eq. 5): entering a HIGHER state —
+    # i.e. turning a burst "on" — costs gamma * log(n) per level step;
+    # dropping back down is free. Charging upward transitions (not downward
+    # ones) prevents spurious state flapping and matches the original paper.
     logn = math.log(max(n, 2)) if n > 1 else 1.0
 
     def trans_cost(i: int, j: int) -> float:
-        if j >= i:
-            return 0.0
-        return (i - j) * gamma * logn
+        if j > i:
+            return (j - i) * gamma * logn
+        return 0.0
 
     # Emission cost (negative log-likelihood under Poisson(rates[l])).
     def emit_cost(level: int, count: float) -> float:
@@ -158,10 +166,11 @@ def _kleinberg_bursts(
             return 1e12
 
     # DP forward pass: cost[t][l] = min cost of being in state l at time t.
+    # The stream is PINNED to state 0 at t=0 (the unbursty state), so any
+    # burst must pay its upward transition cost.
     cost = np.full((n, n_levels), np.inf, dtype=np.float64)
     back = np.zeros((n, n_levels), dtype=np.int32)
-    for l in levels:
-        cost[0, l] = emit_cost(l, counts[0])
+    cost[0, 0] = emit_cost(0, counts[0])
     for t in range(1, n):
         for j in levels:
             best_cost = math.inf
@@ -247,6 +256,82 @@ def _make_burst(
 
 
 # ---------------------------------------------------------------------------
+# Per-year citation history extraction
+# ---------------------------------------------------------------------------
+
+
+def _normalize_yearly_series(
+    val: Any, start_year: Optional[int]
+) -> Dict[int, float]:
+    """Normalize a per-year citation history into ``{year: count}``.
+
+    Accepts a ``{year: count}`` mapping (any key type) or an ordered list of
+    annual counts (Semantic Scholar ``citationCountByYear`` style), which is
+    anchored at ``start_year`` when provided. Values are interpreted as
+    citations *received* in each year (per-year counts), matching the
+    upstream API semantics.
+    """
+    out: Dict[int, float] = {}
+    if isinstance(val, dict):
+        for k, v in val.items():
+            try:
+                y = int(str(k).strip()[:4])
+                c = float(v)
+            except (TypeError, ValueError):
+                continue
+            if c >= 0:
+                out[y] = c
+        return out
+    if isinstance(val, (list, tuple)):
+        if start_year is None:
+            return {}
+        try:
+            start = int(start_year)
+        except (TypeError, ValueError):
+            return {}
+        for i, v in enumerate(val):
+            try:
+                c = float(v)
+            except (TypeError, ValueError):
+                continue
+            if c >= 0:
+                out[start + i] = c
+    return out
+
+
+def _paper_yearly_citations(paper: Any) -> Dict[int, float]:
+    """Extract the paper's real per-year citation history, if provided.
+
+    Checks, in order: ``citations_by_year``, ``citation_count_by_year``
+    attributes, then the same keys inside the ``raw`` scraper payload
+    (``citationCountByYear`` is Semantic Scholar's spelling). Returns an
+    empty dict when no real history exists — callers must NOT fabricate a
+    synthetic ramp from the cumulative total by default.
+    """
+    start_year = getattr(paper, "year", None)
+    for attr in ("citations_by_year", "citation_count_by_year"):
+        val = getattr(paper, attr, None)
+        if val:
+            series = _normalize_yearly_series(val, start_year)
+            if series:
+                return series
+    raw = getattr(paper, "raw", None)
+    if isinstance(raw, dict):
+        for key in (
+            "citations_by_year",
+            "citation_count_by_year",
+            "citationCountByYear",
+            "citationsByYear",
+        ):
+            val = raw.get(key)
+            if val:
+                series = _normalize_yearly_series(val, start_year)
+                if series:
+                    return series
+    return {}
+
+
+# ---------------------------------------------------------------------------
 # High-level detector
 # ---------------------------------------------------------------------------
 
@@ -322,24 +407,33 @@ class CitationBurstDetector:
         papers: Sequence[Any],
         time_window: int = 1,
         threshold: float = 2.0,
+        allow_synthetic_ramp: bool = False,
     ) -> List[Burst]:
-        """Detect citation bursts for individual papers.
+        """Detect citation bursts for individual papers from *real* data.
 
-        For each paper we treat its *citation count* (as stored on the
-        :class:`~data_acquisition.base_scraper.Paper` dataclass) as a
-        single annual accumulation and synthesize a per-year citation
-        growth curve from publication year to the latest year present
-        in the corpus. The curve is approximated by distributing the
-        observed citation total across years after the paper's
-        publication year using a monotonically increasing ramp — this
-        is a reasonable proxy when the underlying scraper only returns
-        the *current* citation total (the common case for Semantic
-        Scholar / OpenAlex / Crossref).
+        For each paper we run the automaton on its **per-year citation
+        history** — citations received each year — when the paper provides
+        one (``citations_by_year`` / ``citation_count_by_year`` attributes,
+        or the same keys in the ``raw`` scraper payload such as Semantic
+        Scholar's ``citationCountByYear``). Years without data count as
+        zero.
+
+        Papers that only expose a *cumulative* citation total (the common
+        case for Semantic Scholar / OpenAlex / Crossref list endpoints) are
+        **skipped by default** with a logged note: synthesizing a per-year
+        ramp from a single cumulative number fabricates temporal structure
+        that does not exist in the data and used to make every paper
+        "burst". Callers who explicitly want the legacy behaviour can pass
+        ``allow_synthetic_ramp=True``; bursts produced that way are clearly
+        marked with ``source="synthetic-ramp"``.
 
         Args:
             papers: Sequence of :class:`Paper`-like objects.
             time_window: Bucket size in years (1 = annual).
             threshold: Minimum burst-state level to report.
+            allow_synthetic_ramp: Opt-in to the legacy synthetic linear ramp
+                for papers without real per-year history (results are
+                labelled ``source="synthetic-ramp"``).
 
         Returns:
             List of :class:`Burst` objects, one per paper with a
@@ -348,42 +442,83 @@ class CitationBurstDetector:
         years_axis, _ = self._build_year_axis(papers, time_window)
         if not years_axis:
             return []
-        max_year = max(years_axis)
+        # The analysis window must extend to the newest year covered by the
+        # papers' per-year citation histories (which can be later than the
+        # newest publication year in the corpus).
+        histories: Dict[int, Dict[int, float]] = {}
+        hist_max_year = 0
+        for p in papers:
+            if p.year is None:
+                continue
+            h = _paper_yearly_citations(p)
+            if h:
+                histories[id(p)] = h
+                hist_max_year = max(hist_max_year, max(h.keys()))
+        max_year = max(max(years_axis), hist_max_year)
 
         bursts: List[Burst] = []
+        skipped_no_history = 0
+        synthetic_used = 0
         for p in papers:
-            if p.year is None or not p.citations_count:
+            if p.year is None:
                 continue
             pub_year = self._bucket_year(p.year, time_window)
             if pub_year is None or pub_year > max_year:
                 continue
-            span = max(1, max_year - pub_year + 1)
-            # Monotonic ramp: more recent years accrue more of the
-            # observed citation total.  We use the linear ramp
-            # c_t = total * (t+1) / sum(1..span).  Then take first
-            # differences to get per-year *new* citations.
-            total = float(p.citations_count)
-            weights = np.arange(1, span + 1, dtype=np.float64)
-            weights /= weights.sum()
-            cumulative = total * np.cumsum(weights)
-            counts = np.diff(np.concatenate([[0.0], cumulative]))
-            year_labels = list(range(pub_year, max_year + 1, time_window))
-            # Pad / truncate to align.
-            if len(year_labels) < len(counts):
-                counts = counts[: len(year_labels)]
-            elif len(year_labels) > len(counts):
-                year_labels = year_labels[: len(counts)]
+
+            source = "data"
+            hist = histories.get(id(p))
+            if hist:
+                year_labels = list(range(pub_year, max_year + 1, time_window))
+                counts = [float(hist.get(y, 0.0)) for y in year_labels]
+            elif allow_synthetic_ramp:
+                total = float(p.citations_count or 0)
+                if total <= 0:
+                    continue
+                span = max(1, max_year - pub_year + 1)
+                weights = np.arange(1, span + 1, dtype=np.float64)
+                weights /= weights.sum()
+                cumulative = total * np.cumsum(weights)
+                counts = np.diff(np.concatenate([[0.0], cumulative]))
+                year_labels = list(range(pub_year, max_year + 1, time_window))
+                if len(year_labels) < len(counts):
+                    counts = counts[: len(year_labels)]
+                elif len(year_labels) > len(counts):
+                    year_labels = year_labels[: len(counts)]
+                source = "synthetic-ramp"
+                synthetic_used += 1
+            else:
+                skipped_no_history += 1
+                continue
+
             if len(counts) < 2:
                 continue
             ent_bursts = _kleinberg_bursts(
-                counts.tolist(), year_labels,
+                counts.tolist() if isinstance(counts, np.ndarray) else counts,
+                year_labels,
                 s=self.s, gamma=self.gamma, threshold=threshold,
             )
             for b in ent_bursts:
                 b.entity_id = p.doi or p.title or ""
                 b.entity_name = p.title or b.entity_id
                 b.entity_type = ENTITY_PAPER
+                b.source = source
             bursts.extend(ent_bursts)
+
+        if skipped_no_history:
+            logger.info(
+                "detect_papers: skipped %d paper(s) with no per-year citation "
+                "history (cumulative totals only) — no synthetic ramp was "
+                "fabricated. Pass allow_synthetic_ramp=True to opt in to "
+                "labelled synthetic series.",
+                skipped_no_history,
+            )
+        if synthetic_used:
+            logger.warning(
+                "detect_papers: %d burst(s) derived from explicitly-requested "
+                "synthetic ramps (source='synthetic-ramp').",
+                synthetic_used,
+            )
         return bursts
 
     def detect_authors(
@@ -710,7 +845,13 @@ class CitationBurstDetector:
             key=lambda b: (b.entity_type, b.start_year, -b.duration),
         )
         max_strength = max(b.strength for b in sorted_bursts) or 1.0
-        cmap = plt.cm.get_cmap("YlOrRd")
+        # matplotlib >= 3.9 removed plt.cm.get_cmap; use the module-level
+        # colormap registry (available since 3.6), with a legacy fallback.
+        try:
+            import matplotlib as mpl  # lazy
+            cmap = mpl.colormaps["YlOrRd"]
+        except Exception:  # noqa: BLE001 - very old matplotlib
+            cmap = plt.get_cmap("YlOrRd")
         y_positions = []
         labels = []
         for i, b in enumerate(sorted_bursts):

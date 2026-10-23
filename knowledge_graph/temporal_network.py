@@ -141,6 +141,10 @@ class TemporalNetwork:
         self.graph = nx.Graph()
         self._edge_years = {}
         self._node_years = {}
+        # Nodes that exist only as un-dated citation targets (their own
+        # publication year is unknown). They get graph presence without
+        # fabricated ``first_year`` data.
+        self._node_no_year: set = set()
 
         if mode == "collaboration":
             for paper in papers:
@@ -161,13 +165,16 @@ class TemporalNetwork:
         else:  # citation
             # Build an id index for cited papers that exist in the input set.
             id_index: Dict[str, str] = {}
+            id_to_paper: Dict[str, Any] = {}
             for paper in papers:
                 pid = _paper_id(paper)
                 if pid:
                     id_index[pid] = pid
+                    id_to_paper[pid] = paper
                     doi = _get_attr(paper, "doi")
                     if doi:
                         id_index[str(doi).strip()] = pid
+                        id_to_paper[str(doi).strip()] = paper
             for paper in papers:
                 src = _paper_id(paper)
                 year = _paper_year(paper)
@@ -178,10 +185,21 @@ class TemporalNetwork:
                 for ref in _paper_refs(paper):
                     dst = id_index.get(ref)
                     if dst and dst != src:
-                        # For temporal slicing we use the citing paper's year
-                        # (the moment the edge appeared).
+                        # Node years for the CITED paper come from the
+                        # cited paper's OWN publication year — the old
+                        # code stamped the citing year onto the cited
+                        # node, fabricating a wrong ``first_year``.
+                        # (The EDGE year stays the citing year: that is
+                        # the moment the citation actually appeared.)
+                        cited_paper = id_to_paper.get(ref)
+                        cited_year = _paper_year(cited_paper)
+                        if cited_year is not None:
+                            self._register_node(dst, cited_year)
+                        else:
+                            # Keep the node in the graph (presence), but
+                            # without any fabricated year.
+                            self._node_no_year.add(dst)
                         if year is not None:
-                            self._register_node(dst, year)
                             self._register_edge(src, dst, year)
 
         # Materialize the networkx graph from the registered observations.
@@ -192,6 +210,12 @@ class TemporalNetwork:
                 last_year=max(years),
                 years=sorted(set(years)),
             )
+        # Presence-only nodes (unknown publication year): no first_year.
+        for node in self._node_no_year:
+            if node not in self.graph:
+                self.graph.add_node(
+                    node, first_year=None, last_year=None, years=[]
+                )
         for (u, v), years in self._edge_years.items():
             ys = sorted(set(years))
             self.graph.add_edge(u, v, years=ys, weight=len(ys))

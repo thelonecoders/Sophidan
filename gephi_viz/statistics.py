@@ -168,7 +168,13 @@ class NetworkStatistics:
         return float(total) / float(g.number_of_nodes())
 
     def avg_weighted_degree(self, g: Any) -> float:
-        """Average weighted node degree (sum of edge weights)."""
+        """Average weighted node degree (Gephi parity: ``2·Σw / n``).
+
+        Every edge weight contributes to *both* endpoint's weighted
+        degree (undirected) — matching Gephi's Avg. Weighted Degree —
+        so the per-node average is ``2 × total_edge_weight / n``, not
+        ``Σw / n``.
+        """
         if g is None or g.number_of_nodes() == 0:
             return 0.0
         total = 0.0
@@ -177,7 +183,7 @@ class NetworkStatistics:
                 total += float(data.get("weight", 1.0))
             except (TypeError, ValueError):
                 total += 1.0
-        return float(total) / float(g.number_of_nodes())
+        return 2.0 * float(total) / float(g.number_of_nodes())
 
     def graph_density(self, g: Any) -> float:
         """Edge density (``edges / max_possible_edges``)."""

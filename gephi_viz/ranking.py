@@ -206,12 +206,13 @@ class Ranking:
             cmap: Any matplotlib colormap name (e.g. ``'viridis'``,
                 ``'plasma'``, ``'RdYlBu'``, ``'coolwarm'``).
         """
-        import matplotlib.pyplot as plt  # lazy
+        import matplotlib  # lazy
+        from matplotlib import colormaps as _colormaps  # lazy
         try:
-            cm = plt.get_cmap(cmap)
-        except (ValueError, KeyError):
+            cm = _colormaps[cmap]
+        except KeyError:
             logger.warning("Unknown cmap %r — falling back to 'viridis'.", cmap)
-            cm = plt.get_cmap("viridis")
+            cm = _colormaps["viridis"]
         scoped = {n: self.values[n] for n in graph.nodes() if n in self.values}
         normed = _normalise(scoped, scale="linear", out_min=0.0, out_max=1.0)
         return {n: _rgba_to_hex(cm(t)) for n, t in normed.items()}
@@ -237,11 +238,12 @@ class Ranking:
 
     def to_edge_colors(self, graph: Any, cmap: str = "viridis") -> Dict[Tuple[Any, Any], str]:
         """Project the ranking to per-edge hex colours via a matplotlib colormap."""
-        import matplotlib.pyplot as plt  # lazy
+        from matplotlib import colormaps as _colormaps  # lazy
         try:
-            cm = plt.get_cmap(cmap)
-        except (ValueError, KeyError):
-            cm = plt.get_cmap("viridis")
+            cm = _colormaps[cmap]
+        except KeyError:
+            logger.debug("Unknown cmap %r — falling back to 'viridis'.", cmap)
+            cm = _colormaps["viridis"]
         edge_vals: Dict[Tuple[Any, Any], float] = {}
         for u, v in graph.edges():
             vu = self.values.get(u, 0.0)

@@ -90,15 +90,24 @@ class NMAResult:
         relative_effects: DataFrame (rows = treatment_b, cols = treatment_a)
             of pooled log-scale relative effects.
         ranking: Dict[treatment, List[float]] — P(rank = k) for k = 1..N.
-        inconsistency: Design-by-treatment inconsistency statistic
-            (Cochran's Q for inconsistency).
-        AIC: Akaike information criterion of the consistency model.
-        BIC: Bayesian information criterion of the consistency model.
+        inconsistency: Loop-inconsistency statistic (Cochran's Q over the
+            independent loops; 0 when the network has no closed loops).
+        inconsistency_df: Degrees of freedom for the inconsistency test
+            (number of independent loops tested).
+        inconsistency_p: Upper-tail p-value of the inconsistency Q.
+        inconsistency_tests: Per-loop / per-comparison direct-vs-indirect
+            tests used to build the aggregate statistic.
+        AIC: Akaike information criterion of the fitted model (Gaussian
+            log-likelihood with the comparison SEs as known variances).
+        BIC: Bayesian information criterion (same likelihood scale).
     """
 
     relative_effects: object = None  # pandas.DataFrame
     ranking: Dict[str, List[float]] = field(default_factory=dict)
     inconsistency: float = 0.0
+    inconsistency_df: int = 0
+    inconsistency_p: float = 1.0
+    inconsistency_tests: List[InconsistencyTest] = field(default_factory=list)
     AIC: float = 0.0
     BIC: float = 0.0
 
@@ -115,6 +124,12 @@ class NMAResult:
             "relative_effects": re_dict,
             "ranking": dict(self.ranking),
             "inconsistency": float(self.inconsistency),
+            "inconsistency_df": int(self.inconsistency_df),
+            "inconsistency_p": float(self.inconsistency_p),
+            "inconsistency_tests": [
+                t.__dict__ if hasattr(t, "__dict__") else str(t)
+                for t in self.inconsistency_tests
+            ],
             "AIC": float(self.AIC),
             "BIC": float(self.BIC),
         }
@@ -317,13 +332,24 @@ class NetworkMetaAnalysis:
         se_cols = [c for c in df.columns if c.endswith("_se")]
         relative_effects = df[value_cols].copy()
 
-        # Residual sum of squares for AIC/BIC:
+        # Residual sum of squares & information criteria on a proper
+        # likelihood scale. The comparison SEs are treated as *known*
+        # variances (standard frequentist NMA), so the exact Gaussian
+        # log-likelihood is
+        #   logL = -0.5 * [ Σ_i w_i (y_i - ŷ_i)² + Σ_i log(2π se_i²) ]
+        # and AIC/BIC follow as -2·logL + penalty. (The previous "AIC =
+        # RSS + 2k" was not on any likelihood scale.)
         residuals = y - X @ beta
         RSS = float(np.sum(w * residuals ** 2))
         k_params = len(non_ref)
         n_obs = len(y)
-        AIC = RSS + 2.0 * k_params
-        BIC = RSS + math.log(n_obs if n_obs > 0 else 1) * k_params
+        se_arr = np.array([c.se for c in self.comparisons], dtype=float)
+        se_arr = np.where(np.isfinite(se_arr) & (se_arr > 0), se_arr, 1.0)
+        log2pi = math.log(2.0 * math.pi)
+        loglik = -0.5 * (RSS + float(np.sum(np.log(2.0 * math.pi * se_arr ** 2))))
+        AIC = -2.0 * loglik + 2.0 * k_params
+        BIC = -2.0 * loglik + math.log(max(n_obs, 1)) * k_params
+        del log2pi  # kept for readability of the formula above
 
         # Ranking via SUCRA — bootstrap-free: rank by coef (higher = better
         # if outcome is "good" → use sign = +1; assumes higher log-effect
@@ -341,59 +367,103 @@ class NetworkMetaAnalysis:
     def _rank_probability_from_coef(
         self, coef: Dict[str, float], cov: np.ndarray
     ) -> Dict[str, List[float]]:
-        """Compute P(rank = k) for each treatment using multivariate normal.
+        """Compute P(rank = k) for each treatment (input to SUCRA).
 
         Uses a Monte-Carlo simulation of ``n_sim`` draws from the
         multivariate-normal distribution of the treatment coefficients
         and counts how often each treatment ends up at rank k.
+
+        NOTE: the previous implementation gated the whole simulation on
+        ``from scipy.stats import mvn`` — a module that was REMOVED in
+        scipy ≥ 1.11 (and was never actually used by this code). On
+        modern scipy that import silently degraded every ranking to the
+        deterministic point-estimate ranks. The simulation only needs
+        numpy; the deterministic ranking is now used solely as a
+        fallback when numpy is missing or the covariance is unusable.
         """
+        n_treat = len(self.treatments)
         try:
             import numpy as np  # type: ignore
-            from scipy.stats import mvn  # type: ignore  # noqa: F401
         except Exception:
-            # Fallback: ranking by point estimate (deterministic).
-            ordered = sorted(coef.items(), key=lambda kv: kv[1], reverse=True)
-            ranking = {}
-            for rank, (t, _) in enumerate(ordered, start=1):
-                ranking[t] = [0.0] * len(self.treatments)
-                ranking[t][rank - 1] = 1.0
-            return ranking
+            return self._deterministic_ranking(coef)
 
-        # Monte Carlo simulation.
         order = self.treatments
-        beta_vec = np.array([coef[t] for t in order])
-        # Remove reference (zero variance).
+        beta_vec = np.array([coef.get(t, 0.0) for t in order], dtype=float)
         non_ref_mask = np.array([t != self.reference for t in order])
         beta_nonref = beta_vec[non_ref_mask]
-        cov_nonref = cov[np.ix_(non_ref_mask, non_ref_mask)]
+        cov_nonref = np.asarray(cov)[np.ix_(non_ref_mask, non_ref_mask)]
+        if (
+            cov_nonref.size == 0
+            or not np.all(np.isfinite(cov_nonref))
+            or np.any(np.diag(cov_nonref) < 0)
+        ):
+            return self._deterministic_ranking(coef)
         n_sim = 10000
         rng = np.random.default_rng(seed=42)
         try:
-            samples = rng.multivariate_normal(beta_nonref, cov_nonref, size=n_sim)
+            samples = rng.multivariate_normal(
+                beta_nonref, cov_nonref, size=n_sim, method="svd"
+            )
         except Exception:
-            samples = rng.standard_normal((n_sim, len(beta_nonref))) * 0.0
-        # Add reference (always 0):
+            # Singular-covariance fallback: draw independently along the
+            # non-zero-variance axes (treats coefficients as uncorrelated
+            # — adequate when the WLS covariance is degenerate, e.g. in
+            # single-study networks).
+            variances = np.diag(cov_nonref)
+            if not np.all(np.isfinite(variances)) or np.all(variances <= 0):
+                return self._deterministic_ranking(coef)
+            sd = np.sqrt(np.clip(variances, 0.0, None))
+            samples = (
+                beta_nonref[np.newaxis, :]
+                + rng.standard_normal((n_sim, len(beta_nonref))) * sd[np.newaxis, :]
+            )
         full = np.zeros((n_sim, len(order)))
         full[:, non_ref_mask] = samples
         ranks = np.zeros_like(full, dtype=int)
         for s in range(n_sim):
-            order_desc = np.argsort(-full[s])  # descending
+            order_desc = np.argsort(-full[s])  # descending = best first
             for rank_idx, idx in enumerate(order_desc):
                 ranks[s, idx] = rank_idx + 1
         ranking = {}
         for i, t in enumerate(order):
-            counts = [0.0] * len(order)
-            for r in range(1, len(order) + 1):
+            counts = [0.0] * n_treat
+            for r in range(1, n_treat + 1):
                 counts[r - 1] = float(np.sum(ranks[:, i] == r)) / n_sim
             ranking[t] = counts
         return ranking
 
-    def inconsistency_model(self) -> NMAResult:
-        """Design-by-treatment inconsistency model.
+    def _deterministic_ranking(self, coef: Dict[str, float]) -> Dict[str, List[float]]:
+        """Fallback ranking by point estimate (probability 1 at each rank)."""
+        ordered = sorted(coef.items(), key=lambda kv: kv[1], reverse=True)
+        ranking = {}
+        for rank, (t, _) in enumerate(ordered, start=1):
+            ranking[t] = [0.0] * len(self.treatments)
+            ranking[t][rank - 1] = 1.0
+        return ranking
 
-        Adds one extra parameter per independent loop in the network; the
-        difference in RSS between the consistency and inconsistency models
-        is reported as ``NMAResult.inconsistency``.
+    def inconsistency_model(self) -> NMAResult:
+        """Loop-inconsistency model (side-splitting around independent cycles).
+
+        The previous "design-by-treatment" implementation was bogus: it
+        added one design column per cycle and marked *every* edge of the
+        cycle with the same indicator, which is neither the Higgins
+        design-by-treatment interaction model nor a loop test — it just
+        re-fit a saturated model and diffed RSS values.
+
+        This implementation instead uses the standard **loop
+        inconsistency** test (Veroniki et al. 2013; DONE/"side
+        splitting"): for each independent cycle of the network (cycle
+        basis), pick the comparison in the loop with the most direct
+        evidence and split it into its direct estimate vs the Bucher
+        indirect estimate around the remainder of the loop. The
+        difference D has Var = Var(direct) + Var(indirect) (Bucher), so
+        each loop contributes Q_loop = (D / SE(D))² with df = 1. The
+        aggregate inconsistency statistic is Q = Σ Q_loop with
+        df = number of loops tested, and the p-value is the upper tail
+        of χ²(df).
+
+        Clearly labelled as a *loop inconsistency* (node-splitting)
+        heuristic — NOT the design-by-treatment interaction model.
         """
         try:
             import numpy as np  # type: ignore
@@ -401,14 +471,14 @@ class NetworkMetaAnalysis:
         except ImportError as exc:  # pragma: no cover
             raise RuntimeError("numpy + pandas required for inconsistency model.") from exc
 
-        # Build the augmented design with an extra inconsistency parameter
-        # for each independent cycle. Detect cycles using networkx.
         try:
             import networkx as nx  # type: ignore
         except ImportError:
             logger.warning("networkx unavailable — inconsistency model = consistency.")
             res = self.consistency_model()
             res.inconsistency = 0.0
+            res.inconsistency_df = 0
+            res.inconsistency_p = 1.0
             return res
 
         G = nx.Graph()
@@ -419,63 +489,113 @@ class NetworkMetaAnalysis:
         except Exception:
             cycles = []
 
-        # Build the augmented design matrix.
-        non_ref = [t for t in self.treatments if t != self.reference]
-        idx = {t: i for i, t in enumerate(non_ref)}
-        n = len(self.comparisons)
-        p_consistency = len(non_ref)
-        p_inconsistency = len(cycles)
-        p = p_consistency + p_inconsistency
-        X = np.zeros((n, p))
-        y = np.zeros(n)
-        w = np.zeros(n)
-        for i, comp in enumerate(self.comparisons):
-            ta, tb = comp.treatment_a, comp.treatment_b
-            if tb in idx:
-                X[i, idx[tb]] = 1.0
-            if ta in idx:
-                X[i, idx[ta]] -= 1.0
-            y[i] = comp.effect_size
-            w[i] = 1.0 / (comp.se ** 2) if comp.se > 0 else 0.0
-        # Inconsistency parameters: one per cycle.
-        for ci, cyc in enumerate(cycles):
-            # Mark comparisons whose edge is in this cycle.
-            cyc_edges = set()
-            for a, b in zip(cyc, cyc[1:] + [cyc[0]]):
-                cyc_edges.add(tuple(sorted([a, b])))
-            for i, comp in enumerate(self.comparisons):
-                edge = tuple(sorted([comp.treatment_a, comp.treatment_b]))
-                if edge in cyc_edges:
-                    X[i, p_consistency + ci] = 1.0
-        W = np.diag(w)
-        XtWX = X.T @ W @ X
-        try:
-            XtWX_inv = np.linalg.pinv(XtWX)
-        except np.linalg.LinAlgError:
-            XtWX_inv = np.linalg.pinv(XtWX + 1e-8 * np.eye(p))
-        beta = XtWX_inv @ X.T @ W @ y
-        residuals = y - X @ beta
-        RSS_inc = float(np.sum(w * residuals ** 2))
+        # --- Per-loop side-splitting tests ---------------------------
+        direct = self._direct_pairs()
+        loop_tests: List[InconsistencyTest] = []
+        q_total = 0.0
+        for cyc in cycles:
+            if len(cyc) < 3:
+                continue
+            # Edges of the cycle as sorted pairs.
+            cyc_edges = {
+                tuple(sorted([a, b]))
+                for a, b in zip(cyc, cyc[1:] + [cyc[0]])
+            }
+            # Choose the loop comparison to split: the edge with the most
+            # contributing studies (deterministic tie-break by pair name).
+            best_edge: Optional[Tuple[str, str]] = None
+            best_n = -1
+            for e in sorted(cyc_edges):
+                n_studies = len(direct.get(e, []))
+                if n_studies > best_n:
+                    best_n = n_studies
+                    best_edge = e
+            if best_edge is None or best_n < 1:
+                continue
+            ta, tb = best_edge
+            # Direct estimate of the chosen comparison.
+            comps = direct.get((ta, tb), [])
+            direct_theta, direct_se = self._merge_pooled_estimate(comps)
+            # Indirect estimate around the rest of the loop: Bucher via
+            # every intermediate node of the cycle, excluding the direct
+            # (ta, tb) studies themselves.
+            indirect_pool: List[Tuple[float, float]] = []
+            for tc in cyc:
+                if tc in (ta, tb):
+                    continue
+                key_a = tuple(sorted([ta, tc]))
+                key_b = tuple(sorted([tb, tc]))
+                if key_a not in direct or key_b not in direct:
+                    continue
+                theta_ac, se_ac = self._merge_pooled_estimate(direct[key_a])
+                theta_bc, se_bc = self._merge_pooled_estimate(direct[key_b])
+                # d(x→tc) expressed as effect(tc) - effect(x) — the stored
+                # pooled estimate is already (later - earlier) of the
+                # sorted pair, so flip when ta/tb is the LATER element.
+                d_ta_tc = theta_ac if ta < tc else -theta_ac
+                d_tb_tc = theta_bc if tb < tc else -theta_bc
+                # (tb - ta) = (tc - ta) - (tc - tb).
+                d_indirect = d_ta_tc - d_tb_tc
+                var_indirect = se_ac ** 2 + se_bc ** 2
+                if var_indirect <= 0:
+                    continue
+                indirect_pool.append((d_indirect, var_indirect))
+            if not indirect_pool:
+                continue
+            w_list = [1.0 / v for _, v in indirect_pool]
+            W = sum(w_list)
+            if W <= 0:
+                continue
+            indirect_theta = sum(wi * d for wi, (d, _) in zip(w_list, indirect_pool)) / W
+            indirect_se = math.sqrt(1.0 / W)
+            diff = direct_theta - indirect_theta
+            diff_se = math.sqrt(direct_se ** 2 + indirect_se ** 2)
+            z = diff / diff_se if diff_se > 0 else 0.0
+            q_loop = z * z
+            q_total += q_loop
+            p_loop = 2.0 * (1.0 - 0.5 * (1.0 + math.erf(abs(z) / math.sqrt(2.0))))
+            loop_tests.append(InconsistencyTest(
+                comparison=f"{tb} vs {ta} (loop {('→'.join(cyc))})",
+                direct=float(direct_theta),
+                indirect=float(indirect_theta),
+                difference=float(diff),
+                z=float(z),
+                p_value=float(p_loop),
+                interpretation=(
+                    "no evidence of loop inconsistency"
+                    if p_loop >= 0.10
+                    else "some evidence of loop inconsistency"
+                    if p_loop >= 0.05
+                    else "evidence of loop inconsistency"
+                ),
+            ))
 
-        # Consistency RSS (without inconsistency params).
-        X_cons = X[:, :p_consistency]
-        XtWX_cons = X_cons.T @ W @ X_cons
-        try:
-            XtWX_cons_inv = np.linalg.pinv(XtWX_cons)
-        except np.linalg.LinAlgError:
-            XtWX_cons_inv = np.linalg.pinv(
-                XtWX_cons + 1e-8 * np.eye(p_consistency)
-            )
-        beta_cons = XtWX_cons_inv @ X_cons.T @ W @ y
-        residuals_cons = y - X_cons @ beta_cons
-        RSS_cons = float(np.sum(w * residuals_cons ** 2))
+        df_inc = len(loop_tests)
+        if df_inc > 0:
+            try:
+                from scipy.stats import chi2  # type: ignore
+                p_inc = float(chi2.sf(q_total, df_inc))
+            except Exception:
+                # Wilson–Hilferty normal approximation fallback.
+                z_wh = (
+                    (q_total / df_inc) ** (1.0 / 3.0)
+                    - (1.0 - 2.0 / (9.0 * df_inc))
+                ) / math.sqrt(2.0 / (9.0 * df_inc))
+                p_inc = float(max(0.0, min(1.0, 1.0 - 0.5 * (1.0 + math.erf(z_wh / math.sqrt(2.0))))))
+        else:
+            p_inc = 1.0
 
-        # Inconsistency statistic (Cochran's Q):
-        inconsistency = max(0.0, RSS_cons - RSS_inc)
         # Build the relative-effects DataFrame using the consistency fit.
+        beta, cov, X, y, w, non_ref = self._fit_wls()
         coef = {self.reference: 0.0}
-        for t, b in zip(non_ref, beta_cons):
+        for t, b in zip(non_ref, beta):
             coef[t] = float(b)
+        full_cov = np.zeros((len(self.treatments), len(self.treatments)))
+        for i, ti in enumerate(non_ref):
+            fi = self.treatments.index(ti)
+            for j, tj in enumerate(non_ref):
+                fj = self.treatments.index(tj)
+                full_cov[fi, fj] = cov[i, j]
         order = self.treatments
         rows = {}
         for ti in order:
@@ -488,18 +608,24 @@ class NetworkMetaAnalysis:
             rows[ti] = row
         relative_effects = pd.DataFrame(rows).T
 
-        # AIC/BIC of the inconsistency model:
-        k = p
-        n_obs = n
-        AIC = RSS_inc + 2.0 * k
-        BIC = RSS_inc + math.log(n_obs if n_obs > 0 else 1) * k
+        # AIC/BIC of the consistency model on the proper likelihood scale
+        # (same convention as :meth:`consistency_model`).
+        residuals = y - X @ beta
+        RSS = float(np.sum(w * residuals ** 2))
+        se_arr = np.array([c.se for c in self.comparisons], dtype=float)
+        se_arr = np.where(np.isfinite(se_arr) & (se_arr > 0), se_arr, 1.0)
+        loglik = -0.5 * (RSS + float(np.sum(np.log(2.0 * math.pi * se_arr ** 2))))
+        k_params = len(non_ref)
+        AIC = -2.0 * loglik + 2.0 * k_params
+        BIC = -2.0 * loglik + math.log(max(len(y), 1)) * k_params
 
         return NMAResult(
             relative_effects=relative_effects,
-            ranking=self._rank_probability_from_coef(
-                coef, np.zeros((len(order), len(order)))
-            ),
-            inconsistency=float(inconsistency),
+            ranking=self._rank_probability_from_coef(coef, full_cov),
+            inconsistency=float(q_total),
+            inconsistency_df=int(df_inc),
+            inconsistency_p=float(p_inc),
+            inconsistency_tests=loop_tests,
             AIC=float(AIC),
             BIC=float(BIC),
         )
@@ -622,41 +748,53 @@ class NetworkMetaAnalysis:
     def sucra_scores(self) -> Dict[str, float]:
         """SUCRA scores (Surface Under the Cumulative Ranking curve).
 
-        SUCRA = Σ_{k=1}^{N-1} F_k / (N - 1), where F_k = P(rank > k).
-        Range: 0 (worst) to 1 (best).
+        .. math::
+            \\mathrm{SUCRA}_t = \\frac{1}{N-1} \\sum_{k=1}^{N-1} P(\\mathrm{rank}_t \\le k)
+
+        i.e. the mean of the cumulative probability of being among the top
+        ``k`` treatments. Range: 0 (worst) to 1 (best) — a treatment that
+        is always rank 1 has SUCRA = 1; a treatment always ranked last
+        has SUCRA = 0. (The previous implementation summed ``P(rank > k)``
+        instead, which inverted the scale: the best treatment scored ~0.)
         """
         ranks = self.rank_probability()
         scores: Dict[str, float] = {}
         for t, p_list in ranks.items():
             N = len(p_list)
-            # Cumulative probability that treatment ranks worse than position k.
-            cumulative_better = 0.0
+            if N <= 1:
+                scores[t] = 1.0
+                continue
+            cumulative = 0.0
             sucra = 0.0
             for k in range(1, N):
-                # Probability of being at rank ≤ k:
-                cumulative_better += p_list[k - 1]
-                # Probability of NOT being in top k:
-                F_k = 1.0 - cumulative_better
-                sucra += F_k / (N - 1)
-            scores[t] = float(sucra)
+                # Cumulative P(rank ≤ k):
+                cumulative += p_list[k - 1]
+                sucra += cumulative
+            scores[t] = float(sucra / (N - 1))
         return scores
 
     # ------------------------------------------------------------------ #
     # League table
     # ------------------------------------------------------------------ #
-    def league_table(self):
+    def league_table(self, confidence: float = 0.95):
         """N×N table of pooled pairwise effects.
+
+        Args:
+            confidence: Confidence level for the intervals (default 0.95).
 
         Returns:
             ``pandas.DataFrame`` with rows = treatment_b, columns = treatment_a;
             cell (i, j) = pooled log-effect of treatment_i vs treatment_j
-            with 95% CI in parentheses (e.g. ``"0.45 (0.10, 0.80)"``).
+            with CI in parentheses (e.g. ``"0.45 (0.10, 0.80)"``).
         """
         try:
             import pandas as pd  # type: ignore
             import numpy as np  # type: ignore
         except ImportError as exc:  # pragma: no cover
             raise RuntimeError("pandas + numpy required for league_table.") from exc
+        from .pooling import _z_from_confidence
+
+        z_mult = _z_from_confidence(confidence)
 
         beta, cov, X, y, w, non_ref = self._fit_wls()
         coef = {self.reference: 0.0}
@@ -685,8 +823,8 @@ class NetworkMetaAnalysis:
                     - 2.0 * full_cov[idx_i, idx_j]
                 )
                 se = math.sqrt(max(var, 0.0))
-                ci_lo = val - 1.96 * se
-                ci_hi = val + 1.96 * se
+                ci_lo = val - z_mult * se
+                ci_hi = val + z_mult * se
                 row[tj] = f"{val:+.3f} ({ci_lo:+.3f}, {ci_hi:+.3f})"
             rows[ti] = row
         return pd.DataFrame(rows).T
@@ -730,10 +868,12 @@ class NetworkMetaAnalysis:
 
         fig, ax = plt.subplots(figsize=(8, 8), constrained_layout=True)
         pos = nx.spring_layout(G, seed=42, k=2.0)
-        # Node sizes by SUCRA.
+        # Node sizes by SUCRA (larger = better; SUCRA ∈ [0, 1] with 1 =
+        # best after the ranking fix — previously the inverted SUCRA made
+        # the WORST treatment draw the biggest node).
         try:
             sucra = self.sucra_scores()
-            node_sizes = [200 + 1500 * sucra.get(t, 0.0) for t in G.nodes()]
+            node_sizes = [200 + 1500 * max(0.0, min(1.0, sucra.get(t, 0.0))) for t in G.nodes()]
         except Exception:
             node_sizes = [600] * len(G.nodes())
         edge_widths = [0.5 + 2.0 * math.log1p(d["weight"]) for _, _, d in G.edges(data=True)]
